@@ -31,6 +31,11 @@
     <name>Paimon : FileSystems : S3 Native</name>
     <packaging>jar</packaging>
 
+    <properties>
+        <!-- Test-only pins mirroring paimon-s3-native-impl (Docker Engine 29 negotiation). -->
+        <testcontainers.version>1.21.3</testcontainers.version>
+    </properties>
+
     <dependencies>
         <dependency>
             <groupId>org.apache.paimon</groupId>
@@ -52,10 +57,67 @@
                 </exclusion>
             </exclusions>
         </dependency>
+
+        <!-- Benchmark comparison tests only: the S3A baseline (paimon-s3 + its self-contained
+             paimon-s3-impl fat jar with unrelocated Hadoop 3.3.4 / AWS SDK v1) alongside the
+             native implementation (paimon classes are not relocated by shading, so both FileIOs
+             are directly instantiable). No Maven cycle: paimon-s3 never depends on this module. -->
+        <dependency>
+            <groupId>org.apache.paimon</groupId>
+            <artifactId>paimon-s3</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.paimon</groupId>
+            <artifactId>paimon-s3-impl</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.paimon</groupId>
+            <artifactId>paimon-s3-native-impl</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <!-- HdfsConfiguration for CatalogContext (hadoop-common comes from the fat jar). -->
+        <dependency>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-hdfs-client</artifactId>
+            <version>${fs.hadoopshaded.version}</version>
+            <scope>test</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>log4j</groupId>
+                    <artifactId>log4j</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.slf4j</groupId>
+                    <artifactId>slf4j-log4j12</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
+
 
     <build>
         <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <systemPropertyVariables>
+                        <!-- docker-java defaults to API 1.32, rejected by Docker Engine 29+. -->
+                        <api.version>1.44</api.version>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-dependency-plugin</artifactId>

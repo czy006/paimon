@@ -51,16 +51,18 @@ import static org.apache.paimon.s3native.S3PathUtils.markerKey;
  * S3 {@link FileIO} implemented directly on AWS SDK v2, without any Hadoop dependency.
  *
  * <p>[PORTED] Object-store semantics (HeadObject-based existence, delimiter listing, CopyObject +
- * Delete rename, always-true mkdirs) derived from Apache Flink flink-filesystems/flink-s3-fs-native
- * (FLINK-38592, Apache License 2.0), class org.apache.flink.fs.s3native.NativeS3FileSystem. Local
- * reference: /Users/SL/javaProject/flink/flink-filesystems/flink-s3-fs-native/src/main/java/org/
+ * Delete rename, mkdirs succeeding without directory creation) derived from Apache Flink
+ * flink-filesystems/flink-s3-fs-native (FLINK-38592, Apache License 2.0), class
+ * org.apache.flink.fs.s3native.NativeS3FileSystem. Local reference:
+ * /Users/SL/javaProject/flink/flink-filesystems/flink-s3-fs-native/src/main/java/org/
  * apache/flink/fs/s3native/NativeS3FileSystem.java
  *
  * <p>Registered deviations from the Flink reference (see Spec §5.5): D1 directory markers (0-byte
  * {@code <key>/} objects, S3A-compatible — required by FileIOBehaviorTestBase empty-dir
  * visibility), D2 recursive directory rename, D4 zero-length files are files (key suffix decides
  * marker vs file), D5 empty-directory non-recursive delete succeeds, D6 batch recursive delete, D7
- * objects larger than 5GB are renamed via UploadPartCopy.
+ * objects larger than 5GB are renamed via UploadPartCopy, D9 mkdirs fails fast on file conflicts
+ * (Paimon contract) instead of returning true unconditionally.
  */
 public class S3NativeFileIO implements FileIO {
 
@@ -117,8 +119,8 @@ public class S3NativeFileIO implements FileIO {
         S3NativeOptions resolved = resolvedOptions();
         if (!overwrite && classify(path).kind != Kind.MISSING) {
             // [PORTED] NativeS3FileSystem#create (NO_OVERWRITE branch). Blocks any existing
-            // entry — file, marker directory or prefix directory — unlike the Flink original
-            // which only checked objects.
+            // entry — file, marker directory or prefix directory — matching the reference's
+            // exists() semantics (which also detects prefix directories).
             throw new IOException("File already exists: " + path);
         }
         return new S3NativePositionOutputStream(
@@ -141,6 +143,8 @@ public class S3NativeFileIO implements FileIO {
         String key = key(path);
         Classification classification = classify(path);
         if (classification.kind == Kind.FILE) {
+            // [ADAPTED] Flink returns an empty array for object keys; returning the file's own
+            // status is the Hadoop/Paimon convention.
             return new FileStatus[] {classification.toStatus(path)};
         }
         if (classification.kind == Kind.MISSING) {
@@ -218,6 +222,8 @@ public class S3NativeFileIO implements FileIO {
         }
         S3NativeObjectOperations operations = ops(path);
 
+        // [DEVIATION D9] Flink's mkdirs is unconditionally true; the fail-fast checks below are
+        // mandated by the Paimon FileIO contract (FileIOBehaviorTestBase mkdirs cases).
         if (operations.headObjectOrNull(key) != null) {
             // A plain object occupies the path (a marker would return null for the bare key).
             throw new IOException("Cannot mkdirs, a file already exists: " + path);
@@ -247,7 +253,8 @@ public class S3NativeFileIO implements FileIO {
             return true;
         }
         if (!S3PathUtils.bucket(src).equals(S3PathUtils.bucket(dst))) {
-            // The copy below would otherwise silently land in the source bucket.
+            // [ADAPTED] The Flink filesystem is bucket-scoped; this FileIO is bucket-agnostic, so
+            // the copy below would otherwise silently land in the source bucket.
             return false;
         }
         S3NativeObjectOperations operations = ops(src);
@@ -257,7 +264,9 @@ public class S3NativeFileIO implements FileIO {
             return false;
         }
         if (classify(dst).kind != Kind.MISSING) {
-            return false; // never overwrite
+            // [ADAPTED] Flink's rename silently overwrites the destination; refusing is the
+            // Hadoop/Paimon convention.
+            return false;
         }
         if (isAncestorOf(srcKey, dstKey)) {
             return false; // cannot move a directory into itself
