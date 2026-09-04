@@ -69,12 +69,16 @@ final class S3NativeOptions {
     final double multipartThresholdFactor;
     /** When true, part-level and whole-object MD5 are sent as Content-MD5. */
     final boolean checksumEnabled;
-    /** Storage class for new objects (e.g. GLACIER, INTELLIGENT_TIERING); null = bucket default. */
-    @Nullable final String writeStorageClass;
-    /** Tags for new objects, "k1:v1,k2:v2"; empty = none. */
+    /** Storage class for new objects; null = bucket default. Typed to reject typos (I6). */
+    @Nullable final software.amazon.awssdk.services.s3.model.StorageClass writeStorageClass;
+    /**
+     * Tags for new objects, "k1:v1,k2:v2"; empty map = none. [DEVIATION vs Iceberg] Iceberg uses
+     * the prefix form {@code s3.write.tags.<key>}; Paimon packs them into one comma-separated
+     * option. Empty values are allowed (S3 permits them); duplicate keys keep the last value.
+     */
     final Map<String, String> writeTags;
-    /** Canned ACL for new objects; null = none. */
-    @Nullable final String acl;
+    /** Canned ACL for new objects; null = none. Typed to reject typos (I6). */
+    @Nullable final software.amazon.awssdk.services.s3.model.ObjectCannedACL acl;
 
     // [PORTED-ICE Spec §14 I7] Parallel batch deletion adopted from Iceberg S3FileIOProperties.
     /** Keys per DeleteObjects request, 1..1000 (S3 API limit). */
@@ -104,9 +108,9 @@ final class S3NativeOptions {
             String tmpDir,
             double multipartThresholdFactor,
             boolean checksumEnabled,
-            String writeStorageClass,
+            software.amazon.awssdk.services.s3.model.StorageClass writeStorageClass,
             Map<String, String> writeTags,
-            String acl,
+            software.amazon.awssdk.services.s3.model.ObjectCannedACL acl,
             int deleteBatchSize,
             int deleteThreads) {
         this.accessKey = accessKey;
@@ -228,9 +232,9 @@ final class S3NativeOptions {
                 normalized.getString("s3.upload.tmp.dir", System.getProperty("java.io.tmpdir")),
                 validatedThresholdFactor(normalized),
                 normalized.getBoolean("s3.checksum-enabled", false),
-                normalized.get("s3.write.storage-class"),
+                validatedStorageClass(normalized.get("s3.write.storage-class")),
                 parseTags(normalized.get("s3.write.tags")),
-                normalized.get("s3.acl"),
+                validatedAcl(normalized.get("s3.acl")),
                 validatedDeleteBatchSize(normalized),
                 validatedDeleteThreads(normalized));
     }
@@ -257,11 +261,51 @@ final class S3NativeOptions {
         return threads;
     }
 
+    /** Typed fail-fast parse: the SDK's fromValue maps typos to UNKNOWN_TO_SDK_VERSION. */
+    @Nullable
+    private static software.amazon.awssdk.services.s3.model.StorageClass validatedStorageClass(
+            @Nullable String value) {
+        if (value == null) {
+            return null;
+        }
+        software.amazon.awssdk.services.s3.model.StorageClass parsed =
+                software.amazon.awssdk.services.s3.model.StorageClass.fromValue(value);
+        if (software.amazon.awssdk.services.s3.model.StorageClass.UNKNOWN_TO_SDK_VERSION.equals(
+                parsed)) {
+            throw new IllegalArgumentException("Invalid s3.write.storage-class value: " + value);
+        }
+        return parsed;
+    }
+
+    /** Typed fail-fast parse: the SDK's fromValue maps typos to UNKNOWN_TO_SDK_VERSION. */
+    @Nullable
+    private static software.amazon.awssdk.services.s3.model.ObjectCannedACL validatedAcl(
+            @Nullable String value) {
+        if (value == null) {
+            return null;
+        }
+        software.amazon.awssdk.services.s3.model.ObjectCannedACL parsed =
+                software.amazon.awssdk.services.s3.model.ObjectCannedACL.fromValue(value);
+        if (software.amazon.awssdk.services.s3.model.ObjectCannedACL.UNKNOWN_TO_SDK_VERSION.equals(
+                parsed)) {
+            throw new IllegalArgumentException("Invalid s3.acl value: " + value);
+        }
+        return parsed;
+    }
+
     private static double validatedThresholdFactor(Options options) {
-        double factor = Double.parseDouble(options.getString("s3.multipart.threshold", "1.5"));
-        if (factor < 1.0) {
+        String raw = options.getString("s3.multipart.threshold", "1.5");
+        double factor;
+        try {
+            factor = Double.parseDouble(raw);
+        } catch (NumberFormatException e) {
             throw new IllegalArgumentException(
-                    "s3.multipart.threshold must be >= 1.0, but was: " + factor);
+                    "Invalid s3.multipart.threshold value: " + raw + " (expected e.g. 1.5)");
+        }
+        // NaN/Infinity would silently pass a plain < 1.0 check (Iceberg rejects them via >=).
+        if (!Double.isFinite(factor) || !(factor >= 1.0)) {
+            throw new IllegalArgumentException(
+                    "s3.multipart.threshold must be a finite value >= 1.0, but was: " + raw);
         }
         return factor;
     }
@@ -272,11 +316,15 @@ final class S3NativeOptions {
             return result;
         }
         for (String pair : tags.split(",")) {
+            if (pair.trim().isEmpty()) {
+                continue; // tolerate trailing/duplicated commas
+            }
             int sep = pair.indexOf(':');
-            if (sep <= 0 || sep == pair.length() - 1) {
+            if (sep <= 0) {
                 throw new IllegalArgumentException(
                         "Invalid s3.write.tags entry '" + pair + "', expected key:value pairs");
             }
+            // Empty values are allowed (S3 permits them); duplicate keys keep the last value.
             result.put(pair.substring(0, sep).trim(), pair.substring(sep + 1).trim());
         }
         return result;

@@ -340,6 +340,138 @@ class S3NativePositionOutputStreamTest {
     }
 
     @Test
+    void testWriteAttributesAppliedToPutObjectPath() throws Exception {
+        // [PORTED-ICE I6] Tags/storage-class/ACL must shape the single-put path too, not only
+        // CreateMultipartUpload.
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        when(sync.putObject(any(PutObjectRequest.class), any(RequestBody.class)))
+                .thenReturn(PutObjectResponse.builder().eTag("e").build());
+
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(
+                        sync,
+                        async,
+                        "bucket",
+                        "key",
+                        options(
+                                "s3.write.tags",
+                                "team:data,env:prod",
+                                "s3.write.storage-class",
+                                "INTELLIGENT_TIERING",
+                                "s3.acl",
+                                "public-read-write"));
+        out.write(new byte[128]);
+        out.close();
+
+        org.mockito.ArgumentCaptor<PutObjectRequest> request =
+                org.mockito.ArgumentCaptor.forClass(PutObjectRequest.class);
+        verify(sync).putObject(request.capture(), any(RequestBody.class));
+        assertThat(request.getValue().storageClass().toString()).isEqualTo("INTELLIGENT_TIERING");
+        assertThat(request.getValue().acl().toString()).isEqualTo("public-read-write");
+        // The SDK serializes tagging as an XML URL-encoded string.
+        String tagging = request.getValue().tagging();
+        assertThat(tagging).contains("team").contains("data").contains("env").contains("prod");
+
+        verify(sync, never()).createMultipartUpload(any(CreateMultipartUploadRequest.class));
+    }
+
+    @Test
+    void testPartMd5ExactValues() throws Exception {
+        // [PORTED-ICE I4] Pin the exact per-part digests so a digest-reuse bug across part
+        // rolls would fail, not just an empty-value check.
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        when(sync.createMultipartUpload(any(CreateMultipartUploadRequest.class)))
+                .thenReturn(CreateMultipartUploadResponse.builder().uploadId("u1").build());
+        when(async.uploadPart(any(UploadPartRequest.class), any(AsyncRequestBody.class)))
+                .thenReturn(
+                        CompletableFuture.completedFuture(
+                                UploadPartResponse.builder().eTag("etag").build()));
+        when(sync.completeMultipartUpload(any(CompleteMultipartUploadRequest.class)))
+                .thenReturn(null);
+
+        byte[] data = new byte[(int) PART_SIZE + 7];
+        new java.util.Random(11).nextBytes(data);
+        java.security.MessageDigest md5 = java.security.MessageDigest.getInstance("MD5");
+        String firstPartMd5 =
+                Base64.getEncoder()
+                        .encodeToString(md5.digest(java.util.Arrays.copyOf(data, (int) PART_SIZE)));
+        md5.reset();
+        String tailMd5 =
+                Base64.getEncoder()
+                        .encodeToString(
+                                md5.digest(
+                                        java.util.Arrays.copyOfRange(
+                                                data, (int) PART_SIZE, data.length)));
+
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(
+                        sync, async, "bucket", "key", options("s3.checksum-enabled", "true"));
+        out.write(data);
+        out.close();
+
+        java.util.List<UploadPartRequest> requests =
+                org.mockito.Mockito.mockingDetails(sync).getInvocations().stream()
+                        .filter(i -> i.getMethod().getName().equals("uploadPart"))
+                        .map(i -> (UploadPartRequest) i.getArgument(0))
+                        .collect(java.util.stream.Collectors.toList());
+        // uploadPart goes through the async client; capture there instead.
+        org.mockito.ArgumentCaptor<UploadPartRequest> asyncRequest =
+                org.mockito.ArgumentCaptor.forClass(UploadPartRequest.class);
+        verify(async, org.mockito.Mockito.times(2))
+                .uploadPart(asyncRequest.capture(), any(AsyncRequestBody.class));
+        assertThat(asyncRequest.getAllValues().get(0).partNumber()).isEqualTo(1);
+        assertThat(asyncRequest.getAllValues().get(0).contentMD5()).isEqualTo(firstPartMd5);
+        assertThat(asyncRequest.getAllValues().get(1).partNumber()).isEqualTo(2);
+        assertThat(asyncRequest.getAllValues().get(1).contentMD5()).isEqualTo(tailMd5);
+    }
+
+    @Test
+    void testExactThresholdBoundaryWithSubPartWrites() throws Exception {
+        // [PORTED-ICE I5] threshold=1.5 x 5MB = 7.5MB. Sub-part increments (1MB chunks) must
+        // trip the threshold check at the tail of every write: one byte below the boundary
+        // stays on single PutObject, past it starts the MPU.
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        when(sync.putObject(any(PutObjectRequest.class), any(RequestBody.class)))
+                .thenReturn(PutObjectResponse.builder().eTag("e").build());
+        when(sync.createMultipartUpload(any(CreateMultipartUploadRequest.class)))
+                .thenReturn(CreateMultipartUploadResponse.builder().uploadId("u1").build());
+        when(async.uploadPart(any(UploadPartRequest.class), any(AsyncRequestBody.class)))
+                .thenReturn(
+                        CompletableFuture.completedFuture(
+                                UploadPartResponse.builder().eTag("etag").build()));
+        when(sync.completeMultipartUpload(any(CompleteMultipartUploadRequest.class)))
+                .thenReturn(null);
+
+        byte[] chunk = new byte[1024 * 1024];
+        // Threshold = 5MiB part x 1.5 = 7,864,320 = 7 chunks (7MiB) + 512KiB.
+        // Just below: 7MiB + (512KiB - 1).
+        S3NativePositionOutputStream below =
+                new S3NativePositionOutputStream(
+                        sync, async, "bucket", "below", options("s3.multipart.threshold", "1.5"));
+        for (int i = 0; i < 7; i++) {
+            below.write(chunk);
+        }
+        below.write(new byte[512 * 1024 - 1]);
+        below.close();
+        verify(sync).putObject(any(PutObjectRequest.class), any(RequestBody.class));
+        verify(sync, never()).createMultipartUpload(any(CreateMultipartUploadRequest.class));
+
+        // Just above: 7MiB + (512KiB + 1).
+        S3NativePositionOutputStream above =
+                new S3NativePositionOutputStream(
+                        sync, async, "bucket", "above", options("s3.multipart.threshold", "1.5"));
+        for (int i = 0; i < 7; i++) {
+            above.write(chunk);
+        }
+        above.write(new byte[512 * 1024 + 1]);
+        above.close();
+        verify(sync).createMultipartUpload(any(CreateMultipartUploadRequest.class));
+    }
+
+    @Test
     void testWriteTagsAndStorageClassApplied() throws Exception {
         // [PORTED-ICE I6]
         S3Client sync = mock(S3Client.class);
