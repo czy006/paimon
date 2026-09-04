@@ -31,6 +31,21 @@
 4. **向量读是独有能力**：1455 MB/s 的 8 路并发 Range 读为 Parquet 列式读取提供了 S3A 路径不具备的加速面。
 5. 递归删除毫秒级差异不具意义（两者均批量删除）。
 
+## 可复现的对比测试用例（JUnit 内跑）
+
+`S3VsS3NativeBenchmarkTest`（paimon-s3-native 壳模块，`mvn -pl paimon-filesystems/paimon-s3-native test`）在同一 MinIO、同一 JVM、**对称参数**（两边均 8MB part + 50 连接；S3A 经 `fs.s3a.multipart.size/threshold` 显式开启 multipart）下交替执行（interleaved best-of-3）相同负载，断言防回归关系并打印比值。
+
+> **重要修正（2026-09-04）**：早期跑出的 5.38× 大文件写系不公平对比——`s3.upload.min.part.size` 被 S3A 侧映射为无效键，S3A 实际按默认 threshold（>32MB）走**单 PUT**。对称开启 multipart 后本地比值为 0.99–1.20×（持平）。
+
+| 用例 | 断言（防回归底线） | 公平参数首跑（多轮观测） | 结论 |
+| --- | --- | --- | --- |
+| `testLargeFileWriteWithinRegressionFloor` | native ≤ s3a×1.25 | 0.99×/1.07×/1.10×/1.20× | 本地磁盘瓶颈下持平；真实网络端点预期拉开（Flink 官方 SDK v2 vs v1 基准 2.17× 同向） |
+| `testSmallFileWriteWithinRegressionFloor` | native ≤ s3a×2 | 1.51×/1.54×/1.62×/1.74×/1.83×/2.08× | **稳定优势**（单 PUT 路径更轻） |
+| `testSequentialReadComparableToS3A` | native ≤ s3a×1.5 | 0.77×–1.07× | 页缓存主导，持平 |
+| `testVectoredReadParallelRanges` | 功能正确性（数字仅打印） | 向量 35–37 ms vs 顺序 29–30 ms | **独有能力**（S3A 无 VectoredReadable） |
+
+断言阈值刻意保守，用于防回归；优势断言的载体是小文件写（稳定）与向量读（独有），大文件写的优势预期在真实 S3 端点显现（网络 RTT 主导时异步并发模型收益放大）。该测试放在壳模块的原因：只有此处两个实现的类可在同一 classpath 共存且无 Maven 循环（paimon-s3 不依赖本模块；native impl 经 shade 只重定位第三方类）。
+
 ## 复现
 
 ```shell

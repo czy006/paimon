@@ -193,7 +193,10 @@
 | D5 | **delete 目录非递归**：Flink 一律抛异常（F11），我们空目录（仅 marker）放行 | 行为套件 `testExistingEmptyDirectoryDeletion` |
 | D6 | **递归删除批量化**：Flink 逐对象递归（F11），我们 `DeleteObjects` 批 ≤1000 | 分区过期/快照过期会删大量对象，逐个删是吞吐瓶颈 |
 | D7 | **大对象 rename**：Flink 单 `CopyObject`（上限 5GB），>5GB 走 `UploadPartCopy` | S3 API 硬约束；S3A 对齐 |
-| D8 | **范围裁剪**：无 STS/委托令牌/CRT/metrics/entropy/bulk-copy/per-bucket 配置/自定义凭证类/SSE(M5 可选)/TransferManager | v1 范围决策（§2.2）；F8 使 TransferManager 无收益 |
+| D8 | **范围裁剪**：无 STS/委托令牌/CRT/metrics/entropy/bulk-copy/per-bucket 配置/自定义凭证类（含 `s3.retry.circuit-breaker.enabled` 开关，固定为 Flink 默认值 false）/SSE(M5 可选)/TransferManager | v1 范围决策（§2.2）；F8 使 TransferManager 无收益 |
+| D9 | **mkdirs fail-fast**：Flink 无条件返回 true；我们在路径被普通对象占用或祖先为对象时抛 IOException | Paimon FileIO 契约（`testMkdirsFailsForExistingFile`/`testMkdirsFailsWithExistingParentFile`） |
+
+其余未编号的语义适配（均为 Hadoop/Paimon 惯例，代码内以 [ADAPTED] 注释标注）：rename 目标存在时返回 false 而非覆盖、同 key 返回 true、跨桶返回 false；`listStatus` 对文件路径返回自身状态；目录 mtime 取墙钟（Flink 取 0）；path-style 系统属性仅在选项缺省时生效（Flink 为覆盖式）；close 为无超时同步（Java 8 无 `orTimeout`）。
 
 ## 6. 详细设计
 
@@ -481,3 +484,7 @@ mirror `paimon-s3/pom.xml` 的结构（dependency-plugin 把 impl jar unpack 进
 | T9 | 基准首跑（本地 MinIO，同盘同参）：大文件写 2.48×（322 vs 130 MB/s）、小文件写 1.73×、向量读 1185-1455 MB/s（S3A 无此能力）、顺序读 ~0.92×（页缓存主导、噪声内） | 详见 `docs/analysis/benchmarks/s3-native-benchmark.md`；真实 S3 验收数字待客户 staging |
 
 **遗留（非本 Spec 验收项）**：真实 S3 端点基准（客户 staging）；Flink/Spark 真机部署冒烟；上游化提 PR。
+
+**溯源核对（2026-09-04 二轮，独立 agent 逐项验证）**：27 个 `[PORTED]/[ADAPTED]` 标注 + 8 个 D 编号偏离 + 1 个未编号偏离全部与 Flink 参考源码逐方法比对——24 项 FAITHFUL、12 项 FAITHFUL-WITH-ADAPTATION（均有注释依据）、1 项措辞失实（mkdirs "always-true"，已修正并登记为 D9）；0 Critical。核对产生的注释修正（F1–F10）已全部落码。
+
+**对比型基准测试（2026-09-04 二轮新增，三轮审查后修正为公平对比）**：`S3VsS3NativeBenchmarkTest`（paimon-s3-native 壳模块，4 用例）——同一 MinIO/JVM、**对称参数**（两侧 8MB part + 50 连接，S3A 显式开 multipart）下交替测量（interleaved best-of-3）：multipart 写断言 native ≤ s3a×1.25（公平参数后本地 0.99–1.20× 持平；早期 5.38× 系 S3A 未开 multipart 的不公平对比，已修正——真实网络端点优势引 Flink 2.17× 基准佐证）、小文件写断言 native ≤ s3a×2（本地稳定 1.5–2.1× 优势）、顺序读断言 native ≤ s3a×1.5（持平）、向量读验证功能正确性并打印对比（S3A 无对应能力，独有优势）。放在壳模块因两个实现的类仅在此处可同 classpath 共存且无 Maven 循环。

@@ -46,7 +46,8 @@ final class S3NativeFileStatus implements FileStatus {
     }
 
     static S3NativeFileStatus directory(Path path) {
-        // Directory timestamps are best-effort on object stores.
+        // Directory timestamps are best-effort on object stores. [ADAPTED] Flink reports 0; we
+        // report wall-clock time, which keeps listings monotonic for tooling.
         return new S3NativeFileStatus(0, true, path, System.currentTimeMillis());
     }
 

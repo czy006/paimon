@@ -105,6 +105,8 @@ final class S3NativeClientProvider implements AutoCloseable {
                                                 BackoffStrategy.exponentialDelay(
                                                         options.retryThrottleBaseDelay,
                                                         options.retryMaxBackoff))
+                                        // [ADAPTED] Circuit breaker stays at the Flink default
+                                        // (off); the toggle option is out of scope (D8).
                                         .circuitBreakerEnabled(false)
                                         .build())
                         .build();
@@ -148,7 +150,7 @@ final class S3NativeClientProvider implements AutoCloseable {
         try {
             asyncClient = asyncBuilder.build();
         } catch (RuntimeException e) {
-            // Do not leak the already-built sync client's connection pool on partial failure.
+            // [ADAPTED] Flink leaks the sync client here; we close it before rethrowing.
             try {
                 syncClient.close();
             } catch (Exception closeFailure) {
@@ -202,7 +204,11 @@ final class S3NativeClientProvider implements AutoCloseable {
         return asyncClient;
     }
 
-    /** [PORTED] S3ClientProvider#closeAsync — sequential close, each guarded. */
+    /**
+     * [PORTED] S3ClientProvider#closeAsync — sequential close, each guarded. [ADAPTED] Synchronous
+     * instead of a time-bounded async close ({@code orTimeout} is Java 9+), so a hung client close
+     * blocks the caller — acceptable because this provider is process-cached (Spec R5).
+     */
     @Override
     public void close() {
         if (!closed.compareAndSet(false, true)) {

@@ -55,8 +55,8 @@ final class S3PathUtils {
         if (key == null) {
             return "";
         }
-        // [ADAPTED] NativeS3ObjectOperations#extractKey strips a single leading slash; Paimon
-        // Path normalization already removes trailing slashes, so no trailing handling is needed.
+        // [PORTED] NativeS3ObjectOperations#extractKey — single leading-slash strip; Paimon
+        // Path normalization already removes trailing slashes before we get here.
         if (key.startsWith("/")) {
             key = key.substring(1);
         }

@@ -116,6 +116,8 @@ final class S3NativeOptions {
         }
         boolean pathStyle = normalized.getBoolean("s3.path-style-access", false);
         if (!normalized.containsKey("s3.path-style-access")) {
+            // [ADAPTED] Flink lets the sysprop override an explicit option; fallback-only is the
+            // safer precedence (an explicit option always wins).
             pathStyle = Boolean.parseBoolean(System.getProperty("s3.path.style.access"));
         }
 
