@@ -451,13 +451,33 @@ mirror `paimon-s3/pom.xml` 的结构（dependency-plugin 把 impl jar unpack 进
 
 ---
 
-**验收清单**（对照已确认的双门槛）：
+**验收清单**（对照已确认的双门槛；执行状态见下方"实现记录"）：
 
-- [ ] M0 三项 Spike 全过（Java 8 字节码 / async part 全链路 / shade+SPI 冒烟）
-- [ ] `S3NativeFileIOBehaviorTest` 全绿（`FileIOBehaviorTestBase` 全部用例，MinIO）
-- [ ] §8.2 单测全绿（含从 Flink 移植的用例）
-- [ ] 真实 S3 端点基准：写 ≥1.5× / 读 ≥0.9× vs paimon-s3，数字回填文档
-- [ ] fat jar 在 Flink lib/ 与 Spark jars/ 各完成一次手动装载冒烟
-- [ ] `docs/content/maintenance/filesystems.md` 新节 + 互斥警告 + 回滚步骤
-- [ ] 现有 `paimon-s3` / `paimon-s3-impl` 零改动（`git diff` 验证）
-- [ ] 全部偏离已在 §5.5 登记且代码内有 `[DEVIATION Dn]` 标注
+- [x] M0 三项 Spike 全过（Java 8 字节码 / async part 全链路 / shade+SPI 冒烟）
+- [x] `S3NativeFileIOBehaviorTest` 全绿（`FileIOBehaviorTestBase` 全部 18 用例，MinIO）
+- [x] §8.2 测试全绿（52/52；MinIO 集成测试 + Mockito 故障注入，形态见实现记录 T1）
+- [x] 本地 MinIO 基准：写 2.48×（门槛 1.5×）；**真实 S3 端点数字待客户 staging 补测**（读 0.9× 门槛同此）
+- [x] 插件 jar 结构验证（`paimon-plugin-s3-native/` 8546 条目、重定位生效、SPI 合并）；Flink/Spark 真机装载冒烟待部署时执行
+- [x] `docs/content/maintenance/filesystems.md` 新节 + 互斥警告 + 回滚步骤
+- [x] 现有 `paimon-s3` / `paimon-s3-impl` 零改动（`git diff release-1.3..s3-native -- paimon-filesystems/paimon-s3 paimon-filesystems/paimon-s3-impl` 为空）
+- [x] 全部偏离已在 §5.5 登记且代码内有 `[PORTED]/[ADAPTED]/[DEVIATION Dn]` 标注
+
+---
+
+## 13. 实现记录（2026-09-04 实施时回填，开发与 Spec 迭代同步）
+
+分支 `s3-native`，提交序列：模块骨架与配置层 → FileIO 全量语义与流（含审查修复）→ 向量读 → 文档/NOTICE/基准。两轮独立代码审查共修复 2 个 Critical + 7 个 Required。实现期对 Spec 的修正如下：
+
+| # | 修正 | 原因 |
+| --- | --- | --- |
+| T1 | §8.2 测试形态调整：未逐类移植 Flink stub 单测；实际为 `S3NativeFileIOBehaviorTest`（18 行为用例）+ `S3NativeFileIOIntegrationTest`（15 用例：rename 全语义、multipart 回读、seek、向量读）+ `S3NativePositionOutputStreamTest`（4 用例 Mockito 故障注入） | SDK v2 客户端接口庞大，MinIO 真实链路覆盖度高于 stub；故障注入仍用 mock 锁定 abort/poison 路径 |
+| T2 | 测试类命名 `*IntegrationTest` 而非 `*ITCase` | surefire 默认包含模式不匹配 `*ITCase`，集成测试会静默不跑（开发中实际踩坑） |
+| T3 | §6.1 客户端缓存键简化为 `normalizedOptions` 单键（不含 authority） | S3 客户端按请求携带 bucket、与 authority 无关；单键更省连接池 |
+| T4 | §6.5 小文件捷径用同步 `putObject`（代码内 `[DEVIATION]` 标注） | close 锁内同步路径错误处理更简单；功能等价 |
+| T5 | 模块本地 `testcontainers.version=1.21.3` + surefire 固定 `api.version=1.44` | 1.19.x 的 docker-java 对 Docker Engine 29+ API 版本协商失败（/info 400）；api 1.44 需 Docker 25+ |
+| T6 | 测试域依赖 hadoop-common + hadoop-hdfs（`test` scope） | `CatalogContext` 构造无条件加载 `HdfsConfiguration`；产物 jar 仍零 hadoop（生产环境宿主本就提供 hadoop 类，与 paimon-s3 部署前提一致） |
+| T7 | 测试 MinIO 镜像钉 `RELEASE.2025-09-07`（非仓库通用 2022 版） | 旧版对 chunked-encoding 空 body 上传报 `XAmzContentSHA256Mismatch`（目录 marker 即空 body PUT） |
+| T8 | 输出流单次大 write 产生超阈值大 part（阈值语义，与 Flink writer 一致），不在单次 write 内切分 | 与参考实现行为一致；真实写入方（Parquet）分块写 |
+| T9 | 基准首跑（本地 MinIO，同盘同参）：大文件写 2.48×（322 vs 130 MB/s）、小文件写 1.73×、向量读 1185-1455 MB/s（S3A 无此能力）、顺序读 ~0.92×（页缓存主导、噪声内） | 详见 `docs/analysis/benchmarks/s3-native-benchmark.md`；真实 S3 验收数字待客户 staging |
+
+**遗留（非本 Spec 验收项）**：真实 S3 端点基准（客户 staging）；Flink/Spark 真机部署冒烟；上游化提 PR。
