@@ -485,6 +485,41 @@ mirror `paimon-s3/pom.xml` 的结构（dependency-plugin 把 impl jar unpack 进
 
 **遗留（非本 Spec 验收项）**：真实 S3 端点基准（客户 staging）；Flink/Spark 真机部署冒烟；上游化提 PR。
 
+---
+
+## 14. Iceberg S3 实现探查与移植候选（2026-09-05，v2 增补）
+
+> 参考源码：本地 `/Users/SL/javaProject/iceberg`（main @ `27bfd00d6`），模块 `aws/src/main/java/org/apache/iceberg/aws/s3/`（下文 `$ICE` 代指）。逐类通读：`S3OutputStream`、`S3InputStream`、`S3FileIO`、`S3FileIOProperties`、`S3RequestUtil`、`VendedCredentialsProvider`、`AnalyticsAcceleratorUtil`。本节为**移植候选登记**，非当前范围承诺；实施时逐项另立提交并沿用 §7 溯源规范（`[PORTED-ICE]` 标注建议）。
+
+### 14.1 候选清单（按优先级）
+
+| # | 特性 | Iceberg 实现（证据） | 对我们的价值 | 优先级 | 预估 |
+| --- | --- | --- | --- | --- | --- |
+| I1 | **读中途断连重试** | `$ICE/S3InputStream.java:55-87,267-270`：Failsafe RetryPolicy 捕获 SSL/Socket 异常 → `resetForRetry()` 以 Range 重开流，最多 3 次 | SDK 重试只覆盖请求建立，**不覆盖流读取中途断连**（长读被 LB/代理掐断是生产真实故障模式）；客户长期运行的 Flink/Spark 作业直接受益 | **P0** | ~0.5d |
+| I2 | **大 write() 按 part 切分** | `$ICE/S3OutputStream.java:183-211`：`write(b,off,len)` while 循环按 part 边界切分 | 修复我们已登记的 T8（单次大 write 产生超阈值大 part）；与写入方行为无关的确定性 part 尺寸 | **P0** | ~0.2d |
+| I3 | **未关闭流的 GC 兜底** | `$ICE/S3OutputStream.java:483-492`、`S3InputStream.java:310-319`：`finalize()` 中关闭资源并打印**创建栈**（构造时捕获 `createStack`） | 我们 O2 遗留的"未关闭流泄漏临时文件/MPU"直接消解；创建栈让泄漏源头可定位 | **P0** | ~0.3d |
+| I4 | **MD5 传输校验** | `$ICE/S3OutputStream.java:79,98-99,213-251,315-317,436-437`：`s3.checksum-enabled` 开启后 part 级+整体 MD5（`DigestOutputStream`），UploadPart/PutObject 带 `Content-MD5` | 端到端数据完整性（服务端校验），对合规敏感客户（casino SaaS）有价值；默认关闭 | **P1** | ~0.5d |
+| I5 | **multipart 阈值因子** | `$ICE/S3OutputStream.java:135-136,176-179`：`s3.multipart.threshold`（默认 1.5×part）——staging 累积超阈值才 `initializeMultiPartUpload` | 小于阈值的文件永远单 PUT（省 CreateMultipartUpload 往返）；manifest/schema 小文件多的 Paimon 场景契合 | **P1** | ~0.3d |
+| I6 | **写入标签/存储类/ACL** | `$ICE/S3OutputStream.java:279-284,428-434` + `S3FileIOProperties`：`s3.write.storage-class`（GLACIER/INTELLIGENT_TIERING）、writeTags、`s3.acl` | 冷热分层与成本管理（生命周期策略按 tag 触发）；运维向 | **P1** | ~0.3d |
+| I7 | **并行批量删除 + 失败聚合** | `$ICE/S3FileIO.java:202-272`：`s3.delete.num-threads` 线程池并行 `DeleteObjects` 批；部分失败聚合计数后抛 `BulkDeletionFailureException` | 分区/快照过期的大前缀删除吞吐（我们单线程顺序批）；聚合语义比首错即抛更利于上层重试 | **P1** | ~0.4d |
+| I8 | **完整 SSE 家族（含 SSE-C）** | `$ICE/S3RequestUtil.java:41-134`：KMS/DSSE-KMS/SSE-S3/SSE-C（客户密钥+MD5），按请求类型差异化注入（Get/Head/UploadPart 仅 SSE-C 字段） | 现仅 M5 可选的 SSE-S3/KMS 之上补 SSE-C（BYOK 场景）；Get/Head 也要带 SSE-C 头是易漏点 | **P2** | ~0.5d |
+| I9 | **vended 凭据定时刷新** | `$ICE/S3FileIO.java:441-477` + `VendedCredentialsProvider.java:132-153`：按 `expiresAt-5min` 调度刷新，CachedSupplier 缓存 | 仅当接入 REST catalog/EMR vended credentials 时需要；fork 当前静态 key 场景无用 | **P2** | ~1d |
+| I10 | **按前缀的客户端路由** | `$ICE/S3FileIO.java:114,405-439`：`clientByPrefix`（PrefixedS3Client）+ bucket→access point 映射 | 多 endpoint/访问点部署（混合云）；单 endpoint 场景无用 | **P2** | ~1d |
+| I11 | **readTail / Range 细节** | `$ICE/S3InputStream.java:186-199`：`bytes=-N` 后缀 range 读尾 | ORC footer 读取模式；Paimon ORC 支持时可补 | **P2** | ~0.1d |
+
+### 14.2 明确不移植
+
+| 项 | 证据 | 理由 |
+| --- | --- | --- |
+| S3 Analytics Accelerator | `$ICE/AnalyticsAcceleratorUtil.java:31-38`（`software.amazon.s3.analyticsaccelerator`） | Amazon 专用库，绑定 S3 Tables 元数据生态；引入即失去 MinIO 兼容 |
+| REST 远程签名（S3V4RestSignerClient） | `$ICE/signer/S3V4RestSignerClient.java` | 依赖 Iceberg REST catalog 生态，Paimon 无对应 |
+| CRT 传输 | `S3FileIOProperties.java:100-105`（`s3.crt.enabled`，默认关） | 与本 Spec D8 一致；Iceberg 亦默认关闭，佐证排除合理 |
+| Access Grants / 跨区域 ARN / 双栈 / 传输加速 | `S3FileIOProperties.java:74-123,424-444` | AWS 企业特性，fork 场景未提出需求 |
+
+### 14.3 与现有实现的对照结论
+
+Iceberg 写路径用**同步客户端 + 静态 daemon 线程池**（`S3OutputStream.java:111-125`）做 part 并发，读路径纯同步——我们的 async client + semaphore（D3）在其之上；其小文件捷径把全部 staging 文件串成 `SequenceInputStream` 单 PUT（`:412-446`），比我们的"单临时文件"多文件场景更优雅（配合 I2 切分后自然需要）。Iceberg 输入流的 skip 判据用 `stream.available()` 感知 SDK 缓冲存量（`:226`），比我们固定 `readBufferSize` 阈值更精确，可在 I1 一并借鉴。
+
 **溯源核对（2026-09-04 二轮，独立 agent 逐项验证）**：27 个 `[PORTED]/[ADAPTED]` 标注 + 8 个 D 编号偏离 + 1 个未编号偏离全部与 Flink 参考源码逐方法比对——24 项 FAITHFUL、12 项 FAITHFUL-WITH-ADAPTATION（均有注释依据）、1 项措辞失实（mkdirs "always-true"，已修正并登记为 D9）；0 Critical。核对产生的注释修正（F1–F10）已全部落码。
 
 **对比型基准测试（2026-09-04 二轮新增，三轮审查后修正为公平对比）**：`S3VsS3NativeBenchmarkTest`（paimon-s3-native 壳模块，4 用例）——同一 MinIO/JVM、**对称参数**（两侧 8MB part + 50 连接，S3A 显式开 multipart）下交替测量（interleaved best-of-3）：multipart 写断言 native ≤ s3a×1.25（公平参数后本地 0.99–1.20× 持平；早期 5.38× 系 S3A 未开 multipart 的不公平对比，已修正——真实网络端点优势引 Flink 2.17× 基准佐证）、小文件写断言 native ≤ s3a×2（本地稳定 1.5–2.1× 优势）、顺序读断言 native ≤ s3a×1.5（持平）、向量读验证功能正确性并打印对比（S3A 无对应能力，独有优势）。放在壳模块因两个实现的类仅在此处可同 classpath 共存且无 Maven 循环。
