@@ -31,6 +31,7 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.net.URI;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Random;
 
@@ -360,6 +361,26 @@ class S3NativeFileIOIntegrationTest {
                     .isEqualTo(java.util.Arrays.copyOfRange(data, 500_000, 502_048));
         }
         fs.delete(path, true);
+    }
+
+    @Test
+    void testRecursiveDeleteWithSmallBatchSize() throws Exception {
+        Map<String, String> config = new HashMap<>(MINIO_CONTAINER.getS3ConfigOptions());
+        config.put("s3.upload.min.part.size", "5 mb");
+        // Force many small DeleteObjects batches through the parallel path (I7).
+        config.put("s3.delete.batch-size", "3");
+        config.put("s3.delete.num-threads", "4");
+        FileIO smallBatchIO = createFileIO(Options.fromMap(config));
+
+        Path dir = new Path(base, "small-batch");
+        smallBatchIO.mkdirs(dir);
+        for (int i = 0; i < 10; i++) {
+            writeFile(new Path(dir, "f" + i), randomBytes(8, 20 + i));
+        }
+        assertThat(smallBatchIO.exists(new Path(dir, "f9"))).isTrue();
+
+        assertThat(smallBatchIO.delete(dir, true)).isTrue();
+        assertThat(smallBatchIO.exists(dir)).isFalse();
     }
 
     @Test

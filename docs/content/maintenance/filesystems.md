@@ -433,6 +433,13 @@ Additional options:
 | `s3.connection.max` | 50 | HTTP connection pool size for both clients. |
 | `s3.retry.max-num-retries` | 3 | Retries per request (exponential backoff, 100ms base / 20s cap). |
 | `s3.upload.tmp.dir` | `java.io.tmpdir` | Local directory buffering parts before upload. |
+| `s3.multipart.threshold` | 1.5 | Multipart starts only above part size x this factor; smaller objects use a single PutObject. |
+| `s3.checksum-enabled` | false | Send MD5 Content-MD5 for parts and whole objects. |
+| `s3.write.storage-class` | none | Storage class for new objects (e.g. `GLACIER`, `INTELLIGENT_TIERING`). |
+| `s3.write.tags` | none | Tags for new objects, `k1:v1,k2:v2`. |
+| `s3.acl` | none | Canned ACL for new objects. |
+| `s3.delete.batch-size` | 1000 | Keys per DeleteObjects request (1-1000). |
+| `s3.delete.num-threads` | CPU cores | Concurrent DeleteObjects requests during bulk deletes. |
 
 Notes:
 

@@ -42,6 +42,7 @@ final class S3NativeOptions {
     static final int MIN_READ_BUFFER_BYTES = 256 * 1024;
     static final int DEFAULT_READ_BUFFER_BYTES = 256 * 1024;
     static final int DEFAULT_MAX_CONNECTIONS = 50;
+    static final int MAX_BATCH_DELETE_KEYS = 1000;
 
     @Nullable final String accessKey;
     @Nullable final String secretKey;
@@ -75,6 +76,12 @@ final class S3NativeOptions {
     /** Canned ACL for new objects; null = none. */
     @Nullable final String acl;
 
+    // [PORTED-ICE Spec §14 I7] Parallel batch deletion adopted from Iceberg S3FileIOProperties.
+    /** Keys per DeleteObjects request, 1..1000 (S3 API limit). */
+    final int deleteBatchSize;
+    /** Concurrent DeleteObjects requests during bulk deletes (Iceberg default: CPU cores). */
+    final int deleteThreads;
+
     private S3NativeOptions(
             @Nullable String accessKey,
             @Nullable String secretKey,
@@ -99,7 +106,9 @@ final class S3NativeOptions {
             boolean checksumEnabled,
             String writeStorageClass,
             Map<String, String> writeTags,
-            String acl) {
+            String acl,
+            int deleteBatchSize,
+            int deleteThreads) {
         this.accessKey = accessKey;
         this.secretKey = secretKey;
         this.region = region;
@@ -124,6 +133,8 @@ final class S3NativeOptions {
         this.writeStorageClass = writeStorageClass;
         this.writeTags = writeTags;
         this.acl = acl;
+        this.deleteBatchSize = deleteBatchSize;
+        this.deleteThreads = deleteThreads;
     }
 
     /**
@@ -219,7 +230,31 @@ final class S3NativeOptions {
                 normalized.getBoolean("s3.checksum-enabled", false),
                 normalized.get("s3.write.storage-class"),
                 parseTags(normalized.get("s3.write.tags")),
-                normalized.get("s3.acl"));
+                normalized.get("s3.acl"),
+                validatedDeleteBatchSize(normalized),
+                validatedDeleteThreads(normalized));
+    }
+
+    /** [PORTED-ICE Spec §14 I7] Keys per DeleteObjects request, 1..1000 (S3 API limit). */
+    private static int validatedDeleteBatchSize(Options options) {
+        int batchSize = options.getInteger("s3.delete.batch-size", MAX_BATCH_DELETE_KEYS);
+        if (batchSize < 1 || batchSize > MAX_BATCH_DELETE_KEYS) {
+            throw new IllegalArgumentException(
+                    "s3.delete.batch-size must be between 1 and 1000, but was: " + batchSize);
+        }
+        return batchSize;
+    }
+
+    /** [PORTED-ICE Spec §14 I7] Concurrent DeleteObjects requests; Iceberg default = CPU cores. */
+    private static int validatedDeleteThreads(Options options) {
+        int threads =
+                options.getInteger(
+                        "s3.delete.num-threads", Runtime.getRuntime().availableProcessors());
+        if (threads < 1) {
+            throw new IllegalArgumentException(
+                    "s3.delete.num-threads must be positive, but was: " + threads);
+        }
+        return threads;
     }
 
     private static double validatedThresholdFactor(Options options) {
