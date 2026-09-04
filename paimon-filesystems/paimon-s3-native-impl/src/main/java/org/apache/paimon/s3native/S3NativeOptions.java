@@ -81,7 +81,10 @@ final class S3NativeOptions {
     @Nullable final software.amazon.awssdk.services.s3.model.ObjectCannedACL acl;
 
     // [PORTED-ICE Spec §14 I7] Parallel batch deletion adopted from Iceberg S3FileIOProperties.
-    /** Keys per DeleteObjects request, 1..1000 (S3 API limit). */
+    /**
+     * Keys per DeleteObjects request, 1..1000 (S3 API limit). Default 1000 keeps this module's
+     * pre-Iceberg behavior; Iceberg's own default is 250.
+     */
     final int deleteBatchSize;
     /** Concurrent DeleteObjects requests during bulk deletes (Iceberg default: CPU cores). */
     final int deleteThreads;

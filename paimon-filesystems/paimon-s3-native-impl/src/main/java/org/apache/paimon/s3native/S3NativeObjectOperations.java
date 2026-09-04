@@ -34,6 +34,7 @@ import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.ObjectIdentifier;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.services.s3.model.S3Error;
 import software.amazon.awssdk.services.s3.model.S3Exception;
 import software.amazon.awssdk.services.s3.model.S3Object;
 
@@ -41,8 +42,20 @@ import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Sync S3 metadata/object operations used by {@link S3NativeFileIO}.
@@ -150,55 +163,67 @@ final class S3NativeObjectOperations {
         if (keys.isEmpty()) {
             return;
         }
-        List<java.util.concurrent.Future<List<String>>> tasks = new ArrayList<>();
+        // Deduplicate like Iceberg's SetMultimap accumulation; duplicates would inflate the
+        // failure count and repeat keys inside one request.
+        List<String> distinctKeys = new ArrayList<>(new LinkedHashSet<>(keys));
+        List<Future<List<String>>> tasks = new ArrayList<>();
+        // First whole-request failure is kept as the cause of the aggregated IOException.
+        AtomicReference<Exception> firstFailure = new AtomicReference<>();
         ExecutorService pool = deletePool(threads);
-        try {
-            for (int from = 0; from < keys.size(); from += batchSize) {
-                List<String> batch = keys.subList(from, Math.min(keys.size(), from + batchSize));
-                List<ObjectIdentifier> identifiers = new ArrayList<>(batch.size());
-                for (String key : batch) {
-                    identifiers.add(ObjectIdentifier.builder().key(key).build());
-                }
-                DeleteObjectsRequest request =
-                        DeleteObjectsRequest.builder()
-                                .bucket(bucket)
-                                .delete(Delete.builder().objects(identifiers).build())
-                                .build();
-                tasks.add(pool.submit(() -> deleteBatchQuietly(request, batch)));
+        for (int from = 0; from < distinctKeys.size(); from += batchSize) {
+            List<String> batch =
+                    distinctKeys.subList(from, Math.min(distinctKeys.size(), from + batchSize));
+            List<ObjectIdentifier> identifiers = new ArrayList<>(batch.size());
+            for (String key : batch) {
+                identifiers.add(ObjectIdentifier.builder().key(key).build());
             }
+            DeleteObjectsRequest request =
+                    DeleteObjectsRequest.builder()
+                            .bucket(bucket)
+                            .delete(Delete.builder().objects(identifiers).build())
+                            .build();
+            tasks.add(pool.submit(() -> deleteBatchQuietly(request, batch, firstFailure)));
+        }
 
-            List<String> failedKeys = new ArrayList<>();
-            for (java.util.concurrent.Future<List<String>> task : tasks) {
-                try {
-                    failedKeys.addAll(task.get());
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("Interrupted while waiting for batch deletions", e);
-                } catch (java.util.concurrent.ExecutionException e) {
-                    throw new IOException("Batch deletion task failed", e.getCause());
+        List<String> failedKeys = new ArrayList<>();
+        for (Future<List<String>> task : tasks) {
+            try {
+                failedKeys.addAll(task.get());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                // Cancel outstanding batches like Iceberg; they would keep issuing requests
+                // after the caller aborted.
+                for (Future<List<String>> outstanding : tasks) {
+                    outstanding.cancel(true);
                 }
+                throw new IOException("Interrupted while waiting for batch deletions", e);
+            } catch (ExecutionException e) {
+                // Unexpected: deleteBatchQuietly maps every failure to failed keys.
+                throw new IOException("Batch deletion task failed", e.getCause());
             }
-            if (!failedKeys.isEmpty()) {
-                throw new IOException(
-                        "Batch delete failed for "
-                                + failedKeys.size()
-                                + " keys, first: "
-                                + failedKeys.get(0));
-            }
-        } finally {
-            // Tasks are done (or interrupted); nothing to cancel on the shared pool.
+        }
+        if (!failedKeys.isEmpty()) {
+            throw new IOException(
+                    "Batch delete failed for "
+                            + failedKeys.size()
+                            + " keys, first: "
+                            + failedKeys.get(0),
+                    firstFailure.get());
         }
     }
 
     /** Runs one DeleteObjects request; returns the keys that failed non-NotFound errors. */
-    private List<String> deleteBatchQuietly(DeleteObjectsRequest request, List<String> batch) {
+    private List<String> deleteBatchQuietly(
+            DeleteObjectsRequest request,
+            List<String> batch,
+            AtomicReference<Exception> firstFailure) {
         try {
             DeleteObjectsResponse response = client.deleteObjects(request);
             if (!response.hasErrors()) {
-                return java.util.Collections.emptyList();
+                return Collections.emptyList();
             }
             List<String> failed = new ArrayList<>();
-            for (software.amazon.awssdk.services.s3.model.S3Error error : response.errors()) {
+            for (S3Error error : response.errors()) {
                 String code = error.code() == null ? "" : error.code();
                 // Per-key NotFound means the object is already gone — success per Spec D6.
                 if (!"NoSuchKey".equals(code) && !"NotFound".equals(code)) {
@@ -206,24 +231,30 @@ final class S3NativeObjectOperations {
                 }
             }
             return failed;
-        } catch (S3Exception e) {
-            LOG.warn("DeleteObjects call failed for {} keys: {}", batch.size(), e.getMessage());
+        } catch (Exception e) {
+            // Whole-request failure: S3Exception, but also SdkClientException for network and
+            // credential failures (which do not extend S3Exception). Mark the batch's keys
+            // failed and remember the first cause.
+            firstFailure.compareAndSet(null, e);
+            LOG.warn("DeleteObjects call failed for {} keys", batch.size(), e);
             return new ArrayList<>(batch);
         }
     }
 
-    /** Shared daemon pools keyed by thread count; one entry per configured parallelism. */
-    private static final java.util.Map<Integer, ExecutorService> DELETE_POOLS =
-            new java.util.concurrent.ConcurrentHashMap<>();
+    /**
+     * Shared daemon pools keyed by thread count — one pool per configured parallelism instead of
+     * Iceberg's single static pool, so option changes do not resize a live pool. Core threads time
+     * out so pools for abandoned settings reclaim their threads.
+     */
+    private static final Map<Integer, ExecutorService> DELETE_POOLS = new ConcurrentHashMap<>();
 
     private static ExecutorService deletePool(int threads) {
         return DELETE_POOLS.computeIfAbsent(
                 threads,
                 n -> {
-                    java.util.concurrent.ThreadFactory factory =
-                            new java.util.concurrent.ThreadFactory() {
-                                private final java.util.concurrent.atomic.AtomicInteger seq =
-                                        new java.util.concurrent.atomic.AtomicInteger();
+                    ThreadFactory factory =
+                            new ThreadFactory() {
+                                private final AtomicInteger seq = new AtomicInteger();
 
                                 @Override
                                 public Thread newThread(Runnable r) {
@@ -234,13 +265,16 @@ final class S3NativeObjectOperations {
                                     return t;
                                 }
                             };
-                    return new java.util.concurrent.ThreadPoolExecutor(
-                            n,
-                            n,
-                            60L,
-                            java.util.concurrent.TimeUnit.SECONDS,
-                            new java.util.concurrent.LinkedBlockingQueue<>(),
-                            factory);
+                    ThreadPoolExecutor executor =
+                            new ThreadPoolExecutor(
+                                    n,
+                                    n,
+                                    60L,
+                                    TimeUnit.SECONDS,
+                                    new LinkedBlockingQueue<>(),
+                                    factory);
+                    executor.allowCoreThreadTimeOut(true);
+                    return executor;
                 });
     }
 
