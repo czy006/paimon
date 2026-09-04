@@ -170,6 +170,35 @@ class S3NativeObjectOperationsTest {
     }
 
     @Test
+    void testSseCustomerHeadersOnHeadObject() {
+        S3Client client = mock(S3Client.class);
+        when(client.headObject(
+                        any(software.amazon.awssdk.services.s3.model.HeadObjectRequest.class)))
+                .thenThrow(
+                        (software.amazon.awssdk.services.s3.model.NoSuchKeyException)
+                                software.amazon.awssdk.services.s3.model.NoSuchKeyException
+                                        .builder()
+                                        .build());
+
+        org.apache.paimon.options.Options options = new org.apache.paimon.options.Options();
+        options.set("s3.sse.type", "custom");
+        options.set("s3.sse.key", "c2VjcmV0LWtleQ==");
+        options.set("s3.sse.md5", "tT1l8pJFI9r1hE0A5fFQjg==");
+        S3NativeObjectOperations sseOps =
+                new S3NativeObjectOperations(client, "bucket", S3NativeSse.from(options));
+        org.assertj.core.api.Assertions.assertThatCode(() -> sseOps.headObjectOrNull("k"))
+                .doesNotThrowAnyException();
+
+        org.mockito.ArgumentCaptor<software.amazon.awssdk.services.s3.model.HeadObjectRequest>
+                request =
+                        org.mockito.ArgumentCaptor.forClass(
+                                software.amazon.awssdk.services.s3.model.HeadObjectRequest.class);
+        verify(client).headObject(request.capture());
+        assertThat(request.getValue().sseCustomerAlgorithm()).isEqualTo("AES256");
+        assertThat(request.getValue().sseCustomerKey()).isEqualTo("c2VjcmV0LWtleQ==");
+    }
+
+    @Test
     void testEmptyKeyListIsNoop() throws IOException {
         S3Client client = mock(S3Client.class);
         ops(client).deleteBatch(new ArrayList<>(), 1000, 4);

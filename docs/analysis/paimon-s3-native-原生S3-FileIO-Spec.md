@@ -491,6 +491,8 @@ mirror `paimon-s3/pom.xml` 的结构（dependency-plugin 把 impl jar unpack 进
 
 > 参考源码：本地 `/Users/SL/javaProject/iceberg`（main @ `27bfd00d6`），模块 `aws/src/main/java/org/apache/iceberg/aws/s3/`（下文 `$ICE` 代指）。逐类通读：`S3OutputStream`、`S3InputStream`、`S3FileIO`、`S3FileIOProperties`、`S3RequestUtil`、`VendedCredentialsProvider`、`AnalyticsAcceleratorUtil`。本节为**移植候选登记**，非当前范围承诺；实施时逐项另立提交并沿用 §7 溯源规范（`[PORTED-ICE]` 标注建议）。
 
+> **实现记录（2026-09-05）**：I1–I8 已全部实现并逐提交审查（提交 a6a19d4 / 11fd50c8 / 5f0ae8a / a1af12c3 / 737c545 / 2fd882a），含三轮审查修复（枚举类型化 fail-fast、阈值尾部检查、NaN 防护、SdkClientException 聚合、cause 保留、去重、任务取消）。I9/I10/I11 维持不实施（fork 场景无需求）；SSE-C 完整加解密 roundtrip 需 HTTPS 端点（本地 MinIO 用 S3 的 HTTPS-only 规则做了端到端 wiring 验证）。
+
 ### 14.1 候选清单（按优先级）
 
 | # | 特性 | Iceberg 实现（证据） | 对我们的价值 | 优先级 | 预估 |

@@ -369,9 +369,10 @@ class S3NativeFileIOIntegrationTest {
         // [PORTED-ICE I8] SSE-C end-to-end wiring proof: the put request carries the customer
         // key headers all the way to MinIO, which rejects them with S3's standard
         // "secure connection" rule — SSE-C is HTTPS-only and this container runs plain HTTP.
-        // A full encrypt/decrypt round trip needs an HTTPS endpoint; the request shaping
-        // itself (PutObject/CreateMultipartUpload/UploadPart/Get/Head) is pinned by the
-        // Mockito tests in S3NativePositionOutputStreamTest.
+        // A full encrypt/decrypt round trip needs an HTTPS endpoint; request shaping for
+        // PutObject/CreateMultipartUpload/UploadPart is pinned in
+        // S3NativePositionOutputStreamTest, and for GetObject/HeadObject in the stream and
+        // operations test classes.
         byte[] keyBytes = new byte[32];
         new Random(99).nextBytes(keyBytes);
         String key64 = Base64.getEncoder().encodeToString(keyBytes);

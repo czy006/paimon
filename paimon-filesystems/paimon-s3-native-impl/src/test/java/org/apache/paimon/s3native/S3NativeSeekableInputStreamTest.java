@@ -43,6 +43,17 @@ import static org.mockito.Mockito.when;
 /** Tests for the mid-stream-read retry ([PORTED-ICE I1]) and unclosed-stream finalization (I3). */
 class S3NativeSeekableInputStreamTest {
 
+    private static final String SSE_KEY = "c2VjcmV0LWtleQ==";
+    private static final String SSE_MD5 = "tT1l8pJFI9r1hE0A5fFQjg==";
+
+    private static S3NativeSse customSse() {
+        org.apache.paimon.options.Options options = new org.apache.paimon.options.Options();
+        options.set("s3.sse.type", "custom");
+        options.set("s3.sse.key", SSE_KEY);
+        options.set("s3.sse.md5", SSE_MD5);
+        return S3NativeSse.from(options);
+    }
+
     private static S3Client clientServing(
             java.util.function.BiFunction<Integer, Integer, InputStream> streamForCall) {
         S3Client client = mock(S3Client.class);
@@ -83,6 +94,61 @@ class S3NativeSeekableInputStreamTest {
                 return delegate.read();
             }
         };
+    }
+
+    @Test
+    void testSseCustomerHeadersOnStreamOpenAndPread() throws Exception {
+        S3Client client = mock(S3Client.class);
+        java.util.List<GetObjectRequest> requests =
+                java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+        when(client.getObject(any(GetObjectRequest.class)))
+                .thenAnswer(
+                        invocation -> {
+                            requests.add(invocation.getArgument(0));
+                            return new ResponseInputStream<>(
+                                    GetObjectResponse.builder().build(),
+                                    new ByteArrayInputStream(new byte[] {1, 2, 3, 4}));
+                        });
+
+        S3NativeSse sse = customSse();
+        try (S3NativeSeekableInputStream in =
+                new S3NativeSeekableInputStream(client, "bucket", "key", 4, 256, sse)) {
+            assertThat(in.read()).isEqualTo(1); // stream-open path
+            byte[] buf = new byte[2];
+            ((org.apache.paimon.fs.VectoredReadable) in).pread(2, buf, 0, 2); // pread path
+            assertThat(buf).containsExactly(1, 2);
+        }
+
+        assertThat(requests).hasSize(2);
+        for (GetObjectRequest request : requests) {
+            assertThat(request.sseCustomerAlgorithm()).isEqualTo("AES256");
+            assertThat(request.sseCustomerKey()).isEqualTo(SSE_KEY);
+            assertThat(request.sseCustomerKeyMD5()).isEqualTo(SSE_MD5);
+        }
+    }
+
+    @Test
+    void testSseNoneSendsNoCustomerHeaders() throws Exception {
+        S3Client client = mock(S3Client.class);
+        java.util.List<GetObjectRequest> requests =
+                java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+        when(client.getObject(any(GetObjectRequest.class)))
+                .thenAnswer(
+                        invocation -> {
+                            requests.add(invocation.getArgument(0));
+                            return new ResponseInputStream<>(
+                                    GetObjectResponse.builder().build(),
+                                    new ByteArrayInputStream(new byte[] {1}));
+                        });
+
+        try (S3NativeSeekableInputStream in =
+                new S3NativeSeekableInputStream(
+                        client, "bucket", "key", 1, 256, S3NativeSse.NONE)) {
+            in.read();
+        }
+
+        assertThat(requests).hasSize(1);
+        assertThat(requests.get(0).sseCustomerKey()).isNull();
     }
 
     @Test
