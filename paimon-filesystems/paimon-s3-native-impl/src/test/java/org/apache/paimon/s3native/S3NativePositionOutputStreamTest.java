@@ -36,6 +36,7 @@ import software.amazon.awssdk.services.s3.model.UploadPartResponse;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -58,6 +59,17 @@ class S3NativePositionOutputStreamTest {
 
     private static final long PART_SIZE = 5L * 1024 * 1024;
 
+    /** Options matching the pre-threshold behavior (submit as soon as a part fills). */
+    private S3NativeOptions options(String... keyValue) {
+        org.apache.paimon.options.Options raw = new org.apache.paimon.options.Options();
+        raw.set("s3.upload.tmp.dir", tmpDir.toString());
+        raw.set("s3.multipart.threshold", "1");
+        for (int i = 0; i < keyValue.length; i += 2) {
+            raw.set(keyValue[i], keyValue[i + 1]);
+        }
+        return S3NativeOptions.from(raw);
+    }
+
     @Test
     void testSmallFileUsesSinglePutObject() throws Exception {
         S3Client sync = mock(S3Client.class);
@@ -66,8 +78,7 @@ class S3NativePositionOutputStreamTest {
                 .thenReturn(PutObjectResponse.builder().eTag("e").build());
 
         S3NativePositionOutputStream out =
-                new S3NativePositionOutputStream(
-                        sync, async, "bucket", "key", tmpDir.toString(), PART_SIZE, 2);
+                new S3NativePositionOutputStream(sync, async, "bucket", "key", options());
         out.write(new byte[128]);
         out.close();
 
@@ -101,8 +112,7 @@ class S3NativePositionOutputStreamTest {
                         });
 
         S3NativePositionOutputStream out =
-                new S3NativePositionOutputStream(
-                        sync, async, "bucket", "key", tmpDir.toString(), PART_SIZE, 2);
+                new S3NativePositionOutputStream(sync, async, "bucket", "key", options());
         // Part size is a submit threshold (as in Flink's writer): a single huge write becomes one
         // oversized part, so write in chunks like real writers do — two full parts + a tail.
         int total = (int) PART_SIZE * 2 + 10;
@@ -162,8 +172,7 @@ class S3NativePositionOutputStreamTest {
                         });
 
         S3NativePositionOutputStream out =
-                new S3NativePositionOutputStream(
-                        sync, async, "bucket", "key", tmpDir.toString(), PART_SIZE, 2);
+                new S3NativePositionOutputStream(sync, async, "bucket", "key", options());
         out.write(new byte[(int) PART_SIZE * 2 + 10]); // single 2.5-part write
         out.close();
 
@@ -193,8 +202,7 @@ class S3NativePositionOutputStreamTest {
                 .thenReturn(null);
 
         S3NativePositionOutputStream out =
-                new S3NativePositionOutputStream(
-                        sync, async, "bucket", "key", tmpDir.toString(), PART_SIZE, 2);
+                new S3NativePositionOutputStream(sync, async, "bucket", "key", options());
         out.write(new byte[(int) PART_SIZE]); // exactly one part, no tail
         out.close();
 
@@ -214,8 +222,7 @@ class S3NativePositionOutputStreamTest {
                                 UploadPartResponse.builder().eTag("etag").build()));
 
         S3NativePositionOutputStream out =
-                new S3NativePositionOutputStream(
-                        sync, async, "bucket", "key", tmpDir.toString(), PART_SIZE, 2);
+                new S3NativePositionOutputStream(sync, async, "bucket", "key", options());
         out.write(new byte[(int) PART_SIZE]); // starts a multipart upload
         assertThat(tmpDir.toFile().listFiles()).isNotNull().isNotEmpty();
 
@@ -243,8 +250,7 @@ class S3NativePositionOutputStreamTest {
                 .thenReturn(failed);
 
         S3NativePositionOutputStream out =
-                new S3NativePositionOutputStream(
-                        sync, async, "bucket", "key", tmpDir.toString(), PART_SIZE, 2);
+                new S3NativePositionOutputStream(sync, async, "bucket", "key", options());
         out.write(new byte[(int) PART_SIZE]); // triggers submit of part 1
         // The failure surfaces on close (when futures are joined).
         assertThatThrownBy(out::close).isInstanceOf(IOException.class);
@@ -253,6 +259,120 @@ class S3NativePositionOutputStreamTest {
         assertThatThrownBy(() -> out.write(1)).isInstanceOf(IOException.class);
         out.close();
         assertThat(tmpDir.toFile().listFiles()).isNullOrEmpty();
+    }
+
+    @Test
+    void testBelowThresholdUsesSinglePutObject() throws Exception {
+        // [PORTED-ICE I5] Default threshold 1.5x: a 6MB write (< 7.5MB) stays on one PutObject
+        // even though it crossed the 5MB part size (two staging files are sequenced).
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        org.apache.paimon.options.Options raw = new org.apache.paimon.options.Options();
+        raw.set("s3.upload.tmp.dir", tmpDir.toString()); // threshold defaults to 1.5
+        when(sync.putObject(any(PutObjectRequest.class), any(RequestBody.class)))
+                .thenReturn(PutObjectResponse.builder().eTag("e").build());
+
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(
+                        sync, async, "bucket", "key", S3NativeOptions.from(raw));
+        out.write(new byte[6 * 1024 * 1024]);
+        out.close();
+
+        org.mockito.ArgumentCaptor<RequestBody> body =
+                org.mockito.ArgumentCaptor.forClass(RequestBody.class);
+        verify(sync).putObject(any(PutObjectRequest.class), body.capture());
+        assertThat(body.getValue().contentLength()).isEqualTo(6L * 1024 * 1024);
+        verify(sync, never()).createMultipartUpload(any(CreateMultipartUploadRequest.class));
+        assertThat(tmpDir.toFile().listFiles()).isNullOrEmpty();
+    }
+
+    @Test
+    void testChecksumAddsContentMd5ToPutObject() throws Exception {
+        // [PORTED-ICE I4] Whole-object MD5 on the single-put path.
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        when(sync.putObject(any(PutObjectRequest.class), any(RequestBody.class)))
+                .thenReturn(PutObjectResponse.builder().eTag("e").build());
+        byte[] data = new byte[1024];
+        new java.util.Random(7).nextBytes(data);
+        java.security.MessageDigest md5 = java.security.MessageDigest.getInstance("MD5");
+        String expected = Base64.getEncoder().encodeToString(md5.digest(data));
+
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(
+                        sync, async, "bucket", "key", options("s3.checksum-enabled", "true"));
+        out.write(data);
+        out.close();
+
+        org.mockito.ArgumentCaptor<PutObjectRequest> request =
+                org.mockito.ArgumentCaptor.forClass(PutObjectRequest.class);
+        verify(sync).putObject(request.capture(), any(RequestBody.class));
+        assertThat(request.getValue().contentMD5()).isEqualTo(expected);
+    }
+
+    @Test
+    void testChecksumAddsContentMd5ToParts() throws Exception {
+        // [PORTED-ICE I4] Part-level MD5 on the multipart path.
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        when(sync.createMultipartUpload(any(CreateMultipartUploadRequest.class)))
+                .thenReturn(CreateMultipartUploadResponse.builder().uploadId("u1").build());
+        when(async.uploadPart(any(UploadPartRequest.class), any(AsyncRequestBody.class)))
+                .thenReturn(
+                        CompletableFuture.completedFuture(
+                                UploadPartResponse.builder().eTag("etag").build()));
+        when(sync.completeMultipartUpload(any(CompleteMultipartUploadRequest.class)))
+                .thenReturn(null);
+
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(
+                        sync, async, "bucket", "key", options("s3.checksum-enabled", "true"));
+        out.write(new byte[(int) PART_SIZE + 7]);
+        out.close();
+
+        org.mockito.ArgumentCaptor<UploadPartRequest> request =
+                org.mockito.ArgumentCaptor.forClass(UploadPartRequest.class);
+        verify(async, org.mockito.Mockito.times(2))
+                .uploadPart(request.capture(), any(AsyncRequestBody.class));
+        for (UploadPartRequest part : request.getAllValues()) {
+            assertThat(part.contentMD5()).isNotEmpty();
+        }
+    }
+
+    @Test
+    void testWriteTagsAndStorageClassApplied() throws Exception {
+        // [PORTED-ICE I6]
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        when(sync.createMultipartUpload(any(CreateMultipartUploadRequest.class)))
+                .thenReturn(CreateMultipartUploadResponse.builder().uploadId("u1").build());
+        when(async.uploadPart(any(UploadPartRequest.class), any(AsyncRequestBody.class)))
+                .thenReturn(
+                        CompletableFuture.completedFuture(
+                                UploadPartResponse.builder().eTag("etag").build()));
+        when(sync.completeMultipartUpload(any(CompleteMultipartUploadRequest.class)))
+                .thenReturn(null);
+
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(
+                        sync,
+                        async,
+                        "bucket",
+                        "key",
+                        options(
+                                "s3.write.tags", "team:paimon,env:prod",
+                                "s3.write.storage-class", "INTELLIGENT_TIERING"));
+        out.write(new byte[(int) PART_SIZE + 1]);
+        out.close();
+
+        org.mockito.ArgumentCaptor<CreateMultipartUploadRequest> request =
+                org.mockito.ArgumentCaptor.forClass(CreateMultipartUploadRequest.class);
+        verify(sync).createMultipartUpload(request.capture());
+        assertThat(request.getValue().storageClass())
+                .isEqualTo(
+                        software.amazon.awssdk.services.s3.model.StorageClass.INTELLIGENT_TIERING);
+        // The SDK's tagging() getter exposes the XML string form of the Tagging we set.
+        assertThat(request.getValue().tagging()).contains("team").contains("paimon");
     }
 
     @Test
@@ -265,8 +385,7 @@ class S3NativePositionOutputStreamTest {
                 .thenThrow(new RuntimeException("sync failure"));
 
         S3NativePositionOutputStream out =
-                new S3NativePositionOutputStream(
-                        sync, async, "bucket", "key", tmpDir.toString(), PART_SIZE, 2);
+                new S3NativePositionOutputStream(sync, async, "bucket", "key", options());
         assertThatThrownBy(() -> out.write(new byte[(int) PART_SIZE]))
                 .isInstanceOf(IOException.class);
         verify(sync).abortMultipartUpload(any(AbortMultipartUploadRequest.class));

@@ -23,21 +23,44 @@ import org.apache.paimon.fs.PositionOutputStream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import software.amazon.awssdk.core.async.AsyncRequestBody;
+import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
 import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.AbortMultipartUploadRequest;
+import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest;
+import software.amazon.awssdk.services.s3.model.CompletedMultipartUpload;
 import software.amazon.awssdk.services.s3.model.CompletedPart;
+import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
+import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
+import software.amazon.awssdk.services.s3.model.NoSuchUploadException;
+import software.amazon.awssdk.services.s3.model.ObjectCannedACL;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.services.s3.model.StorageClass;
+import software.amazon.awssdk.services.s3.model.Tag;
+import software.amazon.awssdk.services.s3.model.Tagging;
 import software.amazon.awssdk.services.s3.model.UploadPartRequest;
 import software.amazon.awssdk.services.s3.model.UploadPartResponse;
 
+import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
+import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.SequenceInputStream;
 import java.nio.file.Files;
+import java.security.DigestOutputStream;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -49,16 +72,22 @@ import java.util.concurrent.locks.ReentrantLock;
 /**
  * Positional output stream writing to S3.
  *
- * <p>Data is buffered into local per-part temp files (64KB write buffer). Whenever a part reaches
- * {@code partSize} it is submitted as an async {@code UploadPart} with bounded in-flight
- * concurrency; {@link #close()} uploads the tail and completes the multipart upload. Objects
- * smaller than one part take the single-{@code PutObject} shortcut.
+ * <p>Data is buffered into local per-part temp files (64KB write buffer). A filled part is rolled
+ * into a pending list and submitted as an async {@code UploadPart} with bounded in-flight
+ * concurrency once the multipart threshold is reached ([PORTED-ICE I5]: {@code threshold = partSize
+ * * factor}, default 1.5 — smaller objects stay on the single-PutObject path); {@link #close()}
+ * uploads the tail and completes the multipart upload. With {@code s3.checksum-enabled}, part-level
+ * and whole-object MD5 digests are sent as Content-MD5 ([PORTED-ICE I4]); write tags, storage class
+ * and canned ACL are attached to object-creating requests ([PORTED-ICE I6]).
  *
- * <p>[PORTED] Buffering pattern from Apache Flink flink-s3-fs-native (FLINK-38592, Apache License
- * 2.0) writer/NativeS3RecoverableFsDataOutputStream (per-part temp files, 64KB buffer,
- * CompletedPart collection, abort-on-failure), small-file path from NativeS3OutputStream. Local
+ * <p>[PORTED] Buffering pattern from Apache Flink flink-filesystems/flink-s3-fs-native
+ * (FLINK-38592, Apache License 2.0) writer/NativeS3RecoverableFsDataOutputStream (per-part temp
+ * files, 64KB buffer, CompletedPart collection, abort-on-failure) and NativeS3OutputStream
+ * (single-PutObject small-file path, here extended to Iceberg's multi-file sequence form). Local
  * reference: /Users/SL/javaProject/flink/flink-filesystems/flink-s3-fs-native/src/main/java/org/
- * apache/flink/fs/s3native/
+ * apache/flink/fs/s3native/. Iceberg reference: S3OutputStream.java (threshold switch, part
+ * splitting, MD5 digests, tags/storage-class) in /Users/SL/javaProject/iceberg/aws/src/main/
+ * java/org/apache/iceberg/aws/s3/.
  *
  * <p>[DEVIATION D3] Parts are uploaded via bounded-concurrency async UploadPart calls instead of
  * Flink's synchronous sequential uploadPart — the TransferManager offers no parallel multipart on
@@ -66,7 +95,7 @@ import java.util.concurrent.locks.ReentrantLock;
  *
  * <p>Single-writer contract like the Flink original: write/flush/close are lock-guarded so close
  * from another thread (task cancellation) stays safe. An abandoned stream that is never closed
- * leaks its local part temp files — always close in a finally block.
+ * leaks its local part temp files until finalization — always close in a finally block.
  */
 final class S3NativePositionOutputStream extends PositionOutputStream {
 
@@ -74,6 +103,7 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
 
     private static final int BUFFER_SIZE = 64 * 1024;
     private static final long CLOSE_TIMEOUT_MS = TimeUnit.MINUTES.toMillis(15);
+    private static final String OCTET_STREAM = "application/octet-stream";
 
     private final S3Client syncClient;
     private final S3AsyncClient asyncClient;
@@ -81,16 +111,26 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
     private final String key;
     private final File tmpDir;
     private final long partSize;
+    private final long thresholdBytes;
     private final Semaphore uploadPermits;
+    private final boolean checksumEnabled;
+    private final Set<Tag> writeTags;
+    private final String writeStorageClass;
+    private final String acl;
 
     private final ReentrantLock lock = new ReentrantLock();
 
     /** All temp files ever created, for best-effort cleanup on any exit path. */
     private final List<File> tempFiles = new ArrayList<>();
 
+    /** Filled parts not yet submitted (only accumulated below the multipart threshold). */
+    private final List<FileAndDigest> pendingParts = new ArrayList<>();
+
     private final List<CompletableFuture<CompletedPart>> partFutures = new ArrayList<>();
 
     private OutputStream currentBuffer;
+    private MessageDigest currentPartDigest;
+    private MessageDigest wholeObjectDigest;
     private File currentPartFile;
     private long currentPartSize;
 
@@ -107,20 +147,43 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
             S3AsyncClient asyncClient,
             String bucket,
             String key,
-            String tmpDir,
-            long partSize,
-            int maxConcurrentUploads)
+            S3NativeOptions options)
             throws IOException {
         this.syncClient = syncClient;
         this.asyncClient = asyncClient;
         this.bucket = bucket;
         this.key = key;
-        this.partSize = partSize;
-        this.uploadPermits = new Semaphore(maxConcurrentUploads);
+        this.partSize = options.partSizeBytes;
+        this.thresholdBytes = (long) (options.partSizeBytes * options.multipartThresholdFactor);
+        this.uploadPermits = new Semaphore(options.maxConcurrentUploads);
+        this.checksumEnabled = options.checksumEnabled;
+        this.writeTags = toTags(options.writeTags);
+        this.writeStorageClass = options.writeStorageClass;
+        this.acl = options.acl;
         this.createStack = Thread.currentThread().getStackTrace();
-        this.tmpDir = new File(tmpDir);
-        Files.createDirectories(this.tmpDir.toPath());
+        this.tmpDir = new File(options.tmpDir);
+        if (checksumEnabled) {
+            this.currentPartDigest = newDigest();
+            this.wholeObjectDigest = newDigest();
+        }
+        Files.createDirectories(tmpDir.toPath());
         rollPartFile();
+    }
+
+    private static Set<Tag> toTags(Map<String, String> tagMap) {
+        Set<Tag> tags = new HashSet<>();
+        for (Map.Entry<String, String> entry : tagMap.entrySet()) {
+            tags.add(Tag.builder().key(entry.getKey()).value(entry.getValue()).build());
+        }
+        return tags;
+    }
+
+    private static MessageDigest newDigest() {
+        try {
+            return MessageDigest.getInstance("MD5");
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("MD5 digest unavailable", e);
+        }
     }
 
     @Override
@@ -141,7 +204,8 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
             currentBuffer.write(b);
             pos++;
             currentPartSize++;
-            maybeSubmitPart();
+            updateWholeDigest(new byte[] {(byte) b}, 0, 1);
+            onPartMaybeFull();
         } finally {
             lock.unlock();
         }
@@ -167,14 +231,17 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
                 currentBuffer.write(b, relativeOffset, writeSize);
                 pos += writeSize;
                 currentPartSize += writeSize;
+                updateWholeDigest(b, relativeOffset, writeSize);
                 remaining -= writeSize;
                 relativeOffset += writeSize;
-                submitCurrentPart();
+                rollPendingPart();
+                maybeStartUploading();
             }
             currentBuffer.write(b, relativeOffset, remaining);
             pos += remaining;
             currentPartSize += remaining;
-            maybeSubmitPart();
+            updateWholeDigest(b, relativeOffset, remaining);
+            onPartMaybeFull();
         } finally {
             lock.unlock();
         }
@@ -203,28 +270,39 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
             closed = true;
             try {
                 if (uploadId == null) {
-                    // Small-file shortcut: the whole object fits a single PutObject.
-                    // [PORTED] NativeS3OutputStream#uploadToS3. [DEVIATION] Uses the sync client
-                    // instead of Spec §6.5's async putObject — functionally equivalent, simpler
-                    // error handling under the close lock.
+                    // [PORTED-ICE I5] Below the threshold: one PutObject over the sequence of all
+                    // staging files (Iceberg S3OutputStream#completeUploads).
                     currentBuffer.flush();
                     currentBuffer.close();
                     currentBuffer = null;
+                    List<FileAndDigest> parts = allParts();
+                    long contentLength = 0;
+                    for (FileAndDigest part : parts) {
+                        contentLength += part.file.length();
+                    }
+                    PutObjectRequest.Builder requestBuilder =
+                            PutObjectRequest.builder().bucket(bucket).key(key);
+                    applyWriteAttributes(
+                            requestBuilder::tagging,
+                            requestBuilder::storageClass,
+                            requestBuilder::acl);
+                    if (checksumEnabled && wholeObjectDigest != null) {
+                        requestBuilder.contentMD5(
+                                Base64.getEncoder().encodeToString(wholeObjectDigest.digest()));
+                    }
                     syncClient.putObject(
-                            software.amazon.awssdk.services.s3.model.PutObjectRequest.builder()
-                                    .bucket(bucket)
-                                    .key(key)
-                                    .build(),
-                            software.amazon.awssdk.core.sync.RequestBody.fromFile(
-                                    currentPartFile.toPath()));
+                            requestBuilder.build(),
+                            RequestBody.fromContentProvider(
+                                    () -> sequence(parts), contentLength, OCTET_STREAM));
                 } else {
                     if (currentPartSize > 0) {
-                        // submitCurrentPart flushes and closes the tail buffer itself.
-                        submitCurrentPart();
+                        rollPendingPart();
                     } else {
                         currentBuffer.close();
                         currentBuffer = null;
+                        discardCurrentEmptyPart();
                     }
+                    submitPendingParts();
                     completeUpload();
                 }
             } catch (IOException | RuntimeException e) {
@@ -246,18 +324,70 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
         }
     }
 
-    private void maybeSubmitPart() throws IOException {
+    /** The whole-object digest only covers the pre-multipart prefix, as in Iceberg. */
+    private void updateWholeDigest(byte[] b, int off, int len) {
+        if (checksumEnabled && uploadId == null && wholeObjectDigest != null) {
+            wholeObjectDigest.update(b, off, len);
+        }
+    }
+
+    private void onPartMaybeFull() throws IOException {
         if (currentPartSize >= partSize) {
-            submitCurrentPart();
+            rollPendingPart();
+            maybeStartUploading();
         }
     }
 
     /**
-     * Flushes and closes the current part file and submits it as an async UploadPart; a fresh part
-     * file is rolled for subsequent writes. Any failure aborts the upload and poisons the stream so
-     * later writes fail fast with the original cause chain intact.
+     * [PORTED-ICE I5] Parts start uploading only once the stream has passed the multipart
+     * threshold; afterwards every filled part is submitted immediately.
      */
-    private void submitCurrentPart() throws IOException {
+    private void maybeStartUploading() throws IOException {
+        if (uploadId != null || pos >= thresholdBytes) {
+            submitPendingParts();
+        }
+    }
+
+    private List<FileAndDigest> allParts() {
+        List<FileAndDigest> all = new ArrayList<>(pendingParts);
+        if (currentPartFile != null) {
+            all.add(new FileAndDigest(currentPartFile, null));
+        }
+        return all;
+    }
+
+    private void discardCurrentEmptyPart() {
+        if (currentPartFile != null && currentPartFile.delete()) {
+            tempFiles.remove(currentPartFile);
+        }
+        currentPartFile = null;
+    }
+
+    private InputStream sequence(List<FileAndDigest> parts) {
+        if (parts.isEmpty()) {
+            return new ByteArrayInputStream(new byte[0]);
+        }
+        List<InputStream> streams = new ArrayList<>();
+        for (FileAndDigest part : parts) {
+            streams.add(uncheckedInputStream(part.file));
+        }
+        InputStream sequence = streams.get(0);
+        for (int i = 1; i < streams.size(); i++) {
+            sequence = new SequenceInputStream(sequence, streams.get(i));
+        }
+        return sequence;
+    }
+
+    private static InputStream uncheckedInputStream(File file) {
+        try {
+            return new BufferedInputStream(Files.newInputStream(file.toPath()));
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /** Closes the current part file and moves it to the pending list; rolls a fresh file. */
+    private void rollPendingPart() throws IOException {
         try {
             currentBuffer.flush();
             currentBuffer.close();
@@ -265,62 +395,88 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
             throw new IOException("Failed to flush local part file for " + key, e);
         }
         currentBuffer = null;
-
-        if (uploadId == null) {
-            uploadId = startMultipartUpload();
+        byte[] digest = null;
+        if (checksumEnabled && currentPartDigest != null) {
+            digest = currentPartDigest.digest();
+            currentPartDigest = newDigest();
         }
-
-        final File partFile = currentPartFile;
-        final int partNumber = nextPartNumber++;
-        try {
-            // Bounded in-flight parts; single-writer contract makes blocking under the lock safe.
-            uploadPermits.acquire();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            failStream();
-            throw new IOException("Interrupted while waiting for an upload permit", e);
-        }
-        try {
-            CompletableFuture<CompletedPart> future =
-                    asyncClient
-                            .uploadPart(
-                                    UploadPartRequest.builder()
-                                            .bucket(bucket)
-                                            .key(key)
-                                            .uploadId(uploadId)
-                                            .partNumber(partNumber)
-                                            .build(),
-                                    AsyncRequestBody.fromFile(partFile.toPath()))
-                            .thenApply(response -> toCompletedPart(partNumber, response, partFile))
-                            .whenComplete((part, error) -> uploadPermits.release());
-            partFutures.add(future);
-        } catch (RuntimeException e) {
-            uploadPermits.release(); // whenComplete never registered for a synchronous failure
-            failStream();
-            throw new IOException("Failed to submit part " + partNumber + " of " + key, e);
-        }
+        pendingParts.add(new FileAndDigest(currentPartFile, digest));
         rollPartFile();
     }
 
-    /** Aborts the multipart upload and permanently closes the stream on a submit failure. */
-    private void failStream() {
-        abortUploadQuietly();
-        cleanupTempFiles();
-        closed = true;
+    /**
+     * Submits all pending parts as async UploadPart calls with bounded in-flight concurrency. Any
+     * failure aborts the upload and poisons the stream so later writes fail fast with the original
+     * cause chain intact.
+     */
+    private void submitPendingParts() throws IOException {
+        if (pendingParts.isEmpty()) {
+            return;
+        }
+        if (uploadId == null) {
+            uploadId = startMultipartUpload();
+        }
+        for (FileAndDigest part : pendingParts) {
+            final File partFile = part.file;
+            final int partNumber = nextPartNumber++;
+            try {
+                // Bounded in-flight parts; single-writer contract makes blocking under the lock
+                // safe.
+                uploadPermits.acquire();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                failStream();
+                throw new IOException("Interrupted while waiting for an upload permit", e);
+            }
+            try {
+                UploadPartRequest.Builder requestBuilder =
+                        UploadPartRequest.builder()
+                                .bucket(bucket)
+                                .key(key)
+                                .uploadId(uploadId)
+                                .partNumber(partNumber);
+                if (part.md5 != null) {
+                    requestBuilder.contentMD5(Base64.getEncoder().encodeToString(part.md5));
+                }
+                CompletableFuture<CompletedPart> future =
+                        asyncClient
+                                .uploadPart(
+                                        requestBuilder.build(),
+                                        AsyncRequestBody.fromFile(partFile.toPath()))
+                                .thenApply(
+                                        response -> toCompletedPart(partNumber, response, partFile))
+                                .whenComplete((completed, error) -> uploadPermits.release());
+                partFutures.add(future);
+            } catch (RuntimeException e) {
+                uploadPermits.release(); // whenComplete never registered on synchronous failure
+                failStream();
+                throw new IOException("Failed to submit part " + partNumber + " of " + key, e);
+            }
+        }
+        pendingParts.clear();
     }
 
-    private String startMultipartUpload() throws IOException {
-        try {
-            return syncClient
-                    .createMultipartUpload(
-                            software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest
-                                    .builder()
-                                    .bucket(bucket)
-                                    .key(key)
-                                    .build())
-                    .uploadId();
-        } catch (RuntimeException e) {
-            throw new IOException("Failed to start multipart upload for " + key, e);
+    private String startMultipartUpload() {
+        CreateMultipartUploadRequest.Builder requestBuilder =
+                CreateMultipartUploadRequest.builder().bucket(bucket).key(key);
+        applyWriteAttributes(
+                requestBuilder::tagging, requestBuilder::storageClass, requestBuilder::acl);
+        return syncClient.createMultipartUpload(requestBuilder.build()).uploadId();
+    }
+
+    /** [PORTED-ICE I6] Tags, storage class and ACL on every object-creating request. */
+    private void applyWriteAttributes(
+            java.util.function.Consumer<Tagging> taggingSetter,
+            java.util.function.Consumer<StorageClass> storageClassSetter,
+            java.util.function.Consumer<ObjectCannedACL> aclSetter) {
+        if (!writeTags.isEmpty()) {
+            taggingSetter.accept(Tagging.builder().tagSet(writeTags).build());
+        }
+        if (writeStorageClass != null) {
+            storageClassSetter.accept(StorageClass.fromValue(writeStorageClass));
+        }
+        if (acl != null) {
+            aclSetter.accept(ObjectCannedACL.fromValue(acl));
         }
     }
 
@@ -349,18 +505,14 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
         parts.sort(Comparator.comparing(CompletedPart::partNumber));
         try {
             syncClient.completeMultipartUpload(
-                    software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest
-                            .builder()
+                    CompleteMultipartUploadRequest.builder()
                             .bucket(bucket)
                             .key(key)
                             .uploadId(uploadId)
                             .multipartUpload(
-                                    software.amazon.awssdk.services.s3.model
-                                            .CompletedMultipartUpload.builder()
-                                            .parts(parts)
-                                            .build())
+                                    CompletedMultipartUpload.builder().parts(parts).build())
                             .build());
-        } catch (software.amazon.awssdk.services.s3.model.NoSuchUploadException e) {
+        } catch (NoSuchUploadException e) {
             // [PORTED] NativeS3ObjectOperations#commitMultiPartUpload — the complete request may
             // have succeeded on the server while its response was lost; S3 read-after-write
             // consistency makes a present object proof the upload committed.
@@ -374,23 +526,25 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
 
     private boolean objectExists() {
         try {
-            syncClient.headObject(
-                    software.amazon.awssdk.services.s3.model.HeadObjectRequest.builder()
-                            .bucket(bucket)
-                            .key(key)
-                            .build());
+            syncClient.headObject(HeadObjectRequest.builder().bucket(bucket).key(key).build());
             return true;
         } catch (RuntimeException e) {
             return false;
         }
     }
 
+    /** Aborts the multipart upload and permanently closes the stream on a submit failure. */
+    private void failStream() {
+        abortUploadQuietly();
+        cleanupTempFiles();
+        closed = true;
+    }
+
     private void abortUploadQuietly() {
         if (uploadId != null) {
             try {
                 syncClient.abortMultipartUpload(
-                        software.amazon.awssdk.services.s3.model.AbortMultipartUploadRequest
-                                .builder()
+                        AbortMultipartUploadRequest.builder()
                                 .bucket(bucket)
                                 .key(key)
                                 .uploadId(uploadId)
@@ -405,11 +559,25 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
         currentPartFile = new File(tmpDir, "paimon-s3-native-" + UUID.randomUUID());
         tempFiles.add(currentPartFile);
         currentPartSize = 0;
+        OutputStream outputStream;
         try {
-            currentBuffer =
+            outputStream =
                     new BufferedOutputStream(new FileOutputStream(currentPartFile), BUFFER_SIZE);
         } catch (IOException e) {
             throw new IOException("Failed to create local part file " + currentPartFile, e);
+        }
+        // [PORTED-ICE I4] Part-level MD5 accumulates as bytes pass through the buffer.
+        currentBuffer =
+                checksumEnabled && currentPartDigest != null
+                        ? new DigestOutputStream(outputStream, currentPartDigest)
+                        : outputStream;
+    }
+
+    private void cleanupTempFiles() {
+        for (File file : tempFiles) {
+            if (file.exists() && !file.delete()) {
+                file.deleteOnExit();
+            }
         }
     }
 
@@ -447,11 +615,14 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
         }
     }
 
-    private void cleanupTempFiles() {
-        for (File file : tempFiles) {
-            if (file.exists() && !file.delete()) {
-                file.deleteOnExit();
-            }
+    /** A filled staging file and, when checksums are on, its MD5 digest. */
+    private static final class FileAndDigest {
+        private final File file;
+        private final byte[] md5;
+
+        FileAndDigest(File file, byte[] md5) {
+            this.file = file;
+            this.md5 = md5;
         }
     }
 }
