@@ -38,6 +38,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -121,6 +122,113 @@ class S3NativePositionOutputStreamTest {
         assertThat(captured.get(2).partNumber()).isEqualTo(3);
         verify(sync, never()).abortMultipartUpload(any(AbortMultipartUploadRequest.class));
         assertThat(tmpDir.toFile().listFiles()).isNullOrEmpty();
+    }
+
+    @Test
+    void testSingleLargeWriteSplitsIntoParts() throws Exception {
+        // [PORTED-ICE I2] One big write() must not produce one oversized part.
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        when(sync.createMultipartUpload(any(CreateMultipartUploadRequest.class)))
+                .thenReturn(CreateMultipartUploadResponse.builder().uploadId("u1").build());
+        when(async.uploadPart(any(UploadPartRequest.class), any(AsyncRequestBody.class)))
+                .thenReturn(
+                        CompletableFuture.completedFuture(
+                                UploadPartResponse.builder().eTag("etag").build()));
+
+        List<software.amazon.awssdk.services.s3.model.CompletedPart> captured = new ArrayList<>();
+        when(sync.completeMultipartUpload(any(CompleteMultipartUploadRequest.class)))
+                .thenAnswer(
+                        invocation -> {
+                            captured.addAll(
+                                    invocation
+                                            .getArgument(0, CompleteMultipartUploadRequest.class)
+                                            .multipartUpload()
+                                            .parts());
+                            return null;
+                        });
+
+        java.util.List<Long> partLengths = new ArrayList<>();
+        when(async.uploadPart(any(UploadPartRequest.class), any(AsyncRequestBody.class)))
+                .thenAnswer(
+                        invocation -> {
+                            partLengths.add(
+                                    invocation
+                                            .getArgument(1, AsyncRequestBody.class)
+                                            .contentLength()
+                                            .get());
+                            return CompletableFuture.completedFuture(
+                                    UploadPartResponse.builder().eTag("etag").build());
+                        });
+
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(
+                        sync, async, "bucket", "key", tmpDir.toString(), PART_SIZE, 2);
+        out.write(new byte[(int) PART_SIZE * 2 + 10]); // single 2.5-part write
+        out.close();
+
+        assertThat(captured).hasSize(3);
+        assertThat(captured.get(0).partNumber()).isEqualTo(1);
+        assertThat(captured.get(2).partNumber()).isEqualTo(3);
+        // The actual I2 invariant: parts are exactly part-sized, plus the 10-byte tail.
+        assertThat(partLengths).containsExactly(PART_SIZE, PART_SIZE, 10L);
+        assertThat(tmpDir.toFile().listFiles()).isNullOrEmpty();
+    }
+
+    @Test
+    void testExactPartSizeWriteYieldsOnePart() throws Exception {
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        when(sync.createMultipartUpload(any(CreateMultipartUploadRequest.class)))
+                .thenReturn(CreateMultipartUploadResponse.builder().uploadId("u1").build());
+        AtomicInteger parts = new AtomicInteger();
+        when(async.uploadPart(any(UploadPartRequest.class), any(AsyncRequestBody.class)))
+                .thenAnswer(
+                        invocation -> {
+                            parts.incrementAndGet();
+                            return CompletableFuture.completedFuture(
+                                    UploadPartResponse.builder().eTag("etag").build());
+                        });
+        when(sync.completeMultipartUpload(any(CompleteMultipartUploadRequest.class)))
+                .thenReturn(null);
+
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(
+                        sync, async, "bucket", "key", tmpDir.toString(), PART_SIZE, 2);
+        out.write(new byte[(int) PART_SIZE]); // exactly one part, no tail
+        out.close();
+
+        assertThat(parts.get()).isEqualTo(1);
+    }
+
+    @Test
+    void testFinalizeAbortsUnclosedStream() throws Exception {
+        // [PORTED-ICE I3] GC of an unclosed stream aborts the upload and cleans temp files.
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        when(sync.createMultipartUpload(any(CreateMultipartUploadRequest.class)))
+                .thenReturn(CreateMultipartUploadResponse.builder().uploadId("u1").build());
+        when(async.uploadPart(any(UploadPartRequest.class), any(AsyncRequestBody.class)))
+                .thenReturn(
+                        CompletableFuture.completedFuture(
+                                UploadPartResponse.builder().eTag("etag").build()));
+
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(
+                        sync, async, "bucket", "key", tmpDir.toString(), PART_SIZE, 2);
+        out.write(new byte[(int) PART_SIZE]); // starts a multipart upload
+        assertThat(tmpDir.toFile().listFiles()).isNotNull().isNotEmpty();
+
+        java.lang.reflect.Method finalize =
+                S3NativePositionOutputStream.class.getDeclaredMethod("finalize");
+        finalize.setAccessible(true);
+        finalize.invoke(out);
+
+        verify(sync).abortMultipartUpload(any(AbortMultipartUploadRequest.class));
+        verify(sync, never()).completeMultipartUpload(any(CompleteMultipartUploadRequest.class));
+        assertThat(tmpDir.toFile().listFiles()).isNullOrEmpty();
+        // Double-close after finalization is a no-op.
+        out.close();
     }
 
     @Test
