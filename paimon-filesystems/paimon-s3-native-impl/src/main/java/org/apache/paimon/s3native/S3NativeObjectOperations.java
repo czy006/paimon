@@ -77,6 +77,10 @@ final class S3NativeObjectOperations {
         return bucket;
     }
 
+    S3Client client() {
+        return client;
+    }
+
     /**
      * Returns object metadata, or {@code null} when the key does not exist. 404/NoSuchKey map to
      * {@code null}; other S3 errors propagate as {@link IOException}.
