@@ -90,6 +90,17 @@ class S3NativeOptionsTest {
     }
 
     @Test
+    void testSseValidation() {
+        assertThat(parse().sse).isSameAs(S3NativeSse.NONE);
+        assertThatThrownBy(() -> parse("s3.sse.type", "bogus"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("s3.sse.type");
+        assertThatThrownBy(() -> parse("s3.sse.type", "custom", "s3.sse.key", "a2V5"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("s3.sse.md5");
+    }
+
+    @Test
     void testDeleteOptionsValidation() {
         assertThat(parse().deleteBatchSize).isEqualTo(1000);
         assertThat(parse("s3.delete.batch-size", "7").deleteBatchSize).isEqualTo(7);

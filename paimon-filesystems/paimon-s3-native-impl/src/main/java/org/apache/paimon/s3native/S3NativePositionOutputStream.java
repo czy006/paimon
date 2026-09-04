@@ -119,6 +119,7 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
     private final Set<Tag> writeTags;
     @Nullable private final StorageClass writeStorageClass;
     @Nullable private final ObjectCannedACL acl;
+    private final S3NativeSse sse;
 
     private final ReentrantLock lock = new ReentrantLock();
 
@@ -162,6 +163,7 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
         this.writeTags = toTags(options.writeTags);
         this.writeStorageClass = options.writeStorageClass;
         this.acl = options.acl;
+        this.sse = options.sse;
         this.createStack = Thread.currentThread().getStackTrace();
         this.tmpDir = new File(options.tmpDir);
         if (checksumEnabled) {
@@ -291,6 +293,7 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
                     }
                     PutObjectRequest.Builder requestBuilder =
                             PutObjectRequest.builder().bucket(bucket).key(key);
+                    sse.apply(requestBuilder);
                     applyWriteAttributes(
                             requestBuilder::tagging,
                             requestBuilder::storageClass,
@@ -444,6 +447,7 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
                                 .key(key)
                                 .uploadId(uploadId)
                                 .partNumber(partNumber);
+                sse.applyCustomer(requestBuilder);
                 if (part.md5 != null) {
                     requestBuilder.contentMD5(Base64.getEncoder().encodeToString(part.md5));
                 }
@@ -468,6 +472,7 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
     private String startMultipartUpload() throws IOException {
         CreateMultipartUploadRequest.Builder requestBuilder =
                 CreateMultipartUploadRequest.builder().bucket(bucket).key(key);
+        sse.apply(requestBuilder);
         applyWriteAttributes(
                 requestBuilder::tagging, requestBuilder::storageClass, requestBuilder::acl);
         try {
@@ -539,7 +544,12 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
 
     private boolean objectExists() {
         try {
-            syncClient.headObject(HeadObjectRequest.builder().bucket(bucket).key(key).build());
+            // [PORTED-ICE I8] The NoSuchUpload recovery probe carries SSE-C headers like
+            // Iceberg's getObjectMetadata recovery path.
+            software.amazon.awssdk.services.s3.model.HeadObjectRequest.Builder builder =
+                    HeadObjectRequest.builder().bucket(bucket).key(key);
+            sse.applyCustomer(builder);
+            syncClient.headObject(builder.build());
             return true;
         } catch (RuntimeException e) {
             return false;

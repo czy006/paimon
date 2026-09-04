@@ -105,12 +105,14 @@ public class S3NativeFileIO implements FileIO {
         if (head == null) {
             throw new FileNotFoundException("File does not exist: " + path);
         }
+        S3NativeOptions resolved = resolvedOptions();
         return new S3NativeSeekableInputStream(
                 provider().syncClient(),
                 S3PathUtils.bucket(path),
                 key,
                 head.contentLength,
-                resolvedOptions().readBufferSize);
+                resolved.readBufferSize,
+                resolved.sse);
     }
 
     @Override
@@ -537,7 +539,8 @@ public class S3NativeFileIO implements FileIO {
     // ------------------------------------------------------------------------
 
     private S3NativeObjectOperations ops(Path path) {
-        return new S3NativeObjectOperations(provider().syncClient(), S3PathUtils.bucket(path));
+        return new S3NativeObjectOperations(
+                provider().syncClient(), S3PathUtils.bucket(path), resolvedOptions().sse);
     }
 
     /** Lazily rebuilds the typed options after Java deserialization. */

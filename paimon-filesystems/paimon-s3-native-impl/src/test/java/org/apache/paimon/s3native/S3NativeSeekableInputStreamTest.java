@@ -95,7 +95,7 @@ class S3NativeSeekableInputStreamTest {
                                         : new ByteArrayInputStream("AB".getBytes()));
 
         S3NativeSeekableInputStream in =
-                new S3NativeSeekableInputStream(client, "bucket", "key", 2, 256);
+                new S3NativeSeekableInputStream(client, "bucket", "key", 2, 256, S3NativeSse.NONE);
         assertThat(in.read()).isEqualTo('A');
         assertThat(in.read()).isEqualTo('B');
         // The reopen went through a fresh GetObject; the retried byte comes from the new stream.
@@ -116,7 +116,7 @@ class S3NativeSeekableInputStreamTest {
                                 });
 
         S3NativeSeekableInputStream in =
-                new S3NativeSeekableInputStream(client, "bucket", "key", 2, 256);
+                new S3NativeSeekableInputStream(client, "bucket", "key", 2, 256, S3NativeSse.NONE);
         assertThatThrownBy(in::read).isInstanceOf(IOException.class);
         // 1 initial + 2 retries, then propagate.
         verify(client, times(3)).getObject(any(GetObjectRequest.class));
@@ -136,7 +136,7 @@ class S3NativeSeekableInputStreamTest {
                                 });
 
         S3NativeSeekableInputStream in =
-                new S3NativeSeekableInputStream(client, "bucket", "key", 2, 256);
+                new S3NativeSeekableInputStream(client, "bucket", "key", 2, 256, S3NativeSse.NONE);
         assertThatThrownBy(in::read).isInstanceOf(FileNotFoundException.class);
         verify(client, times(1)).getObject(any(GetObjectRequest.class));
         in.close();
@@ -168,7 +168,8 @@ class S3NativeSeekableInputStreamTest {
                                                 data.substring(rangeStart).getBytes()));
 
         S3NativeSeekableInputStream in =
-                new S3NativeSeekableInputStream(client, "bucket", "key", data.length(), 256);
+                new S3NativeSeekableInputStream(
+                        client, "bucket", "key", data.length(), 256, S3NativeSse.NONE);
         assertThat(in.read()).isEqualTo('X');
         in.seek(3); // forward skip of 2 (< readBufferSize) triggers the failing refill
         // lazySeek already committed streamPos to the seek target, so the reopen Range is
@@ -183,7 +184,7 @@ class S3NativeSeekableInputStreamTest {
         S3Client client =
                 clientServing((call, rangeStart) -> new ByteArrayInputStream("AB".getBytes()));
         S3NativeSeekableInputStream in =
-                new S3NativeSeekableInputStream(client, "bucket", "key", 2, 256);
+                new S3NativeSeekableInputStream(client, "bucket", "key", 2, 256, S3NativeSse.NONE);
         in.read();
 
         java.lang.reflect.Method finalize =
