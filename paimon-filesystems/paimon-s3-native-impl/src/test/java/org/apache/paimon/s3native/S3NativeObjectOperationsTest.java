@@ -136,6 +136,40 @@ class S3NativeObjectOperationsTest {
     }
 
     @Test
+    void testNetworkFailureAggregatedWithCause() {
+        // SdkClientException does not extend S3Exception; it must still be aggregated (all
+        // keys failed) and preserved as the cause of the reported IOException.
+        software.amazon.awssdk.core.exception.SdkClientException networkFailure =
+                software.amazon.awssdk.core.exception.SdkClientException.create(
+                        "Connection refused");
+        S3Client client = mock(S3Client.class);
+        when(client.deleteObjects(any(DeleteObjectsRequest.class))).thenThrow(networkFailure);
+
+        assertThatThrownBy(() -> ops(client).deleteBatch(keys(3), 1000, 2))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("3 keys")
+                .hasRootCauseInstanceOf(
+                        software.amazon.awssdk.core.exception.SdkClientException.class);
+    }
+
+    @Test
+    void testDuplicateKeysDeduplicated() throws IOException {
+        S3Client client = mock(S3Client.class);
+        when(client.deleteObjects(any(DeleteObjectsRequest.class)))
+                .thenReturn(DeleteObjectsResponse.builder().build());
+
+        List<String> withDuplicates = new ArrayList<>(keys(3));
+        withDuplicates.add("k-1");
+        withDuplicates.add("k-2");
+        ops(client).deleteBatch(withDuplicates, 1000, 2);
+
+        org.mockito.ArgumentCaptor<DeleteObjectsRequest> request =
+                org.mockito.ArgumentCaptor.forClass(DeleteObjectsRequest.class);
+        verify(client).deleteObjects(request.capture());
+        assertThat(request.getValue().delete().objects()).hasSize(3);
+    }
+
+    @Test
     void testEmptyKeyListIsNoop() throws IOException {
         S3Client client = mock(S3Client.class);
         ops(client).deleteBatch(new ArrayList<>(), 1000, 4);
