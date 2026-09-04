@@ -1,0 +1,169 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.s3native;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import software.amazon.awssdk.core.async.AsyncRequestBody;
+import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.services.s3.S3AsyncClient;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.AbortMultipartUploadRequest;
+import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest;
+import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
+import software.amazon.awssdk.services.s3.model.CreateMultipartUploadResponse;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.services.s3.model.PutObjectResponse;
+import software.amazon.awssdk.services.s3.model.UploadPartRequest;
+import software.amazon.awssdk.services.s3.model.UploadPartResponse;
+
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+/**
+ * Unit tests for {@link S3NativePositionOutputStream} failure paths and part boundaries, using
+ * mocked S3 clients (fault injection without a container).
+ */
+class S3NativePositionOutputStreamTest {
+
+    @TempDir Path tmpDir;
+
+    private static final long PART_SIZE = 5L * 1024 * 1024;
+
+    @Test
+    void testSmallFileUsesSinglePutObject() throws Exception {
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        when(sync.putObject(any(PutObjectRequest.class), any(RequestBody.class)))
+                .thenReturn(PutObjectResponse.builder().eTag("e").build());
+
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(
+                        sync, async, "bucket", "key", tmpDir.toString(), PART_SIZE, 2);
+        out.write(new byte[128]);
+        out.close();
+
+        verify(sync).putObject(any(PutObjectRequest.class), any(RequestBody.class));
+        verify(sync, never()).createMultipartUpload(any(CreateMultipartUploadRequest.class));
+        // Temp files are cleaned up.
+        assertThat(tmpDir.toFile().listFiles()).isNullOrEmpty();
+    }
+
+    @Test
+    void testMultipartSubmitsPartsAndCompletes() throws Exception {
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        when(sync.createMultipartUpload(any(CreateMultipartUploadRequest.class)))
+                .thenReturn(CreateMultipartUploadResponse.builder().uploadId("u1").build());
+        when(async.uploadPart(any(UploadPartRequest.class), any(AsyncRequestBody.class)))
+                .thenReturn(
+                        CompletableFuture.completedFuture(
+                                UploadPartResponse.builder().eTag("etag").build()));
+
+        List<software.amazon.awssdk.services.s3.model.CompletedPart> captured = new ArrayList<>();
+        when(sync.completeMultipartUpload(any(CompleteMultipartUploadRequest.class)))
+                .thenAnswer(
+                        invocation -> {
+                            captured.addAll(
+                                    invocation
+                                            .getArgument(0, CompleteMultipartUploadRequest.class)
+                                            .multipartUpload()
+                                            .parts());
+                            return null;
+                        });
+
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(
+                        sync, async, "bucket", "key", tmpDir.toString(), PART_SIZE, 2);
+        // Part size is a submit threshold (as in Flink's writer): a single huge write becomes one
+        // oversized part, so write in chunks like real writers do — two full parts + a tail.
+        int total = (int) PART_SIZE * 2 + 10;
+        byte[] chunk = new byte[1024 * 1024];
+        int written = 0;
+        while (written < total) {
+            int n = Math.min(chunk.length, total - written);
+            out.write(chunk, 0, n);
+            written += n;
+        }
+        assertThat(out.getPos()).isEqualTo(total);
+        out.close();
+
+        // 3 parts: two full + the tail, part numbers ascending.
+        assertThat(captured).hasSize(3);
+        assertThat(captured.get(0).partNumber()).isEqualTo(1);
+        assertThat(captured.get(2).partNumber()).isEqualTo(3);
+        verify(sync, never()).abortMultipartUpload(any(AbortMultipartUploadRequest.class));
+        assertThat(tmpDir.toFile().listFiles()).isNullOrEmpty();
+    }
+
+    @Test
+    void testFailedPartAbortsAndPoisonsStream() throws Exception {
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        when(sync.createMultipartUpload(any(CreateMultipartUploadRequest.class)))
+                .thenReturn(CreateMultipartUploadResponse.builder().uploadId("u1").build());
+        CompletableFuture<UploadPartResponse> failed = new CompletableFuture<>();
+        failed.completeExceptionally(new RuntimeException("boom"));
+        when(async.uploadPart(any(UploadPartRequest.class), any(AsyncRequestBody.class)))
+                .thenReturn(failed);
+
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(
+                        sync, async, "bucket", "key", tmpDir.toString(), PART_SIZE, 2);
+        out.write(new byte[(int) PART_SIZE]); // triggers submit of part 1
+        // The failure surfaces on close (when futures are joined).
+        assertThatThrownBy(out::close).isInstanceOf(IOException.class);
+        verify(sync).abortMultipartUpload(any(AbortMultipartUploadRequest.class));
+        // Stream is poisoned: further writes fail fast, second close is a no-op.
+        assertThatThrownBy(() -> out.write(1)).isInstanceOf(IOException.class);
+        out.close();
+        assertThat(tmpDir.toFile().listFiles()).isNullOrEmpty();
+    }
+
+    @Test
+    void testSynchronousUploadPartFailureAbortsImmediately() throws Exception {
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        when(sync.createMultipartUpload(any(CreateMultipartUploadRequest.class)))
+                .thenReturn(CreateMultipartUploadResponse.builder().uploadId("u1").build());
+        when(async.uploadPart(any(UploadPartRequest.class), any(AsyncRequestBody.class)))
+                .thenThrow(new RuntimeException("sync failure"));
+
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(
+                        sync, async, "bucket", "key", tmpDir.toString(), PART_SIZE, 2);
+        assertThatThrownBy(() -> out.write(new byte[(int) PART_SIZE]))
+                .isInstanceOf(IOException.class);
+        verify(sync).abortMultipartUpload(any(AbortMultipartUploadRequest.class));
+        // Poisoned: subsequent write fails without touching the client again.
+        assertThatThrownBy(() -> out.write(1)).isInstanceOf(IOException.class);
+        assertThat(tmpDir.toFile().listFiles()).isNullOrEmpty();
+    }
+}

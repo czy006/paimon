@@ -67,7 +67,7 @@ public class S3NativeMinioContainer extends GenericContainer<S3NativeMinioContai
         // Newer than the repo-wide pinned DockerImageVersions.MINIO (2022-02): that release
         // rejects chunked-encoding uploads with an empty body (XAmzContentSHA256Mismatch),
         // which SDK v2 emits for directory markers.
-        super("minio/minio:latest");
+        super("minio/minio:RELEASE.2025-09-07T16-13-09Z");
 
         this.accessKey = randomString("accessKey", 10);
         // secrets must have at least 8 characters

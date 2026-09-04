@@ -65,7 +65,8 @@ import java.util.concurrent.locks.ReentrantLock;
  * the non-CRT Netty client, and CRT is excluded (D8).
  *
  * <p>Single-writer contract like the Flink original: write/flush/close are lock-guarded so close
- * from another thread (task cancellation) stays safe.
+ * from another thread (task cancellation) stays safe. An abandoned stream that is never closed
+ * leaks its local part temp files — always close in a finally block.
  */
 final class S3NativePositionOutputStream extends PositionOutputStream {
 
@@ -183,13 +184,14 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
             }
             closed = true;
             try {
-                currentBuffer.flush();
-                currentBuffer.close();
-                currentBuffer = null;
-
                 if (uploadId == null) {
                     // Small-file shortcut: the whole object fits a single PutObject.
-                    // [PORTED] NativeS3OutputStream#uploadToS3
+                    // [PORTED] NativeS3OutputStream#uploadToS3. [DEVIATION] Uses the sync client
+                    // instead of Spec §6.5's async putObject — functionally equivalent, simpler
+                    // error handling under the close lock.
+                    currentBuffer.flush();
+                    currentBuffer.close();
+                    currentBuffer = null;
                     syncClient.putObject(
                             software.amazon.awssdk.services.s3.model.PutObjectRequest.builder()
                                     .bucket(bucket)
@@ -199,7 +201,11 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
                                     currentPartFile.toPath()));
                 } else {
                     if (currentPartSize > 0) {
+                        // submitCurrentPart flushes and closes the tail buffer itself.
                         submitCurrentPart();
+                    } else {
+                        currentBuffer.close();
+                        currentBuffer = null;
                     }
                     completeUpload();
                 }
@@ -230,7 +236,8 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
 
     /**
      * Flushes and closes the current part file and submits it as an async UploadPart; a fresh part
-     * file is rolled for subsequent writes.
+     * file is rolled for subsequent writes. Any failure aborts the upload and poisons the stream so
+     * later writes fail fast with the original cause chain intact.
      */
     private void submitCurrentPart() throws IOException {
         try {
@@ -252,23 +259,36 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
             uploadPermits.acquire();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            failStream();
             throw new IOException("Interrupted while waiting for an upload permit", e);
         }
-
-        CompletableFuture<CompletedPart> future =
-                asyncClient
-                        .uploadPart(
-                                UploadPartRequest.builder()
-                                        .bucket(bucket)
-                                        .key(key)
-                                        .uploadId(uploadId)
-                                        .partNumber(partNumber)
-                                        .build(),
-                                AsyncRequestBody.fromFile(partFile.toPath()))
-                        .thenApply(response -> toCompletedPart(partNumber, response, partFile))
-                        .whenComplete((part, error) -> uploadPermits.release());
-        partFutures.add(future);
+        try {
+            CompletableFuture<CompletedPart> future =
+                    asyncClient
+                            .uploadPart(
+                                    UploadPartRequest.builder()
+                                            .bucket(bucket)
+                                            .key(key)
+                                            .uploadId(uploadId)
+                                            .partNumber(partNumber)
+                                            .build(),
+                                    AsyncRequestBody.fromFile(partFile.toPath()))
+                            .thenApply(response -> toCompletedPart(partNumber, response, partFile))
+                            .whenComplete((part, error) -> uploadPermits.release());
+            partFutures.add(future);
+        } catch (RuntimeException e) {
+            uploadPermits.release(); // whenComplete never registered for a synchronous failure
+            failStream();
+            throw new IOException("Failed to submit part " + partNumber + " of " + key, e);
+        }
         rollPartFile();
+    }
+
+    /** Aborts the multipart upload and permanently closes the stream on a submit failure. */
+    private void failStream() {
+        abortUploadQuietly();
+        cleanupTempFiles();
+        closed = true;
     }
 
     private String startMultipartUpload() throws IOException {
@@ -322,8 +342,28 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
                                             .parts(parts)
                                             .build())
                             .build());
+        } catch (software.amazon.awssdk.services.s3.model.NoSuchUploadException e) {
+            // [PORTED] NativeS3ObjectOperations#commitMultiPartUpload — the complete request may
+            // have succeeded on the server while its response was lost; S3 read-after-write
+            // consistency makes a present object proof the upload committed.
+            if (!objectExists()) {
+                throw new IOException("Failed to complete multipart upload for " + key, e);
+            }
         } catch (RuntimeException e) {
             throw new IOException("Failed to complete multipart upload for " + key, e);
+        }
+    }
+
+    private boolean objectExists() {
+        try {
+            syncClient.headObject(
+                    software.amazon.awssdk.services.s3.model.HeadObjectRequest.builder()
+                            .bucket(bucket)
+                            .key(key)
+                            .build());
+            return true;
+        } catch (RuntimeException e) {
+            return false;
         }
     }
 

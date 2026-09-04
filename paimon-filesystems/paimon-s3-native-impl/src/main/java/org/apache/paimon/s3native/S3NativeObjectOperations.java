@@ -230,9 +230,9 @@ final class S3NativeObjectOperations {
         return children;
     }
 
-    /** Lists all keys under a prefix (no delimiter, pagination); markers included. */
-    List<String> listAllKeys(String prefix) throws IOException {
-        List<String> keys = new ArrayList<>();
+    /** Lists all objects under a prefix (no delimiter, pagination); markers included. */
+    List<S3Object> listAllObjects(String prefix) throws IOException {
+        List<S3Object> objects = new ArrayList<>();
         String token = null;
         try {
             do {
@@ -242,13 +242,21 @@ final class S3NativeObjectOperations {
                     request.continuationToken(token);
                 }
                 ListObjectsV2Response response = client.listObjectsV2(request.build());
-                for (S3Object object : response.contents()) {
-                    keys.add(object.key());
-                }
+                objects.addAll(response.contents());
                 token = response.nextContinuationToken();
             } while (token != null);
         } catch (S3Exception e) {
-            throw toIOException("listAllKeys " + prefix, e);
+            throw toIOException("listAllObjects " + prefix, e);
+        }
+        return objects;
+    }
+
+    /** Lists all keys under a prefix; convenience over {@link #listAllObjects(String)}. */
+    List<String> listAllKeys(String prefix) throws IOException {
+        List<S3Object> objects = listAllObjects(prefix);
+        List<String> keys = new ArrayList<>(objects.size());
+        for (S3Object object : objects) {
+            keys.add(object.key());
         }
         return keys;
     }
