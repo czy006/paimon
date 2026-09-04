@@ -34,13 +34,11 @@ import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.ObjectIdentifier;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
-import software.amazon.awssdk.services.s3.model.PutObjectResponse;
 import software.amazon.awssdk.services.s3.model.S3Exception;
 import software.amazon.awssdk.services.s3.model.S3Object;
 
 import javax.annotation.Nullable;
 
-import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
@@ -96,19 +94,6 @@ final class S3NativeObjectOperations {
                 return null;
             }
             throw toIOException("headObject " + key, e);
-        }
-    }
-
-    /** Uploads a whole local file with a single PutObject; returns the eTag. */
-    String putObject(String key, File file) throws IOException {
-        try {
-            PutObjectResponse response =
-                    client.putObject(
-                            PutObjectRequest.builder().bucket(bucket).key(key).build(),
-                            RequestBody.fromFile(file.toPath()));
-            return response.eTag();
-        } catch (S3Exception e) {
-            throw toIOException("putObject " + key, e);
         }
     }
 
