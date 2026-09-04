@@ -207,7 +207,7 @@ public class S3NativeFileIO implements FileIO {
                     return true;
                 }
                 // [DEVIATION D6] Batch delete of every key under the prefix (markers included).
-                operations.deleteBatch(operations.listAllKeys(prefix));
+                deleteBatchAll(operations, operations.listAllKeys(prefix));
                 return true;
         }
     }
@@ -296,7 +296,7 @@ public class S3NativeFileIO implements FileIO {
         for (software.amazon.awssdk.services.s3.model.S3Object srcObject : srcObjects) {
             srcKeys.add(srcObject.key());
         }
-        operations.deleteBatch(srcKeys);
+        deleteBatchAll(operations, srcKeys);
         return true;
     }
 
@@ -312,6 +312,12 @@ public class S3NativeFileIO implements FileIO {
         return !ancestorKey.isEmpty()
                 && (descendantKey + "/").startsWith(ancestorKey + "/")
                 && !descendantKey.equals(ancestorKey);
+    }
+
+    private void deleteBatchAll(S3NativeObjectOperations operations, List<String> keys)
+            throws IOException {
+        S3NativeOptions options = resolvedOptions();
+        operations.deleteBatch(keys, options.deleteBatchSize, options.deleteThreads);
     }
 
     /** Copies an object; [DEVIATION D7] objects over 5GB go through UploadPartCopy. */
