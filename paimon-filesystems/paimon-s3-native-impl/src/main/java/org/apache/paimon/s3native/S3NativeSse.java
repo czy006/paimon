@@ -20,14 +20,18 @@ package org.apache.paimon.s3native;
 
 import org.apache.paimon.options.Options;
 
+import software.amazon.awssdk.services.s3.model.CopyObjectRequest;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.model.ServerSideEncryption;
+import software.amazon.awssdk.services.s3.model.UploadPartCopyRequest;
 import software.amazon.awssdk.services.s3.model.UploadPartRequest;
 
 import javax.annotation.Nullable;
+
+import java.util.function.Consumer;
 
 /**
  * Server-side encryption settings applied to S3 requests.
@@ -102,23 +106,76 @@ final class S3NativeSse {
 
     /** Applies SSE-S3/KMS/DSSE and SSE-C to an object-creating request. */
     void apply(PutObjectRequest.Builder builder) {
+        applyEncryption(
+                builder::serverSideEncryption,
+                builder::ssekmsKeyId,
+                builder::sseCustomerAlgorithm,
+                builder::sseCustomerKey,
+                builder::sseCustomerKeyMD5);
+    }
+
+    /** Applies SSE-S3/KMS/DSSE and SSE-C to a multipart-creating request. */
+    void apply(CreateMultipartUploadRequest.Builder builder) {
+        applyEncryption(
+                builder::serverSideEncryption,
+                builder::ssekmsKeyId,
+                builder::sseCustomerAlgorithm,
+                builder::sseCustomerKey,
+                builder::sseCustomerKeyMD5);
+    }
+
+    /** Applies destination encryption plus the SSE-C source headers on a server-side copy. */
+    void apply(CopyObjectRequest.Builder builder) {
+        applyEncryption(
+                builder::serverSideEncryption,
+                builder::ssekmsKeyId,
+                builder::sseCustomerAlgorithm,
+                builder::sseCustomerKey,
+                builder::sseCustomerKeyMD5);
+        applyCopySource(
+                builder::copySourceSSECustomerAlgorithm,
+                builder::copySourceSSECustomerKey,
+                builder::copySourceSSECustomerKeyMD5);
+    }
+
+    /**
+     * Applies the SSE-C source headers on a multipart copy part. The destination encryption is set
+     * on the CreateMultipartUpload request; UploadPartCopy carries no destination SSE fields.
+     */
+    void apply(UploadPartCopyRequest.Builder builder) {
+        applyCopySource(
+                builder::copySourceSSECustomerAlgorithm,
+                builder::copySourceSSECustomerKey,
+                builder::copySourceSSECustomerKeyMD5);
+    }
+
+    /** Shared core for object-creating requests (Iceberg S3RequestUtil#configureEncryption). */
+    private void applyEncryption(
+            Consumer<ServerSideEncryption> encryptionSetter,
+            Consumer<String> kmsKeySetter,
+            Consumer<String> customerAlgorithmSetter,
+            Consumer<String> customerKeySetter,
+            Consumer<String> customerMd5Setter) {
         switch (type) {
             case SSE_S3:
-                builder.serverSideEncryption(ServerSideEncryption.AES256);
+                encryptionSetter.accept(ServerSideEncryption.AES256);
                 break;
             case KMS:
-                builder.serverSideEncryption(ServerSideEncryption.AWS_KMS);
-                applyKmsKey(builder::ssekmsKeyId);
+                encryptionSetter.accept(ServerSideEncryption.AWS_KMS);
+                if (hasText(kmsKeyId)) {
+                    kmsKeySetter.accept(kmsKeyId);
+                }
                 break;
             case DSSE_KMS:
-                builder.serverSideEncryption(ServerSideEncryption.AWS_KMS_DSSE);
-                applyKmsKey(builder::ssekmsKeyId);
+                encryptionSetter.accept(ServerSideEncryption.AWS_KMS_DSSE);
+                if (hasText(kmsKeyId)) {
+                    kmsKeySetter.accept(kmsKeyId);
+                }
                 break;
             case CUSTOM:
-                applyCustomer(
-                        builder::sseCustomerAlgorithm,
-                        builder::sseCustomerKey,
-                        builder::sseCustomerKeyMD5);
+                customerAlgorithmSetter.accept(ServerSideEncryption.AES256.toString());
+                customerKeySetter.accept(customerKey);
+                customerMd5Setter.accept(customerKeyMd5);
                 break;
             case NONE:
             default:
@@ -126,30 +183,20 @@ final class S3NativeSse {
         }
     }
 
-    /** Applies SSE-S3/KMS/DSSE and SSE-C to a multipart-creating request. */
-    void apply(CreateMultipartUploadRequest.Builder builder) {
-        switch (type) {
-            case SSE_S3:
-                builder.serverSideEncryption(ServerSideEncryption.AES256);
-                break;
-            case KMS:
-                builder.serverSideEncryption(ServerSideEncryption.AWS_KMS);
-                applyKmsKey(builder::ssekmsKeyId);
-                break;
-            case DSSE_KMS:
-                builder.serverSideEncryption(ServerSideEncryption.AWS_KMS_DSSE);
-                applyKmsKey(builder::ssekmsKeyId);
-                break;
-            case CUSTOM:
-                applyCustomer(
-                        builder::sseCustomerAlgorithm,
-                        builder::sseCustomerKey,
-                        builder::sseCustomerKeyMD5);
-                break;
-            case NONE:
-            default:
-                break;
+    /** SSE-C headers for reading the copy source. */
+    private void applyCopySource(
+            Consumer<String> algorithmSetter,
+            Consumer<String> keySetter,
+            Consumer<String> md5Setter) {
+        if (type == Type.CUSTOM) {
+            algorithmSetter.accept(ServerSideEncryption.AES256.toString());
+            keySetter.accept(customerKey);
+            md5Setter.accept(customerKeyMd5);
         }
+    }
+
+    private static boolean hasText(@Nullable String value) {
+        return value != null && !value.trim().isEmpty();
     }
 
     /** Applies SSE-C to a part-upload request (the only SSE form valid there). */

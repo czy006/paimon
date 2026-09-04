@@ -29,7 +29,6 @@ import org.apache.paimon.options.Options;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import software.amazon.awssdk.services.s3.model.CopyObjectRequest;
-import software.amazon.awssdk.services.s3.model.CopyObjectResponse;
 import software.amazon.awssdk.services.s3.model.CopyPartResult;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadResponse;
@@ -274,7 +273,7 @@ public class S3NativeFileIO implements FileIO {
 
         if (srcClassification.kind == Kind.FILE) {
             long length = srcClassification.head.contentLength;
-            copyObject(operations, srcKey, dstKey, length);
+            copyObject(operations, resolvedOptions().sse, srcKey, dstKey, length);
             operations.deleteObject(srcKey);
             return true;
         }
@@ -290,6 +289,7 @@ public class S3NativeFileIO implements FileIO {
             String renamed = dstPrefix + srcObjectKey.substring(srcPrefix.length());
             copyObject(
                     operations,
+                    resolvedOptions().sse,
                     srcObjectKey,
                     renamed,
                     srcObject.size() == null ? 0L : srcObject.size());
@@ -322,65 +322,69 @@ public class S3NativeFileIO implements FileIO {
         operations.deleteBatch(keys, options.deleteBatchSize, options.deleteThreads);
     }
 
-    /** Copies an object; [DEVIATION D7] objects over 5GB go through UploadPartCopy. */
+    /**
+     * Copies an object; [DEVIATION D7] objects over 5GB go through UploadPartCopy. Both paths carry
+     * the SSE settings — the copy source needs SSE-C headers to be readable, and the destination
+     * must keep the encryption policy (a blind spot inherited from Iceberg, whose FileIO has no
+     * rename).
+     */
     private static void copyObject(
-            S3NativeObjectOperations operations, String srcKey, String dstKey, long length)
+            S3NativeObjectOperations operations,
+            S3NativeSse sse,
+            String srcKey,
+            String dstKey,
+            long length)
             throws IOException {
         try {
             if (length <= MAX_COPY_OBJECT_BYTES) {
-                CopyObjectResponse response =
-                        operations
-                                .client()
-                                .copyObject(
-                                        CopyObjectRequest.builder()
-                                                .sourceBucket(operations.bucket())
-                                                .sourceKey(srcKey)
-                                                .destinationBucket(operations.bucket())
-                                                .destinationKey(dstKey)
-                                                .build());
+                CopyObjectRequest.Builder builder =
+                        CopyObjectRequest.builder()
+                                .sourceBucket(operations.bucket())
+                                .sourceKey(srcKey)
+                                .destinationBucket(operations.bucket())
+                                .destinationKey(dstKey);
+                sse.apply(builder);
+                operations.client().copyObject(builder.build());
                 return;
             }
-            copyObjectMultipart(operations, srcKey, dstKey, length);
+            copyObjectMultipart(operations, sse, srcKey, dstKey, length);
         } catch (S3Exception e) {
             throw new IOException("Failed to copy " + srcKey + " to " + dstKey, e);
         }
     }
 
     private static void copyObjectMultipart(
-            S3NativeObjectOperations operations, String srcKey, String dstKey, long length)
+            S3NativeObjectOperations operations,
+            S3NativeSse sse,
+            String srcKey,
+            String dstKey,
+            long length)
             throws IOException {
         String uploadId = null;
         try {
+            CreateMultipartUploadRequest.Builder createBuilder =
+                    CreateMultipartUploadRequest.builder().bucket(operations.bucket()).key(dstKey);
+            sse.apply(createBuilder);
             CreateMultipartUploadResponse create =
-                    operations
-                            .client()
-                            .createMultipartUpload(
-                                    CreateMultipartUploadRequest.builder()
-                                            .bucket(operations.bucket())
-                                            .key(dstKey)
-                                            .build());
+                    operations.client().createMultipartUpload(createBuilder.build());
             uploadId = create.uploadId();
 
             List<software.amazon.awssdk.services.s3.model.CompletedPart> parts = new ArrayList<>();
             int partNumber = 1;
             for (long offset = 0; offset < length; offset += MAX_COPY_OBJECT_BYTES, partNumber++) {
                 long lastByte = Math.min(offset + MAX_COPY_OBJECT_BYTES, length) - 1;
+                UploadPartCopyRequest.Builder partBuilder =
+                        UploadPartCopyRequest.builder()
+                                .sourceBucket(operations.bucket())
+                                .sourceKey(srcKey)
+                                .destinationBucket(operations.bucket())
+                                .destinationKey(dstKey)
+                                .uploadId(uploadId)
+                                .partNumber(partNumber)
+                                .copySourceRange(String.format("bytes=%d-%d", offset, lastByte));
+                sse.apply(partBuilder);
                 CopyPartResult result =
-                        operations
-                                .client()
-                                .uploadPartCopy(
-                                        UploadPartCopyRequest.builder()
-                                                .sourceBucket(operations.bucket())
-                                                .sourceKey(srcKey)
-                                                .destinationBucket(operations.bucket())
-                                                .destinationKey(dstKey)
-                                                .uploadId(uploadId)
-                                                .partNumber(partNumber)
-                                                .copySourceRange(
-                                                        String.format(
-                                                                "bytes=%d-%d", offset, lastByte))
-                                                .build())
-                                .copyPartResult();
+                        operations.client().uploadPartCopy(partBuilder.build()).copyPartResult();
                 parts.add(
                         software.amazon.awssdk.services.s3.model.CompletedPart.builder()
                                 .partNumber(partNumber)

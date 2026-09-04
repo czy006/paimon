@@ -440,6 +440,9 @@ Additional options:
 | `s3.acl` | none | Canned ACL for new objects. |
 | `s3.delete.batch-size` | 1000 | Keys per DeleteObjects request (1-1000). |
 | `s3.delete.num-threads` | CPU cores | Concurrent DeleteObjects requests during bulk deletes. |
+| `s3.sse.type` | none | Server-side encryption: `none`, `s3`, `kms`, `dsse-kms` or `custom` (SSE-C, HTTPS-only). |
+| `s3.sse.key` | none | KMS key id/alias, or the base64 AES-256 key for `custom`. |
+| `s3.sse.md5` | none | Base64 MD5 of the SSE-C key (required with `custom`). |
 
 Notes:
 
