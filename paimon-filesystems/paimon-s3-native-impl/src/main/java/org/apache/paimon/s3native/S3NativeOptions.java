@@ -24,6 +24,8 @@ import org.apache.paimon.options.Options;
 import javax.annotation.Nullable;
 
 import java.time.Duration;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * Typed, immutable view of the canonical {@code s3.*} option set with validation and clamping.
@@ -61,6 +63,18 @@ final class S3NativeOptions {
     final Duration retryMaxBackoff;
     final String tmpDir;
 
+    // [PORTED-ICE Spec §14 I4-I6] Write-path enhancements adopted from Iceberg S3FileIOProperties.
+    /** Multipart switches on only above partSize * factor (Iceberg default 1.5). */
+    final double multipartThresholdFactor;
+    /** When true, part-level and whole-object MD5 are sent as Content-MD5. */
+    final boolean checksumEnabled;
+    /** Storage class for new objects (e.g. GLACIER, INTELLIGENT_TIERING); null = bucket default. */
+    @Nullable final String writeStorageClass;
+    /** Tags for new objects, "k1:v1,k2:v2"; empty = none. */
+    final Map<String, String> writeTags;
+    /** Canned ACL for new objects; null = none. */
+    @Nullable final String acl;
+
     private S3NativeOptions(
             @Nullable String accessKey,
             @Nullable String secretKey,
@@ -80,7 +94,12 @@ final class S3NativeOptions {
             Duration retryBaseDelay,
             Duration retryThrottleBaseDelay,
             Duration retryMaxBackoff,
-            String tmpDir) {
+            String tmpDir,
+            double multipartThresholdFactor,
+            boolean checksumEnabled,
+            String writeStorageClass,
+            Map<String, String> writeTags,
+            String acl) {
         this.accessKey = accessKey;
         this.secretKey = secretKey;
         this.region = region;
@@ -100,6 +119,11 @@ final class S3NativeOptions {
         this.retryThrottleBaseDelay = retryThrottleBaseDelay;
         this.retryMaxBackoff = retryMaxBackoff;
         this.tmpDir = tmpDir;
+        this.multipartThresholdFactor = multipartThresholdFactor;
+        this.checksumEnabled = checksumEnabled;
+        this.writeStorageClass = writeStorageClass;
+        this.writeTags = writeTags;
+        this.acl = acl;
     }
 
     /**
@@ -190,7 +214,37 @@ final class S3NativeOptions {
                 retryBase,
                 retryThrottleBase,
                 retryMax,
-                normalized.getString("s3.upload.tmp.dir", System.getProperty("java.io.tmpdir")));
+                normalized.getString("s3.upload.tmp.dir", System.getProperty("java.io.tmpdir")),
+                validatedThresholdFactor(normalized),
+                normalized.getBoolean("s3.checksum-enabled", false),
+                normalized.get("s3.write.storage-class"),
+                parseTags(normalized.get("s3.write.tags")),
+                normalized.get("s3.acl"));
+    }
+
+    private static double validatedThresholdFactor(Options options) {
+        double factor = Double.parseDouble(options.getString("s3.multipart.threshold", "1.5"));
+        if (factor < 1.0) {
+            throw new IllegalArgumentException(
+                    "s3.multipart.threshold must be >= 1.0, but was: " + factor);
+        }
+        return factor;
+    }
+
+    private static Map<String, String> parseTags(String tags) {
+        Map<String, String> result = new LinkedHashMap<>();
+        if (tags == null || tags.trim().isEmpty()) {
+            return result;
+        }
+        for (String pair : tags.split(",")) {
+            int sep = pair.indexOf(':');
+            if (sep <= 0 || sep == pair.length() - 1) {
+                throw new IllegalArgumentException(
+                        "Invalid s3.write.tags entry '" + pair + "', expected key:value pairs");
+            }
+            result.put(pair.substring(0, sep).trim(), pair.substring(sep + 1).trim());
+        }
+        return result;
     }
 
     private static int validatedRetries(Options options) {

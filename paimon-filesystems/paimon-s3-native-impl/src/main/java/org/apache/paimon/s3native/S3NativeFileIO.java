@@ -128,9 +128,7 @@ public class S3NativeFileIO implements FileIO {
                 provider().asyncClient(),
                 S3PathUtils.bucket(path),
                 key,
-                resolved.tmpDir,
-                resolved.partSizeBytes,
-                resolved.maxConcurrentUploads);
+                resolved);
     }
 
     @Override
