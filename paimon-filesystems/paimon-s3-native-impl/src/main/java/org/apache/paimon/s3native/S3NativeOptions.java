@@ -86,6 +86,9 @@ final class S3NativeOptions {
     /** Concurrent DeleteObjects requests during bulk deletes (Iceberg default: CPU cores). */
     final int deleteThreads;
 
+    /** [PORTED-ICE Spec §14 I8] Server-side encryption settings; NONE by default. */
+    final S3NativeSse sse;
+
     private S3NativeOptions(
             @Nullable String accessKey,
             @Nullable String secretKey,
@@ -112,7 +115,8 @@ final class S3NativeOptions {
             Map<String, String> writeTags,
             software.amazon.awssdk.services.s3.model.ObjectCannedACL acl,
             int deleteBatchSize,
-            int deleteThreads) {
+            int deleteThreads,
+            S3NativeSse sse) {
         this.accessKey = accessKey;
         this.secretKey = secretKey;
         this.region = region;
@@ -139,6 +143,7 @@ final class S3NativeOptions {
         this.acl = acl;
         this.deleteBatchSize = deleteBatchSize;
         this.deleteThreads = deleteThreads;
+        this.sse = sse;
     }
 
     /**
@@ -236,7 +241,8 @@ final class S3NativeOptions {
                 parseTags(normalized.get("s3.write.tags")),
                 validatedAcl(normalized.get("s3.acl")),
                 validatedDeleteBatchSize(normalized),
-                validatedDeleteThreads(normalized));
+                validatedDeleteThreads(normalized),
+                S3NativeSse.from(normalized));
     }
 
     /** [PORTED-ICE Spec §14 I7] Keys per DeleteObjects request, 1..1000 (S3 API limit). */

@@ -63,10 +63,16 @@ final class S3NativeObjectOperations {
 
     private final S3Client client;
     private final String bucket;
+    private final S3NativeSse sse;
 
     S3NativeObjectOperations(S3Client client, String bucket) {
+        this(client, bucket, S3NativeSse.NONE);
+    }
+
+    S3NativeObjectOperations(S3Client client, String bucket, S3NativeSse sse) {
         this.client = client;
         this.bucket = bucket;
+        this.sse = sse;
     }
 
     String bucket() {
@@ -84,7 +90,9 @@ final class S3NativeObjectOperations {
     @Nullable
     HeadObjectResponse headObjectOrNull(String key) throws IOException {
         try {
-            return client.headObject(HeadObjectRequest.builder().bucket(bucket).key(key).build());
+            HeadObjectRequest.Builder builder = HeadObjectRequest.builder().bucket(bucket).key(key);
+            sse.applyCustomer(builder);
+            return client.headObject(builder.build());
         } catch (NoSuchKeyException e) {
             return null;
         } catch (S3Exception e) {

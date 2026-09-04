@@ -88,13 +88,21 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
     /** Capture site for the unclosed-stream warning emitted by {@link #finalize()}. */
     private final StackTraceElement[] createStack;
 
+    private final S3NativeSse sse;
+
     S3NativeSeekableInputStream(
-            S3Client client, String bucket, String key, long contentLength, int readBufferSize) {
+            S3Client client,
+            String bucket,
+            String key,
+            long contentLength,
+            int readBufferSize,
+            S3NativeSse sse) {
         this.client = client;
         this.bucket = bucket;
         this.key = key;
         this.contentLength = contentLength;
         this.readBufferSize = readBufferSize;
+        this.sse = sse;
         this.nextReadPos = 0;
         this.streamPos = 0;
         this.createStack = Thread.currentThread().getStackTrace();
@@ -318,7 +326,8 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
         String range = String.format("bytes=%d-%d", position, position + toRead - 1);
         try (ResponseInputStream<GetObjectResponse> in =
                 client.getObject(
-                        GetObjectRequest.builder().bucket(bucket).key(key).range(range).build())) {
+                        sseApply(GetObjectRequest.builder().bucket(bucket).key(key).range(range))
+                                .build())) {
             int readBytes = 0;
             while (readBytes < toRead) {
                 int n = in.read(buffer, offset + readBytes, toRead - readBytes);
@@ -432,6 +441,11 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
         return false;
     }
 
+    private GetObjectRequest.Builder sseApply(GetObjectRequest.Builder builder) {
+        sse.applyCustomer(builder);
+        return builder;
+    }
+
     private void ensureStreamOpen() throws IOException {
         if (currentStream == null && !closed) {
             openStreamAtCurrentPosition();
@@ -454,7 +468,7 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
         releaseStreams();
         try {
             GetObjectRequest.Builder requestBuilder =
-                    GetObjectRequest.builder().bucket(bucket).key(key);
+                    sseApply(GetObjectRequest.builder().bucket(bucket).key(key));
             if (streamPos > 0) {
                 requestBuilder.range(String.format("bytes=%d-", streamPos));
             }

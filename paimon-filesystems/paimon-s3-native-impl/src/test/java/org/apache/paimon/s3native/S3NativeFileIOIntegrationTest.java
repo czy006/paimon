@@ -31,6 +31,7 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.net.URI;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Random;
@@ -361,6 +362,45 @@ class S3NativeFileIOIntegrationTest {
                     .isEqualTo(java.util.Arrays.copyOfRange(data, 500_000, 502_048));
         }
         fs.delete(path, true);
+    }
+
+    @Test
+    void testSseCustomerKeyHeadersReachServer() throws Exception {
+        // [PORTED-ICE I8] SSE-C end-to-end wiring proof: the put request carries the customer
+        // key headers all the way to MinIO, which rejects them with S3's standard
+        // "secure connection" rule — SSE-C is HTTPS-only and this container runs plain HTTP.
+        // A full encrypt/decrypt round trip needs an HTTPS endpoint; the request shaping
+        // itself (PutObject/CreateMultipartUpload/UploadPart/Get/Head) is pinned by the
+        // Mockito tests in S3NativePositionOutputStreamTest.
+        byte[] keyBytes = new byte[32];
+        new Random(99).nextBytes(keyBytes);
+        String key64 = Base64.getEncoder().encodeToString(keyBytes);
+        String md564 =
+                Base64.getEncoder()
+                        .encodeToString(
+                                java.security.MessageDigest.getInstance("MD5").digest(keyBytes));
+
+        Map<String, String> config = new HashMap<>(MINIO_CONTAINER.getS3ConfigOptions());
+        config.put("s3.sse.type", "custom");
+        config.put("s3.sse.key", key64);
+        config.put("s3.sse.md5", md564);
+        FileIO sseIO = createFileIO(Options.fromMap(config));
+
+        Path path = file("sse-c");
+        // The SSE-C headers ride the PutObject issued by close(); the try-with-resources
+        // close rethrows that failure, so the assertion must come after the block.
+        try (org.apache.paimon.fs.PositionOutputStream out = sseIO.newOutputStream(path, true)) {
+            out.write(new byte[16]);
+        } catch (IOException e) {
+            org.assertj.core.api.Assertions.assertThat(e)
+                    .hasRootCauseInstanceOf(
+                            software.amazon.awssdk.services.s3.model.InvalidRequestException.class);
+            org.assertj.core.api.Assertions.assertThat(e.getCause().getMessage())
+                    .contains("secure connection");
+            return;
+        }
+        org.assertj.core.api.Assertions.fail(
+                "SSE-C over HTTP should have been rejected with a secure-connection error");
     }
 
     @Test

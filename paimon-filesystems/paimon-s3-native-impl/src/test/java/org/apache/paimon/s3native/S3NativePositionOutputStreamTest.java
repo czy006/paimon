@@ -340,6 +340,84 @@ class S3NativePositionOutputStreamTest {
     }
 
     @Test
+    void testSseKmsShapesObjectCreatingRequests() throws Exception {
+        // [PORTED-ICE I8] SSE-KMS on both PutObject and CreateMultipartUpload.
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        when(sync.createMultipartUpload(any(CreateMultipartUploadRequest.class)))
+                .thenReturn(CreateMultipartUploadResponse.builder().uploadId("u1").build());
+        when(async.uploadPart(any(UploadPartRequest.class), any(AsyncRequestBody.class)))
+                .thenReturn(
+                        CompletableFuture.completedFuture(
+                                UploadPartResponse.builder().eTag("etag").build()));
+        when(sync.completeMultipartUpload(any(CompleteMultipartUploadRequest.class)))
+                .thenReturn(null);
+
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(
+                        sync,
+                        async,
+                        "bucket",
+                        "key",
+                        options("s3.sse.type", "kms", "s3.sse.key", "alias/my-key"));
+        out.write(new byte[(int) PART_SIZE + 3]);
+        out.close();
+
+        org.mockito.ArgumentCaptor<CreateMultipartUploadRequest> create =
+                org.mockito.ArgumentCaptor.forClass(CreateMultipartUploadRequest.class);
+        verify(sync).createMultipartUpload(create.capture());
+        assertThat(create.getValue().serverSideEncryption().toString()).isEqualTo("aws:kms");
+        assertThat(create.getValue().ssekmsKeyId()).isEqualTo("alias/my-key");
+    }
+
+    @Test
+    void testSseCustomShapesUploadPart() throws Exception {
+        // [PORTED-ICE I8] SSE-C is the only SSE form valid on UploadPart; easy to miss.
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        when(sync.createMultipartUpload(any(CreateMultipartUploadRequest.class)))
+                .thenReturn(CreateMultipartUploadResponse.builder().uploadId("u1").build());
+        when(async.uploadPart(any(UploadPartRequest.class), any(AsyncRequestBody.class)))
+                .thenReturn(
+                        CompletableFuture.completedFuture(
+                                UploadPartResponse.builder().eTag("etag").build()));
+        when(sync.completeMultipartUpload(any(CompleteMultipartUploadRequest.class)))
+                .thenReturn(null);
+
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(
+                        sync,
+                        async,
+                        "bucket",
+                        "key",
+                        options(
+                                "s3.sse.type",
+                                "custom",
+                                "s3.sse.key",
+                                "c2VjcmV0LWtleQ==",
+                                "s3.sse.md5",
+                                "tT1l8pJFI9r1hE0A5fFQjg=="));
+        out.write(new byte[(int) PART_SIZE + 3]);
+        out.close();
+
+        org.mockito.ArgumentCaptor<CreateMultipartUploadRequest> create =
+                org.mockito.ArgumentCaptor.forClass(CreateMultipartUploadRequest.class);
+        verify(sync).createMultipartUpload(create.capture());
+        assertThat(create.getValue().sseCustomerAlgorithm()).isEqualTo("AES256");
+        assertThat(create.getValue().sseCustomerKey()).isEqualTo("c2VjcmV0LWtleQ==");
+        assertThat(create.getValue().sseCustomerKeyMD5()).isEqualTo("tT1l8pJFI9r1hE0A5fFQjg==");
+
+        org.mockito.ArgumentCaptor<UploadPartRequest> part =
+                org.mockito.ArgumentCaptor.forClass(UploadPartRequest.class);
+        verify(async, org.mockito.Mockito.times(2))
+                .uploadPart(part.capture(), any(AsyncRequestBody.class));
+        for (UploadPartRequest request : part.getAllValues()) {
+            assertThat(request.sseCustomerAlgorithm()).isEqualTo("AES256");
+            assertThat(request.sseCustomerKey()).isEqualTo("c2VjcmV0LWtleQ==");
+        }
+    }
+
+    @Test
     void testWriteAttributesAppliedToPutObjectPath() throws Exception {
         // [PORTED-ICE I6] Tags/storage-class/ACL must shape the single-put path too, not only
         // CreateMultipartUpload.
