@@ -19,6 +19,7 @@
 package org.apache.paimon.s3native;
 
 import org.apache.paimon.fs.SeekableInputStream;
+import org.apache.paimon.fs.VectoredReadable;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -44,8 +45,13 @@ import java.util.concurrent.locks.ReentrantLock;
  * License 2.0), class org.apache.flink.fs.s3native.NativeS3InputStream. Local reference:
  * /Users/SL/javaProject/flink/flink-filesystems/flink-s3-fs-native/src/main/java/org/apache/
  * flink/fs/s3native/NativeS3InputStream.java
+ *
+ * <p>Also implements {@link VectoredReadable}: {@link #pread(long, byte[], int, int)} issues an
+ * independent ranged GET that neither moves the stream cursor nor touches the shared buffer, so it
+ * is thread-safe by construction; the inherited default {@code readVectored} parallelizes preads
+ * via {@code VectoredReadUtils}.
  */
-final class S3NativeSeekableInputStream extends SeekableInputStream {
+final class S3NativeSeekableInputStream extends SeekableInputStream implements VectoredReadable {
 
     private static final Logger LOG = LoggerFactory.getLogger(S3NativeSeekableInputStream.class);
 
@@ -234,6 +240,48 @@ final class S3NativeSeekableInputStream extends SeekableInputStream {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IOException("Interrupted while acquiring lock", e);
+        }
+    }
+
+    @Override
+    public int pread(long position, byte[] buffer, int offset, int length) throws IOException {
+        if (closed) {
+            throw new IOException("Stream is closed");
+        }
+        if (buffer == null) {
+            throw new NullPointerException("Read buffer must not be null");
+        }
+        if (position < 0 || offset < 0 || length < 0 || length > buffer.length - offset) {
+            throw new IndexOutOfBoundsException(
+                    String.format(
+                            "pread position=%d, off=%d, len=%d out of bounds for buffer of length %d",
+                            position, offset, length, buffer.length));
+        }
+        if (length == 0) {
+            return 0;
+        }
+        if (position >= contentLength) {
+            return -1;
+        }
+        int toRead = (int) Math.min(length, contentLength - position);
+
+        // Independent ranged request: does not use or disturb the shared stream/cursor state.
+        String range = String.format("bytes=%d-%d", position, position + toRead - 1);
+        try (ResponseInputStream<GetObjectResponse> in =
+                client.getObject(
+                        GetObjectRequest.builder().bucket(bucket).key(key).range(range).build())) {
+            int readBytes = 0;
+            while (readBytes < toRead) {
+                int n = in.read(buffer, offset + readBytes, toRead - readBytes);
+                if (n < 0) {
+                    break;
+                }
+                readBytes += n;
+            }
+            return readBytes == 0 ? -1 : readBytes;
+        } catch (IOException | RuntimeException e) {
+            throw new IOException(
+                    String.format("pread failed for %s/%s at %d", bucket, key, position), e);
         }
     }
 
