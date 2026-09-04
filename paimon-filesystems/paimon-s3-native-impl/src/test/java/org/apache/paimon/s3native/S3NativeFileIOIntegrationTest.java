@@ -30,6 +30,7 @@ import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.net.URI;
+import java.util.ArrayList;
 import java.util.Map;
 import java.util.Random;
 
@@ -266,6 +267,99 @@ class S3NativeFileIOIntegrationTest {
         assertThatThrownBy(() -> fs.newOutputStream(dir, false)).isInstanceOf(IOException.class);
         fs.delete(path, true);
         fs.delete(dir, true);
+    }
+
+    // ---------------------------------------------------------------- vectored read
+
+    @Test
+    void testPreadDoesNotMoveCursor() throws Exception {
+        Path path = file("pread");
+        byte[] data = randomBytes(256 * 1024, 14);
+        writeFile(path, data);
+
+        try (SeekableInputStream in = fs.newInputStream(path)) {
+            in.seek(1000);
+            byte[] buf = new byte[64];
+
+            int n = ((org.apache.paimon.fs.VectoredReadable) in).pread(50, buf, 0, buf.length);
+            assertThat(n).isEqualTo(64);
+            assertThat(java.util.Arrays.copyOfRange(buf, 0, 64))
+                    .isEqualTo(java.util.Arrays.copyOfRange(data, 50, 114));
+            // Cursor untouched.
+            assertThat(in.getPos()).isEqualTo(1000);
+
+            // Sequential read still continues from the cursor.
+            in.read(buf, 0, 4);
+            assertThat(java.util.Arrays.copyOfRange(buf, 0, 4))
+                    .isEqualTo(java.util.Arrays.copyOfRange(data, 1000, 1004));
+
+            // EOF and clamped tail.
+            assertThat(((org.apache.paimon.fs.VectoredReadable) in).pread(data.length, buf, 0, 64))
+                    .isEqualTo(-1);
+            int tail =
+                    ((org.apache.paimon.fs.VectoredReadable) in)
+                            .pread(data.length - 10, buf, 0, 64);
+            assertThat(tail).isEqualTo(10);
+        }
+        fs.delete(path, true);
+    }
+
+    @Test
+    void testConcurrentPreads() throws Exception {
+        Path path = file("pread-concurrent");
+        byte[] data = randomBytes(1024 * 1024, 15);
+        writeFile(path, data);
+
+        try (SeekableInputStream in = fs.newInputStream(path)) {
+            java.util.List<java.util.concurrent.CompletableFuture<Boolean>> checks =
+                    new ArrayList<>();
+            for (int i = 0; i < 8; i++) {
+                final int slot = i;
+                checks.add(
+                        java.util.concurrent.CompletableFuture.supplyAsync(
+                                () -> {
+                                    try {
+                                        int offset = slot * 100_000;
+                                        byte[] buf = new byte[4096];
+                                        int n =
+                                                ((org.apache.paimon.fs.VectoredReadable) in)
+                                                        .pread(offset, buf, 0, buf.length);
+                                        return n == 4096
+                                                && java.util.Arrays.equals(
+                                                        buf,
+                                                        java.util.Arrays.copyOfRange(
+                                                                data, offset, offset + 4096));
+                                    } catch (IOException e) {
+                                        throw new RuntimeException(e);
+                                    }
+                                }));
+            }
+            for (java.util.concurrent.CompletableFuture<Boolean> check : checks) {
+                assertThat(check.get()).isTrue();
+            }
+        }
+        fs.delete(path, true);
+    }
+
+    @Test
+    void testReadVectoredViaDefault() throws Exception {
+        Path path = file("vectored");
+        byte[] data = randomBytes(1024 * 1024, 16);
+        writeFile(path, data);
+
+        try (SeekableInputStream in = fs.newInputStream(path)) {
+            org.apache.paimon.fs.FileRange r1 =
+                    org.apache.paimon.fs.FileRange.createFileRange(0, 1024);
+            org.apache.paimon.fs.FileRange r2 =
+                    org.apache.paimon.fs.FileRange.createFileRange(500_000, 2048);
+            ((org.apache.paimon.fs.VectoredReadable) in)
+                    .readVectored(java.util.Arrays.asList(r1, r2));
+
+            assertThat(r1.getData().get()).isEqualTo(java.util.Arrays.copyOfRange(data, 0, 1024));
+            assertThat(r2.getData().get())
+                    .isEqualTo(java.util.Arrays.copyOfRange(data, 500_000, 502_048));
+        }
+        fs.delete(path, true);
     }
 
     @Test
