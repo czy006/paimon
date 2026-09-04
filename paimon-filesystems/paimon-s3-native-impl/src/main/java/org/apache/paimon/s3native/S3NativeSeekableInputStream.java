@@ -81,7 +81,7 @@ final class S3NativeSeekableInputStream extends SeekableInputStream {
 
     @Override
     public void seek(long desired) throws IOException {
-        lock.lock();
+        lock();
         try {
             if (closed) {
                 throw new IOException("Stream is closed");
@@ -98,23 +98,23 @@ final class S3NativeSeekableInputStream extends SeekableInputStream {
             }
             nextReadPos = desired;
         } finally {
-            lock.unlock();
+            this.lock.unlock();
         }
     }
 
     @Override
     public long getPos() throws IOException {
-        lock.lock();
+        lock();
         try {
             return nextReadPos;
         } finally {
-            lock.unlock();
+            this.lock.unlock();
         }
     }
 
     @Override
     public int read() throws IOException {
-        lock.lock();
+        lock();
         try {
             if (closed) {
                 throw new IOException("Stream is closed");
@@ -131,7 +131,7 @@ final class S3NativeSeekableInputStream extends SeekableInputStream {
             }
             return data;
         } finally {
-            lock.unlock();
+            this.lock.unlock();
         }
     }
 
@@ -149,7 +149,7 @@ final class S3NativeSeekableInputStream extends SeekableInputStream {
         if (len == 0) {
             return 0;
         }
-        lock.lock();
+        lock();
         try {
             if (closed) {
                 throw new IOException("Stream is closed");
@@ -168,13 +168,13 @@ final class S3NativeSeekableInputStream extends SeekableInputStream {
             }
             return bytesRead;
         } finally {
-            lock.unlock();
+            this.lock.unlock();
         }
     }
 
     @Override
     public int available() throws IOException {
-        lock.lock();
+        lock();
         try {
             if (closed) {
                 throw new IOException("Stream is closed");
@@ -182,14 +182,14 @@ final class S3NativeSeekableInputStream extends SeekableInputStream {
             long remaining = contentLength - nextReadPos;
             return (int) Math.min(remaining, Integer.MAX_VALUE);
         } finally {
-            lock.unlock();
+            this.lock.unlock();
         }
     }
 
     @Override
     public long skip(long n) throws IOException {
         // Skipping only moves the cursor; no I/O is issued (the next read reconciles lazily).
-        lock.lock();
+        lock();
         try {
             if (closed) {
                 throw new IOException("Stream is closed");
@@ -202,13 +202,13 @@ final class S3NativeSeekableInputStream extends SeekableInputStream {
             nextReadPos = newPos;
             return skipped;
         } finally {
-            lock.unlock();
+            this.lock.unlock();
         }
     }
 
     @Override
     public void close() throws IOException {
-        lock.lock();
+        lock();
         try {
             if (closed) {
                 return;
@@ -219,7 +219,21 @@ final class S3NativeSeekableInputStream extends SeekableInputStream {
                 throw exception;
             }
         } finally {
-            lock.unlock();
+            this.lock.unlock();
+        }
+    }
+
+    /**
+     * Acquires the lock interruptibly, mapping interruption to IOException as callers expect.
+     *
+     * <p>[PORTED] NativeS3InputStream#lock.
+     */
+    private void lock() throws IOException {
+        try {
+            this.lock.lockInterruptibly();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while acquiring lock", e);
         }
     }
 

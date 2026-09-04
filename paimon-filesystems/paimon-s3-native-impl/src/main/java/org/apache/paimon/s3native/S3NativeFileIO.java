@@ -26,6 +26,8 @@ import org.apache.paimon.fs.PositionOutputStream;
 import org.apache.paimon.fs.SeekableInputStream;
 import org.apache.paimon.options.Options;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import software.amazon.awssdk.services.s3.model.CopyObjectRequest;
 import software.amazon.awssdk.services.s3.model.CopyObjectResponse;
 import software.amazon.awssdk.services.s3.model.CopyPartResult;
@@ -37,7 +39,6 @@ import software.amazon.awssdk.services.s3.model.UploadPartCopyRequest;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -65,6 +66,8 @@ public class S3NativeFileIO implements FileIO {
 
     private static final long serialVersionUID = 1L;
 
+    private static final Logger LOG = LoggerFactory.getLogger(S3NativeFileIO.class);
+
     /** S3 CopyObject cannot copy objects larger than 5GB in one request. */
     private static final long MAX_COPY_OBJECT_BYTES = 5L << 30;
 
@@ -75,7 +78,9 @@ public class S3NativeFileIO implements FileIO {
      */
     private static final Map<Options, S3NativeClientProvider> CLIENTS = new ConcurrentHashMap<>();
 
-    private transient volatile Options normalizedOptions;
+    /** Translated s3.* options; serialized so a deserialized FileIO can rebuild everything. */
+    private volatile Options normalizedOptions;
+
     private transient volatile S3NativeOptions options;
 
     @Override
@@ -86,9 +91,9 @@ public class S3NativeFileIO implements FileIO {
     @Override
     public void configure(CatalogContext context) {
         Options normalized = S3ConfigTranslator.translate(context.options());
+        this.normalizedOptions = normalized;
         // Fail fast on invalid values before any client is built.
         this.options = S3NativeOptions.from(normalized);
-        this.normalizedOptions = normalized;
     }
 
     @Override
@@ -103,16 +108,17 @@ public class S3NativeFileIO implements FileIO {
                 S3PathUtils.bucket(path),
                 key,
                 head.contentLength,
-                options.readBufferSize);
+                resolvedOptions().readBufferSize);
     }
 
     @Override
     public PositionOutputStream newOutputStream(Path path, boolean overwrite) throws IOException {
         String key = key(path);
-        S3NativeObjectOperations operations = ops(path);
-        if (!overwrite && operations.headObjectOrNull(key) != null) {
-            // [PORTED] NativeS3FileSystem#create (NO_OVERWRITE branch); note a marker-only
-            // directory also counts as existing here, which matches that reference behavior.
+        S3NativeOptions resolved = resolvedOptions();
+        if (!overwrite && classify(path).kind != Kind.MISSING) {
+            // [PORTED] NativeS3FileSystem#create (NO_OVERWRITE branch). Blocks any existing
+            // entry — file, marker directory or prefix directory — unlike the Flink original
+            // which only checked objects.
             throw new IOException("File already exists: " + path);
         }
         return new S3NativePositionOutputStream(
@@ -120,9 +126,9 @@ public class S3NativeFileIO implements FileIO {
                 provider().asyncClient(),
                 S3PathUtils.bucket(path),
                 key,
-                options.tmpDir,
-                options.partSizeBytes,
-                options.maxConcurrentUploads);
+                resolved.tmpDir,
+                resolved.partSizeBytes,
+                resolved.maxConcurrentUploads);
     }
 
     @Override
@@ -240,6 +246,10 @@ public class S3NativeFileIO implements FileIO {
         if (srcKey.equals(dstKey)) {
             return true;
         }
+        if (!S3PathUtils.bucket(src).equals(S3PathUtils.bucket(dst))) {
+            // The copy below would otherwise silently land in the source bucket.
+            return false;
+        }
         S3NativeObjectOperations operations = ops(src);
 
         Classification srcClassification = classify(src);
@@ -264,11 +274,20 @@ public class S3NativeFileIO implements FileIO {
         // then batch delete the source side. Not atomic, like every S3A rename.
         String srcPrefix = srcKey.isEmpty() ? "" : srcKey + "/";
         String dstPrefix = dstKey.isEmpty() ? "" : dstKey + "/";
-        List<String> srcKeys = operations.listAllKeys(srcPrefix);
-        for (String srcObjectKey : srcKeys) {
+        List<software.amazon.awssdk.services.s3.model.S3Object> srcObjects =
+                operations.listAllObjects(srcPrefix);
+        for (software.amazon.awssdk.services.s3.model.S3Object srcObject : srcObjects) {
+            String srcObjectKey = srcObject.key();
             String renamed = dstPrefix + srcObjectKey.substring(srcPrefix.length());
-            long length = lengthOf(operations, srcObjectKey);
-            copyObject(operations, srcObjectKey, renamed, length);
+            copyObject(
+                    operations,
+                    srcObjectKey,
+                    renamed,
+                    srcObject.size() == null ? 0L : srcObject.size());
+        }
+        List<String> srcKeys = new ArrayList<>(srcObjects.size());
+        for (software.amazon.awssdk.services.s3.model.S3Object srcObject : srcObjects) {
+            srcKeys.add(srcObject.key());
         }
         operations.deleteBatch(srcKeys);
         return true;
@@ -286,13 +305,6 @@ public class S3NativeFileIO implements FileIO {
         return !ancestorKey.isEmpty()
                 && (descendantKey + "/").startsWith(ancestorKey + "/")
                 && !descendantKey.equals(ancestorKey);
-    }
-
-    private static long lengthOf(S3NativeObjectOperations operations, String objectKey)
-            throws IOException {
-        software.amazon.awssdk.services.s3.model.HeadObjectResponse head =
-                operations.headObjectOrNull(objectKey);
-        return head == null || head.contentLength() == null ? 0L : head.contentLength();
     }
 
     /** Copies an object; [DEVIATION D7] objects over 5GB go through UploadPartCopy. */
@@ -322,6 +334,7 @@ public class S3NativeFileIO implements FileIO {
     private static void copyObjectMultipart(
             S3NativeObjectOperations operations, String srcKey, String dstKey, long length)
             throws IOException {
+        String uploadId = null;
         try {
             CreateMultipartUploadResponse create =
                     operations
@@ -331,7 +344,7 @@ public class S3NativeFileIO implements FileIO {
                                             .bucket(operations.bucket())
                                             .key(dstKey)
                                             .build());
-            String uploadId = create.uploadId();
+            uploadId = create.uploadId();
 
             List<software.amazon.awssdk.services.s3.model.CompletedPart> parts = new ArrayList<>();
             int partNumber = 1;
@@ -359,25 +372,60 @@ public class S3NativeFileIO implements FileIO {
                                 .eTag(result.eTag())
                                 .build());
             }
-            parts.sort(
-                    Comparator.comparing(
-                            software.amazon.awssdk.services.s3.model.CompletedPart::partNumber));
+            try {
+                operations
+                        .client()
+                        .completeMultipartUpload(
+                                software.amazon.awssdk.services.s3.model
+                                        .CompleteMultipartUploadRequest.builder()
+                                        .bucket(operations.bucket())
+                                        .key(dstKey)
+                                        .uploadId(uploadId)
+                                        .multipartUpload(
+                                                software.amazon.awssdk.services.s3.model
+                                                        .CompletedMultipartUpload.builder()
+                                                        .parts(parts)
+                                                        .build())
+                                        .build());
+            } catch (software.amazon.awssdk.services.s3.model.NoSuchUploadException e) {
+                // [PORTED] NativeS3ObjectOperations#commitMultiPartUpload — the complete request
+                // may have succeeded while its response was lost; verify the object exists.
+                if (operations.headObjectOrNull(dstKey) == null) {
+                    abortCopyQuietly(operations, dstKey, uploadId);
+                    throw new IOException(
+                            "Failed to multipart-copy " + srcKey + " to " + dstKey, e);
+                }
+            } catch (S3Exception e) {
+                abortCopyQuietly(operations, dstKey, uploadId);
+                throw new IOException("Failed to multipart-copy " + srcKey + " to " + dstKey, e);
+            }
+        } catch (S3Exception e) {
+            abortCopyQuietly(operations, dstKey, uploadId);
+            throw new IOException("Failed to multipart-copy " + srcKey + " to " + dstKey, e);
+        }
+    }
+
+    private static void abortCopyQuietly(
+            S3NativeObjectOperations operations, String dstKey, String uploadId) {
+        if (uploadId == null) {
+            return;
+        }
+        try {
             operations
                     .client()
-                    .completeMultipartUpload(
-                            software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest
+                    .abortMultipartUpload(
+                            software.amazon.awssdk.services.s3.model.AbortMultipartUploadRequest
                                     .builder()
                                     .bucket(operations.bucket())
                                     .key(dstKey)
                                     .uploadId(uploadId)
-                                    .multipartUpload(
-                                            software.amazon.awssdk.services.s3.model
-                                                    .CompletedMultipartUpload.builder()
-                                                    .parts(parts)
-                                                    .build())
                                     .build());
-        } catch (S3Exception e) {
-            throw new IOException("Failed to multipart-copy " + srcKey + " to " + dstKey, e);
+        } catch (RuntimeException abortFailure) {
+            LOG.warn(
+                    "Failed to abort multipart copy upload for {} (uploadId {})",
+                    dstKey,
+                    uploadId,
+                    abortFailure);
         }
     }
 
@@ -479,11 +527,22 @@ public class S3NativeFileIO implements FileIO {
         return new S3NativeObjectOperations(provider().syncClient(), S3PathUtils.bucket(path));
     }
 
+    /** Lazily rebuilds the typed options after Java deserialization. */
+    private S3NativeOptions resolvedOptions() {
+        S3NativeOptions resolved = options;
+        if (resolved == null) {
+            resolved = S3NativeOptions.from(normalizedOptions);
+            options = resolved;
+        }
+        return resolved;
+    }
+
     private S3NativeClientProvider provider() {
         Options normalized = this.normalizedOptions;
         if (normalized == null) {
             throw new IllegalStateException("S3NativeFileIO is not configured yet");
         }
-        return CLIENTS.computeIfAbsent(normalized, k -> S3NativeClientProvider.create(options));
+        return CLIENTS.computeIfAbsent(
+                normalized, k -> S3NativeClientProvider.create(resolvedOptions()));
     }
 }
