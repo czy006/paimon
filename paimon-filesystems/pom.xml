@@ -37,6 +37,8 @@
         <module>paimon-oss-impl</module>
         <module>paimon-s3</module>
         <module>paimon-s3-impl</module>
+        <module>paimon-s3-native-impl</module>
+        <module>paimon-s3-native</module>
         <module>paimon-cosn</module>
         <module>paimon-cosn-impl</module>
         <module>paimon-jindo</module>
