@@ -20,8 +20,6 @@ package org.apache.paimon.s3native;
 
 import org.apache.paimon.fs.Path;
 
-import javax.annotation.Nullable;
-
 /**
  * Extracts bucket and object key from Paimon {@link Path} URIs of the form {@code
  * s3://bucket-name/path/to/object}.
@@ -51,7 +49,6 @@ final class S3PathUtils {
      * Returns the object key (URI path without leading slash). The root of a bucket maps to the
      * empty key.
      */
-    @Nullable
     static String key(Path path) {
         // [PORTED] NativeS3ObjectOperations#extractKey
         String key = path.toUri().getPath();
