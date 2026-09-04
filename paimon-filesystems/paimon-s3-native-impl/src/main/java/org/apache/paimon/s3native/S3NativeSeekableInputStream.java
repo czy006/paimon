@@ -63,6 +63,17 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
     private final long contentLength;
     private final int readBufferSize;
 
+    /**
+     * [PORTED-ICE Spec §14 I1] Connection failures during an in-flight read are not covered by SDK
+     * retries (which only govern request setup); mirror Iceberg S3InputStream's bounded
+     * reopen-and-retry for them.
+     */
+    /**
+     * Total attempts per read (1 initial + 2 retries); Iceberg budgets 1+3. The smaller budget
+     * trades one extra retry for a tighter failure latency.
+     */
+    private static final int MAX_READ_ATTEMPTS = 3;
+
     private ResponseInputStream<GetObjectResponse> currentStream;
     private BufferedInputStream bufferedStream;
 
@@ -74,6 +85,9 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
 
     private volatile boolean closed;
 
+    /** Capture site for the unclosed-stream warning emitted by {@link #finalize()}. */
+    private final StackTraceElement[] createStack;
+
     S3NativeSeekableInputStream(
             S3Client client, String bucket, String key, long contentLength, int readBufferSize) {
         this.client = client;
@@ -83,6 +97,7 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
         this.readBufferSize = readBufferSize;
         this.nextReadPos = 0;
         this.streamPos = 0;
+        this.createStack = Thread.currentThread().getStackTrace();
     }
 
     @Override
@@ -130,7 +145,24 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
             }
             lazySeek();
             ensureStreamOpen();
-            int data = bufferedStream.read();
+            int data;
+            int attempts = 0;
+            while (true) {
+                try {
+                    data = bufferedStream.read();
+                    break;
+                } catch (IOException e) {
+                    if (++attempts >= MAX_READ_ATTEMPTS || !isRetryableReadFailure(e)) {
+                        throw e;
+                    }
+                    LOG.warn(
+                            "Retrying S3 read of {}/{} after connection failure (attempt {})",
+                            bucket,
+                            key,
+                            attempts);
+                    reopenAfterReadFailure();
+                }
+            }
             if (data != -1) {
                 nextReadPos++;
                 streamPos++;
@@ -167,7 +199,24 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
             ensureStreamOpen();
             long remaining = contentLength - nextReadPos;
             int toRead = (int) Math.min(len, remaining);
-            int bytesRead = bufferedStream.read(b, off, toRead);
+            int bytesRead;
+            int attempts = 0;
+            while (true) {
+                try {
+                    bytesRead = bufferedStream.read(b, off, toRead);
+                    break;
+                } catch (IOException e) {
+                    if (++attempts >= MAX_READ_ATTEMPTS || !isRetryableReadFailure(e)) {
+                        throw e;
+                    }
+                    LOG.warn(
+                            "Retrying S3 read of {}/{} after connection failure (attempt {})",
+                            bucket,
+                            key,
+                            attempts);
+                    reopenAfterReadFailure();
+                }
+            }
             if (bytesRead > 0) {
                 nextReadPos += bytesRead;
                 streamPos += bytesRead;
@@ -285,6 +334,35 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
         }
     }
 
+    static String formatCreateStackTrace(StackTraceElement[] stack) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 1; i < stack.length; i++) {
+            sb.append(stack[i]).append("\n\t");
+        }
+        return sb.toString();
+    }
+
+    /**
+     * [PORTED-ICE Spec §14 I3] Last-resort release for streams a reader failed to close; mirrors
+     * Iceberg S3InputStream#finalize.
+     */
+    @Override
+    @SuppressWarnings({"Finalize", "deprecation"})
+    protected void finalize() throws Throwable {
+        super.finalize();
+        if (!closed) {
+            lock.lock();
+            try {
+                closed = true;
+                releaseStreams();
+            } finally {
+                lock.unlock();
+            }
+            LOG.warn(
+                    "Unclosed input stream created by:\n\t{}", formatCreateStackTrace(createStack));
+        }
+    }
+
     // ------------------------------------------------------------------------
 
     /** Reconciles {@link #nextReadPos} and {@link #streamPos} before reading bytes. */
@@ -312,11 +390,46 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
         // readBufferSize is the skip threshold: at most readBufferSize bytes may be consumed
         // from the live HTTP connection before a range request becomes preferable.
         if (diff > 0 && diff <= (long) readBufferSize) {
-            skipBytesInBuffer(diff);
-            return;
+            try {
+                skipBytesInBuffer(diff);
+                return;
+            } catch (IOException e) {
+                if (!isRetryableReadFailure(e)) {
+                    throw e;
+                }
+                // Buffered skip hit the network mid-way, leaving the buffer state indeterminate;
+                // fall through to a clean reopen at streamPos (Iceberg does the same in
+                // positionStream).
+            }
         }
 
         openStreamAtCurrentPosition();
+    }
+
+    /** Reopens the stream at the last confirmed position after a mid-read failure. */
+    private void reopenAfterReadFailure() throws IOException {
+        // Counters only advance on bytes returned to the caller (the speculative in-buffer skip
+        // aside, which guards itself above), so streamPos already points at the recovery offset;
+        // the failed stream's buffered bytes are simply discarded.
+        openStreamAtCurrentPosition();
+    }
+
+    /**
+     * Whether the failure looks like a dropped/stalled connection. Walks the cause chain, since SDK
+     * and HTTP-client wrappers nest the socket exception.
+     */
+    static boolean isRetryableReadFailure(IOException e) {
+        Throwable current = e;
+        while (current != null) {
+            if (current instanceof javax.net.ssl.SSLException
+                    || current instanceof java.net.SocketException
+                    // SocketTimeoutException extends InterruptedIOException, not SocketException.
+                    || current instanceof java.net.SocketTimeoutException) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
     }
 
     private void ensureStreamOpen() throws IOException {

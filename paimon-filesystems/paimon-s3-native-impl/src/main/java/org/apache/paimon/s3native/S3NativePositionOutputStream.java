@@ -99,6 +99,9 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
     private long pos;
     private boolean closed;
 
+    /** Capture site for the unclosed-stream warning emitted by {@link #finalize()}. */
+    private final StackTraceElement[] createStack;
+
     S3NativePositionOutputStream(
             S3Client syncClient,
             S3AsyncClient asyncClient,
@@ -114,6 +117,7 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
         this.key = key;
         this.partSize = partSize;
         this.uploadPermits = new Semaphore(maxConcurrentUploads);
+        this.createStack = Thread.currentThread().getStackTrace();
         this.tmpDir = new File(tmpDir);
         Files.createDirectories(this.tmpDir.toPath());
         rollPartFile();
@@ -153,9 +157,23 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
         lock.lock();
         try {
             ensureOpen();
-            currentBuffer.write(b, off, len);
-            pos += len;
-            currentPartSize += len;
+            // [PORTED-ICE Spec §14 I2] Split writes larger than a part at part boundaries, so a
+            // single large write cannot produce oversized parts. Mirrors Iceberg
+            // S3OutputStream#write(byte[], int, int).
+            int remaining = len;
+            int relativeOffset = off;
+            while (currentPartSize + remaining > partSize) {
+                int writeSize = (int) (partSize - currentPartSize);
+                currentBuffer.write(b, relativeOffset, writeSize);
+                pos += writeSize;
+                currentPartSize += writeSize;
+                remaining -= writeSize;
+                relativeOffset += writeSize;
+                submitCurrentPart();
+            }
+            currentBuffer.write(b, relativeOffset, remaining);
+            pos += remaining;
+            currentPartSize += remaining;
             maybeSubmitPart();
         } finally {
             lock.unlock();
@@ -392,6 +410,40 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
                     new BufferedOutputStream(new FileOutputStream(currentPartFile), BUFFER_SIZE);
         } catch (IOException e) {
             throw new IOException("Failed to create local part file " + currentPartFile, e);
+        }
+    }
+
+    /**
+     * [PORTED-ICE Spec §14 I3] Last-resort cleanup for streams a writer failed to close: abort the
+     * multipart upload and delete temp files. Completing the upload from a finalizer would be
+     * unsafe, so the data is intentionally discarded. Mirrors Iceberg S3OutputStream#finalize.
+     */
+    @Override
+    @SuppressWarnings({"Finalize", "deprecation"})
+    protected void finalize() throws Throwable {
+        super.finalize();
+        if (!closed) {
+            lock.lock();
+            try {
+                closed = true;
+                // [DEVIATION] Iceberg's finalize only removes staging files and leaves the
+                // multipart upload to bucket lifecycle rules; we also abort it to avoid paying
+                // for orphaned parts, accepting a bounded SDK call on the finalizer thread.
+                if (currentBuffer != null) {
+                    try {
+                        currentBuffer.close();
+                    } catch (IOException e) {
+                        LOG.debug("Failed to close unclosed stream's buffer", e);
+                    }
+                }
+                abortUploadQuietly();
+                cleanupTempFiles();
+            } finally {
+                lock.unlock();
+            }
+            LOG.warn(
+                    "Unclosed output stream created by:\n\t{}",
+                    S3NativeSeekableInputStream.formatCreateStackTrace(createStack));
         }
     }
 
