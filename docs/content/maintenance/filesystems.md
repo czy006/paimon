@@ -396,6 +396,54 @@ Caused by: org.apache.http.conn.ConnectionPoolTimeoutException: Timeout waiting 
 ```
 Try to configure this in catalog options: `fs.s3a.connection.maximum=1000`.
 
+## S3 Native (Experimental)
+
+`paimon-s3-native` is an alternative S3 filesystem implemented directly on the AWS SDK v2 with
+**no Hadoop dependency**. Compared to `paimon-s3` (Hadoop S3A + AWS SDK v1) it offers
+multipart uploads with bounded concurrent part transfers, vectored reading for columnar
+formats (`pread`-based, parallel range GETs), and a smaller dependency surface.
+
+{{< unstable >}}
+
+Download [paimon-s3-native-{{< version >}}.jar](https://repository.apache.org/snapshots/org/apache/paimon/paimon-s3-native/{{< version >}}/).
+
+{{< /unstable >}}
+
+{{< hint warning >}}
+`paimon-s3-native` and `paimon-s3` both register the `s3://` scheme and **must not be deployed
+at the same time** — drop exactly one of the two jars into your engine's classpath. Keeping both
+leads to a duplicate-scheme error during `FileIO` discovery. Rolling back to `paimon-s3` is
+simply swapping the jar back; the option keys below are compatible.
+{{< /hint >}}
+
+Deployment and configuration follow the [S3](#s3) section above (Flink `lib/`, Spark `jars/`,
+Hive `auxlib`) — just use `paimon-s3-native-{{< version >}}.jar` instead of `paimon-s3-{{< version >}}.jar`.
+The `s3.*` option keys (`s3.endpoint`, `s3.access-key`, `s3.secret-key`, `s3.path-style-access`,
+`s3.region`, ...) are identical; common `fs.s3a.*` keys (`fs.s3a.endpoint`,
+`fs.s3a.access.key`, `fs.s3a.multipart.size`, `fs.s3a.connection.maximum`, ...) are accepted as
+aliases, and unrecognized `fs.s3a.*` keys are reported with a warning and ignored.
+
+Additional options:
+
+| Option | Default | Description |
+| :- | :- | :- |
+| `s3.upload.min.part.size` | 5mb | Multipart part size (5MB–5GB); parts upload concurrently. |
+| `s3.upload.max.concurrent.uploads` | CPU cores | Maximum in-flight part uploads per stream. |
+| `s3.read.buffer.size` | 256kb | Input stream read-ahead buffer (minimum 256KB). |
+| `s3.connection.max` | 50 | HTTP connection pool size for both clients. |
+| `s3.retry.max-num-retries` | 3 | Retries per request (exponential backoff, 100ms base / 20s cap). |
+| `s3.upload.tmp.dir` | `java.io.tmpdir` | Local directory buffering parts before upload. |
+
+Notes:
+
+- Buckets expose S3A-compatible directory markers (0-byte `key/` objects), so tooling
+  interoperates with data written by `paimon-s3`.
+- Rename is copy+delete and not atomic, exactly like S3A; objects larger than 5GB are copied
+  via multipart `UploadPartCopy`.
+- Region resolution follows the AWS SDK default chain (`s3.region` option, `AWS_REGION`
+  environment variable, `~/.aws/config`, EC2 metadata) and fails fast when nothing resolves —
+  set `s3.region` explicitly for S3-compatible stores.
+
 ## Google Cloud Storage
 
 {{< stable >}}

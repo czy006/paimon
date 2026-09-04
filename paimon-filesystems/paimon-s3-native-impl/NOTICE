@@ -1,0 +1,12 @@
+paimon-s3-native-impl
+Copyright 2026 The Apache Software Foundation
+
+This product includes software developed at The Apache Software
+Foundation (http://www.apache.org/).
+
+This module contains code derived from Apache Flink
+(https://flink.apache.org), module flink-filesystems/flink-s3-fs-native
+(FLINK-38592, "Initial Native Flink S3 FileSystem"), licensed under the
+Apache License, Version 2.0. Derivations are marked with [PORTED]/[ADAPTED]
+comments in the source files, together with deviations documented in
+docs/analysis/paimon-s3-native-原生S3-FileIO-Spec.md (§5.5).
