@@ -41,6 +41,8 @@ import software.amazon.awssdk.services.s3.model.Tagging;
 import software.amazon.awssdk.services.s3.model.UploadPartRequest;
 import software.amazon.awssdk.services.s3.model.UploadPartResponse;
 
+import javax.annotation.Nullable;
+
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.ByteArrayInputStream;
@@ -115,8 +117,8 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
     private final Semaphore uploadPermits;
     private final boolean checksumEnabled;
     private final Set<Tag> writeTags;
-    private final String writeStorageClass;
-    private final String acl;
+    @Nullable private final StorageClass writeStorageClass;
+    @Nullable private final ObjectCannedACL acl;
 
     private final ReentrantLock lock = new ReentrantLock();
 
@@ -204,8 +206,11 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
             currentBuffer.write(b);
             pos++;
             currentPartSize++;
-            updateWholeDigest(new byte[] {(byte) b}, 0, 1);
+            if (wholeObjectDigest != null) {
+                wholeObjectDigest.update((byte) b);
+            }
             onPartMaybeFull();
+            maybeStartUploading();
         } finally {
             lock.unlock();
         }
@@ -242,6 +247,10 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
             currentPartSize += remaining;
             updateWholeDigest(b, relativeOffset, remaining);
             onPartMaybeFull();
+            // [PORTED-ICE I5] Iceberg re-checks the threshold at the end of every write; without
+            // this tail check a sub-part-increment stream just past the threshold would reach
+            // close() and take the single-PutObject path instead of starting the MPU.
+            maybeStartUploading();
         } finally {
             lock.unlock();
         }
@@ -456,12 +465,16 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
         pendingParts.clear();
     }
 
-    private String startMultipartUpload() {
+    private String startMultipartUpload() throws IOException {
         CreateMultipartUploadRequest.Builder requestBuilder =
                 CreateMultipartUploadRequest.builder().bucket(bucket).key(key);
         applyWriteAttributes(
                 requestBuilder::tagging, requestBuilder::storageClass, requestBuilder::acl);
-        return syncClient.createMultipartUpload(requestBuilder.build()).uploadId();
+        try {
+            return syncClient.createMultipartUpload(requestBuilder.build()).uploadId();
+        } catch (RuntimeException e) {
+            throw new IOException("Failed to start multipart upload for " + key, e);
+        }
     }
 
     /** [PORTED-ICE I6] Tags, storage class and ACL on every object-creating request. */
@@ -473,10 +486,10 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
             taggingSetter.accept(Tagging.builder().tagSet(writeTags).build());
         }
         if (writeStorageClass != null) {
-            storageClassSetter.accept(StorageClass.fromValue(writeStorageClass));
+            storageClassSetter.accept(writeStorageClass);
         }
         if (acl != null) {
-            aclSetter.accept(ObjectCannedACL.fromValue(acl));
+            aclSetter.accept(acl);
         }
     }
 
