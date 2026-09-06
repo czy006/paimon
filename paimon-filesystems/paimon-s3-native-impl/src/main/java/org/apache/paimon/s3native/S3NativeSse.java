@@ -229,12 +229,6 @@ final class S3NativeSse {
         }
     }
 
-    private void applyKmsKey(java.util.function.Consumer<String> setter) {
-        if (kmsKeyId != null) {
-            setter.accept(kmsKeyId);
-        }
-    }
-
     private void applyCustomer(
             java.util.function.Consumer<String> algorithmSetter,
             java.util.function.Consumer<String> keySetter,

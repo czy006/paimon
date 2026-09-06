@@ -340,6 +340,68 @@ class S3NativePositionOutputStreamTest {
     }
 
     @Test
+    void testNoSuchUploadCommitRecoverySucceedsWhenObjectExists() throws Exception {
+        // [PORTED] Flink/Iceberg commitMultiPartUpload recovery: a lost Complete response must
+        // not fail the close when the object verifiably exists.
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        when(sync.createMultipartUpload(any(CreateMultipartUploadRequest.class)))
+                .thenReturn(CreateMultipartUploadResponse.builder().uploadId("u1").build());
+        when(async.uploadPart(any(UploadPartRequest.class), any(AsyncRequestBody.class)))
+                .thenReturn(
+                        CompletableFuture.completedFuture(
+                                UploadPartResponse.builder().eTag("etag").build()));
+        when(sync.completeMultipartUpload(any(CompleteMultipartUploadRequest.class)))
+                .thenThrow(
+                        (software.amazon.awssdk.services.s3.model.NoSuchUploadException)
+                                software.amazon.awssdk.services.s3.model.NoSuchUploadException
+                                        .builder()
+                                        .build());
+        when(sync.headObject(any(software.amazon.awssdk.services.s3.model.HeadObjectRequest.class)))
+                .thenReturn(
+                        software.amazon.awssdk.services.s3.model.HeadObjectResponse.builder()
+                                .build());
+
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(sync, async, "bucket", "key", options());
+        out.write(new byte[(int) PART_SIZE + 3]);
+        out.close(); // must not throw: recovery verified the object exists
+
+        verify(sync)
+                .headObject(any(software.amazon.awssdk.services.s3.model.HeadObjectRequest.class));
+        verify(sync, never()).abortMultipartUpload(any(AbortMultipartUploadRequest.class));
+    }
+
+    @Test
+    void testNoSuchUploadCommitRecoveryFailsWhenObjectMissing() throws Exception {
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        when(sync.createMultipartUpload(any(CreateMultipartUploadRequest.class)))
+                .thenReturn(CreateMultipartUploadResponse.builder().uploadId("u1").build());
+        when(async.uploadPart(any(UploadPartRequest.class), any(AsyncRequestBody.class)))
+                .thenReturn(
+                        CompletableFuture.completedFuture(
+                                UploadPartResponse.builder().eTag("etag").build()));
+        when(sync.completeMultipartUpload(any(CompleteMultipartUploadRequest.class)))
+                .thenThrow(
+                        (software.amazon.awssdk.services.s3.model.NoSuchUploadException)
+                                software.amazon.awssdk.services.s3.model.NoSuchUploadException
+                                        .builder()
+                                        .build());
+        when(sync.headObject(any(software.amazon.awssdk.services.s3.model.HeadObjectRequest.class)))
+                .thenThrow(
+                        (software.amazon.awssdk.services.s3.model.NoSuchKeyException)
+                                software.amazon.awssdk.services.s3.model.NoSuchKeyException
+                                        .builder()
+                                        .build());
+
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(sync, async, "bucket", "key", options());
+        out.write(new byte[(int) PART_SIZE + 3]);
+        assertThatThrownBy(out::close).isInstanceOf(IOException.class);
+    }
+
+    @Test
     void testSseKmsShapesObjectCreatingRequests() throws Exception {
         // [PORTED-ICE I8] SSE-KMS on both PutObject and CreateMultipartUpload.
         S3Client sync = mock(S3Client.class);

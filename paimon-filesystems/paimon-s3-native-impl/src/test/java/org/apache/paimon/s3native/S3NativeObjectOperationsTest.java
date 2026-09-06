@@ -199,6 +199,55 @@ class S3NativeObjectOperationsTest {
     }
 
     @Test
+    void testListingPaginationAcrossPages() throws IOException {
+        // Three pages of 2 keys each via continuation tokens; all 6 keys must be collected.
+        S3Client client = mock(S3Client.class);
+        software.amazon.awssdk.services.s3.model.S3Object obj =
+                software.amazon.awssdk.services.s3.model.S3Object.builder().build();
+        when(client.listObjectsV2(
+                        any(software.amazon.awssdk.services.s3.model.ListObjectsV2Request.class)))
+                .thenReturn(
+                        software.amazon.awssdk.services.s3.model.ListObjectsV2Response.builder()
+                                .contents(
+                                        software.amazon.awssdk.services.s3.model.S3Object.builder()
+                                                .key("k-0")
+                                                .build(),
+                                        software.amazon.awssdk.services.s3.model.S3Object.builder()
+                                                .key("k-1")
+                                                .build())
+                                .isTruncated(true)
+                                .nextContinuationToken("t1")
+                                .build(),
+                        software.amazon.awssdk.services.s3.model.ListObjectsV2Response.builder()
+                                .contents(
+                                        software.amazon.awssdk.services.s3.model.S3Object.builder()
+                                                .key("k-2")
+                                                .build(),
+                                        software.amazon.awssdk.services.s3.model.S3Object.builder()
+                                                .key("k-3")
+                                                .build())
+                                .isTruncated(true)
+                                .nextContinuationToken("t2")
+                                .build(),
+                        software.amazon.awssdk.services.s3.model.ListObjectsV2Response.builder()
+                                .contents(
+                                        software.amazon.awssdk.services.s3.model.S3Object.builder()
+                                                .key("k-4")
+                                                .build(),
+                                        software.amazon.awssdk.services.s3.model.S3Object.builder()
+                                                .key("k-5")
+                                                .build())
+                                .isTruncated(false)
+                                .build());
+
+        assertThat(ops(client).listAllKeys("prefix/"))
+                .containsExactly("k-0", "k-1", "k-2", "k-3", "k-4", "k-5");
+        verify(client, times(3))
+                .listObjectsV2(
+                        any(software.amazon.awssdk.services.s3.model.ListObjectsV2Request.class));
+    }
+
+    @Test
     void testEmptyKeyListIsNoop() throws IOException {
         S3Client client = mock(S3Client.class);
         ops(client).deleteBatch(new ArrayList<>(), 1000, 4);
