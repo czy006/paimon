@@ -99,6 +99,10 @@ final class S3NativeObjectOperations {
     /**
      * Returns object metadata, or {@code null} when the key does not exist. 404/NoSuchKey map to
      * {@code null}; other S3 errors propagate as {@link IOException}.
+     *
+     * <p>[DEVIATION] Flink's getFileStatus special-cases S3's 403 ambiguity (a missing object
+     * answers 403 instead of 404 when the caller lacks s3:ListBucket). We propagate 403 as an error
+     * — fail-loud on permission misconfiguration rather than reporting paths missing.
      */
     @Nullable
     HeadObjectResponse headObjectOrNull(String key) throws IOException {

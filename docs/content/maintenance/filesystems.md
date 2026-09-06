@@ -450,6 +450,10 @@ Notes:
   interoperates with data written by `paimon-s3`.
 - Rename is copy+delete and not atomic, exactly like S3A; objects larger than 5GB are copied
   via multipart `UploadPartCopy`.
+- Configure a bucket lifecycle rule aborting incomplete multipart uploads (e.g.
+  `AbortIncompleteMultipartUpload` after 1–7 days): a killed writer leaks uploaded parts that
+  S3 bills until aborted — the stream aborts on clean failures, but only a lifecycle rule
+  covers kill -9.
 - Region resolution follows the AWS SDK default chain (`s3.region` option, `AWS_REGION`
   environment variable, `~/.aws/config`, EC2 metadata) and fails fast when nothing resolves —
   set `s3.region` explicitly for S3-compatible stores.

@@ -251,6 +251,11 @@ public class S3NativeFileIO implements FileIO {
         if (srcKey.equals(dstKey)) {
             return true;
         }
+        if (srcKey.isEmpty()) {
+            // Renaming the bucket root would recursively copy the entire bucket; refuse like
+            // S3A instead of running a whole-bucket copy.
+            return false;
+        }
         if (!S3PathUtils.bucket(src).equals(S3PathUtils.bucket(dst))) {
             // [ADAPTED] The Flink filesystem is bucket-scoped; this FileIO is bucket-agnostic, so
             // the copy below would otherwise silently land in the source bucket.
