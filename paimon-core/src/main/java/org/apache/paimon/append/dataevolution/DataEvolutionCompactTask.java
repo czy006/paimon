@@ -18,50 +18,52 @@
 
 package org.apache.paimon.append.dataevolution;
 
-import org.apache.paimon.AppendOnlyFileStore;
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.data.BinaryRow;
-import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.io.CompactIncrement;
 import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.io.DataIncrement;
-import org.apache.paimon.operation.AppendFileStoreWrite;
-import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.sink.CommitMessage;
 import org.apache.paimon.table.sink.CommitMessageImpl;
-import org.apache.paimon.table.source.DataSplit;
-import org.apache.paimon.types.DataTypeRoot;
-import org.apache.paimon.types.RowType;
-import org.apache.paimon.utils.FileStorePathFactory;
-import org.apache.paimon.utils.RecordWriter;
+import org.apache.paimon.utils.Range;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.stream.Collectors;
 
+import static java.util.Comparator.comparingLong;
+import static org.apache.paimon.utils.DataEvolutionUtils.checkContiguousRowRange;
 import static org.apache.paimon.utils.Preconditions.checkArgument;
 
-/** Data evolution table compaction task. */
-public class DataEvolutionCompactTask {
+/** Base class for data evolution table compaction tasks. */
+public abstract class DataEvolutionCompactTask {
 
-    private static final Map<String, String> DYNAMIC_WRITE_OPTIONS =
-            Collections.singletonMap(CoreOptions.TARGET_FILE_SIZE.key(), "99999 G");
+    protected static final Map<String, String> DYNAMIC_WRITE_OPTIONS = dynamicWriteOptions();
+    protected static final Map<String, String> BLOB_COMPACT_READ_OPTIONS =
+            Collections.singletonMap(CoreOptions.BLOB_AS_DESCRIPTOR.key(), "true");
 
-    private final BinaryRow partition;
-    private final List<DataFileMeta> compactBefore;
-    private final List<DataFileMeta> compactAfter;
-    private final boolean blobTask;
+    protected final BinaryRow partition;
+    protected final List<DataFileMeta> compactBefore;
+    protected final List<DataFileMeta> compactAfter;
 
-    public DataEvolutionCompactTask(
-            BinaryRow partition, List<DataFileMeta> files, boolean blobTask) {
+    protected DataEvolutionCompactTask(BinaryRow partition, List<DataFileMeta> files) {
+        checkArgument(files != null);
         this.partition = partition;
         this.compactBefore = new ArrayList<>(files);
         this.compactAfter = new ArrayList<>();
-        this.blobTask = blobTask;
+    }
+
+    private static Map<String, String> dynamicWriteOptions() {
+        Map<String, String> options = new HashMap<>();
+        options.put(CoreOptions.TARGET_FILE_SIZE.key(), "99999 G");
+        options.put(CoreOptions.BLOB_TARGET_FILE_SIZE.key(), "99999 G");
+        // Compaction is size-based; the write-time row limit must not roll its output.
+        options.put(CoreOptions.TARGET_FILE_ROW_NUM.key(), String.valueOf(Long.MAX_VALUE));
+        return Collections.unmodifiableMap(options);
     }
 
     public BinaryRow partition() {
@@ -76,71 +78,63 @@ public class DataEvolutionCompactTask {
         return compactAfter;
     }
 
-    public boolean isBlobTask() {
-        return blobTask;
-    }
+    public abstract TaskType type();
 
-    public CommitMessage doCompact(FileStoreTable table, String commitUser) throws Exception {
-        if (blobTask) {
-            // TODO: support blob file compaction
-            throw new UnsupportedOperationException("Blob task is not supported");
-        }
+    public abstract CommitMessage doCompact(FileStoreTable table, String commitUser)
+            throws Exception;
 
-        table = table.copy(DYNAMIC_WRITE_OPTIONS);
-        long firstRowId = compactBefore.get(0).nonNullFirstRowId();
-
-        RowType readWriteType =
-                new RowType(
-                        table.rowType().getFields().stream()
-                                .filter(f -> f.type().getTypeRoot() != DataTypeRoot.BLOB)
-                                .collect(Collectors.toList()));
-        FileStorePathFactory pathFactory = table.store().pathFactory();
-        AppendOnlyFileStore store = (AppendOnlyFileStore) table.store();
-
-        DataSplit dataSplit =
-                DataSplit.builder()
-                        .withPartition(partition)
-                        .withBucket(0)
-                        .withDataFiles(compactBefore)
-                        .withBucketPath(pathFactory.bucketPath(partition, 0).toString())
-                        .rawConvertible(false)
-                        .build();
-        RecordReader<InternalRow> reader =
-                store.newDataEvolutionRead().withReadType(readWriteType).createReader(dataSplit);
-        AppendFileStoreWrite storeWrite = (AppendFileStoreWrite) store.newWrite(commitUser);
-        storeWrite.withWriteType(readWriteType);
-        RecordWriter<InternalRow> writer = storeWrite.createWriter(partition, 0);
-
-        reader.forEachRemaining(
-                row -> {
-                    try {
-                        writer.write(row);
-                    } catch (Exception e) {
-                        throw new RuntimeException(e);
-                    }
-                });
-
-        List<DataFileMeta> writeResult = writer.prepareCommit(false).newFilesIncrement().newFiles();
-        checkArgument(
-                writeResult.size() == 1, "Data evolution compaction should produce one file.");
-
-        DataFileMeta dataFileMeta = writeResult.get(0).assignFirstRowId(firstRowId);
-        compactAfter.add(dataFileMeta);
-
+    protected CommitMessage commitMessage(
+            List<DataFileMeta> compactBefore, List<DataFileMeta> compactAfter) {
         CompactIncrement compactIncrement =
-                new CompactIncrement(
-                        compactBefore,
-                        compactAfter,
-                        Collections.emptyList(),
-                        Collections.emptyList(),
-                        Collections.emptyList());
+                new CompactIncrement(compactBefore, compactAfter, Collections.emptyList());
         return new CommitMessageImpl(
                 partition, 0, null, DataIncrement.emptyIncrement(), compactIncrement);
     }
 
+    protected List<DataFileMeta> sortedByFirstRowId(List<DataFileMeta> files) {
+        List<DataFileMeta> sorted = new ArrayList<>(files);
+        sorted.sort(comparingLong(DataFileMeta::nonNullFirstRowId));
+        return sorted;
+    }
+
+    protected void checkSameRowRange(
+            String fileDescription,
+            List<DataFileMeta> compactBefore,
+            List<DataFileMeta> compactAfter) {
+        Range beforeRange = checkContiguousRowRange(compactBefore);
+        Range afterRange = checkContiguousRowRange(compactAfter);
+        checkArgument(
+                beforeRange.equals(afterRange),
+                "%s compact after files should have the same row range as compact before files, "
+                        + "before range is %s, but after range is %s.",
+                fileDescription,
+                beforeRange,
+                afterRange);
+    }
+
+    protected long minSequenceId(List<DataFileMeta> files) {
+        return files.stream()
+                .mapToLong(DataFileMeta::minSequenceNumber)
+                .min()
+                .orElseThrow(
+                        () ->
+                                new IllegalStateException(
+                                        "Cannot get min sequence id from compact before files."));
+    }
+
+    protected long maxSequenceId(List<DataFileMeta> files) {
+        return files.stream()
+                .mapToLong(DataFileMeta::maxSequenceNumber)
+                .max()
+                .orElseThrow(
+                        () ->
+                                new IllegalStateException(
+                                        "Cannot get max sequence id from compact before files."));
+    }
+
     @Override
     public int hashCode() {
-        return Objects.hash(partition, compactBefore, compactAfter, blobTask);
+        return Objects.hash(partition, compactBefore, compactAfter);
     }
 
     @Override
@@ -153,8 +147,7 @@ public class DataEvolutionCompactTask {
         }
 
         DataEvolutionCompactTask that = (DataEvolutionCompactTask) o;
-        return blobTask == that.blobTask
-                && Objects.equals(partition, that.partition)
+        return Objects.equals(partition, that.partition)
                 && Objects.equals(compactBefore, that.compactBefore)
                 && Objects.equals(compactAfter, that.compactAfter);
     }
@@ -162,11 +155,34 @@ public class DataEvolutionCompactTask {
     @Override
     public String toString() {
         return String.format(
-                "DataEvolutionCompactTask {"
-                        + "partition = %s, "
-                        + "compactBefore = %s, "
-                        + "compactAfter = %s, "
-                        + "blobTask = %s}",
-                partition, compactBefore, compactAfter, blobTask);
+                "%s {partition = %s, compactBefore = %s, compactAfter = %s}",
+                getClass().getSimpleName(), partition, compactBefore, compactAfter);
+    }
+
+    /** Type of data evolution compaction task. */
+    public enum TaskType {
+        NORMAL(0),
+        BLOB(1),
+        MATERIALIZE_DELETION(2);
+
+        private final int code;
+
+        TaskType(int code) {
+            this.code = code;
+        }
+
+        public int code() {
+            return code;
+        }
+
+        public static TaskType fromCode(int code) {
+            for (TaskType type : values()) {
+                if (type.code == code) {
+                    return type;
+                }
+            }
+            throw new UnsupportedOperationException(
+                    "Unsupported data evolution compact task type code: " + code);
+        }
     }
 }

@@ -18,9 +18,9 @@
 
 package org.apache.paimon.operation;
 
+import org.apache.paimon.CoreOptions;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.InternalRow;
-import org.apache.paimon.data.variant.VariantAccessInfo;
 import org.apache.paimon.deletionvectors.ApplyDeletionVectorReader;
 import org.apache.paimon.deletionvectors.DeletionVector;
 import org.apache.paimon.disk.IOManager;
@@ -41,11 +41,15 @@ import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.predicate.TopN;
 import org.apache.paimon.reader.EmptyFileRecordReader;
 import org.apache.paimon.reader.FileRecordReader;
+import org.apache.paimon.reader.LimitRecordReader;
+import org.apache.paimon.reader.ReadBatchSizer;
 import org.apache.paimon.reader.ReaderSupplier;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.schema.SchemaManager;
 import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.table.source.DataSplit;
+import org.apache.paimon.table.source.DeletionFile;
+import org.apache.paimon.table.source.IncrementalSplit;
 import org.apache.paimon.table.source.Split;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.FileStorePathFactory;
@@ -81,12 +85,15 @@ public class RawFileSplitRead implements SplitRead<InternalRow> {
     private final Map<FormatKey, FormatReaderMapping> formatReaderMappings;
     private final boolean fileIndexReadEnabled;
     private final boolean rowTrackingEnabled;
+    private final boolean nestedFieldEnabled;
+    private final boolean ignoreCorruptFiles;
+    private final boolean ignoreLostFiles;
 
     private RowType readRowType;
     @Nullable private List<Predicate> filters;
     @Nullable private TopN topN;
     @Nullable private Integer limit;
-    @Nullable private VariantAccessInfo[] variantAccess;
+    @Nullable private ReadBatchSizer readBatchSizer;
 
     public RawFileSplitRead(
             FileIO fileIO,
@@ -95,16 +102,18 @@ public class RawFileSplitRead implements SplitRead<InternalRow> {
             RowType rowType,
             FileFormatDiscover formatDiscover,
             FileStorePathFactory pathFactory,
-            boolean fileIndexReadEnabled,
-            boolean rowTrackingEnabled) {
+            CoreOptions coreOptions) {
         this.fileIO = fileIO;
         this.schemaManager = schemaManager;
         this.schema = schema;
         this.formatDiscover = formatDiscover;
         this.pathFactory = pathFactory;
         this.formatReaderMappings = new HashMap<>();
-        this.fileIndexReadEnabled = fileIndexReadEnabled;
-        this.rowTrackingEnabled = rowTrackingEnabled;
+        this.fileIndexReadEnabled = coreOptions.fileIndexReadEnabled();
+        this.ignoreCorruptFiles = coreOptions.scanIgnoreCorruptFile();
+        this.ignoreLostFiles = coreOptions.scanIgnoreLostFile();
+        this.rowTrackingEnabled = coreOptions.rowTrackingEnabled();
+        this.nestedFieldEnabled = coreOptions.dataEvolutionNestedFieldEnabled();
         this.readRowType = rowType;
     }
 
@@ -120,13 +129,10 @@ public class RawFileSplitRead implements SplitRead<InternalRow> {
 
     @Override
     public SplitRead<InternalRow> withReadType(RowType readRowType) {
+        if (!this.readRowType.equals(readRowType)) {
+            formatReaderMappings.clear();
+        }
         this.readRowType = readRowType;
-        return this;
-    }
-
-    @Override
-    public SplitRead<InternalRow> withVariantAccess(VariantAccessInfo[] variantAccess) {
-        this.variantAccess = variantAccess;
         return this;
     }
 
@@ -151,20 +157,45 @@ public class RawFileSplitRead implements SplitRead<InternalRow> {
     }
 
     @Override
-    public RecordReader<InternalRow> createReader(Split s) throws IOException {
-        DataSplit split = (DataSplit) s;
-        if (!split.beforeFiles().isEmpty()) {
-            LOG.info("Ignore split before files: {}", split.beforeFiles());
-        }
+    public SplitRead<InternalRow> withReadBatchSizer(ReadBatchSizer sizer) {
+        this.readBatchSizer = sizer;
+        return this;
+    }
 
-        List<DataFileMeta> files = split.dataFiles();
-        DeletionVector.Factory dvFactory =
-                DeletionVector.factory(fileIO, files, split.deletionFiles().orElse(null));
+    @Override
+    public RecordReader<InternalRow> createReader(Split s) throws IOException {
+        if (s instanceof DataSplit) {
+            DataSplit split = (DataSplit) s;
+            return createReader(
+                    split.partition(),
+                    split.bucket(),
+                    split.dataFiles(),
+                    split.deletionFiles().orElse(null));
+        } else {
+            IncrementalSplit split = (IncrementalSplit) s;
+            if (!split.beforeFiles().isEmpty()) {
+                LOG.info("Ignore split before files: {}", split.beforeFiles());
+            }
+            return createReader(
+                    split.partition(),
+                    split.bucket(),
+                    split.afterFiles(),
+                    split.afterDeletionFiles());
+        }
+    }
+
+    public RecordReader<InternalRow> createReader(
+            BinaryRow partition,
+            int bucket,
+            List<DataFileMeta> files,
+            List<DeletionFile> deletionFiles)
+            throws IOException {
+        DeletionVector.Factory dvFactory = DeletionVector.factory(fileIO, files, deletionFiles);
         Map<String, IOExceptionSupplier<DeletionVector>> dvFactories = new HashMap<>();
         for (DataFileMeta file : files) {
             dvFactories.put(file.fileName(), () -> dvFactory.create(file.fileName()).orElse(null));
         }
-        return createReader(split.partition(), split.bucket(), split.dataFiles(), dvFactories);
+        return createReader(partition, bucket, files, dvFactories);
     }
 
     public RecordReader<InternalRow> createReader(
@@ -177,23 +208,9 @@ public class RawFileSplitRead implements SplitRead<InternalRow> {
                 pathFactory.createDataFilePathFactory(partition, bucket);
         List<ReaderSupplier<InternalRow>> suppliers = new ArrayList<>();
 
+        RowType outputRowType = readRowType;
         Builder formatReaderMappingBuilder =
-                new Builder(
-                        formatDiscover,
-                        readRowType.getFields(),
-                        schema -> {
-                            if (rowTrackingEnabled) {
-                                // maybe file has no row id and sequence number, but in manifest
-                                // entry
-                                return rowTypeWithRowTracking(schema.logicalRowType(), true, true)
-                                        .getFields();
-                            }
-                            return schema.fields();
-                        },
-                        filters,
-                        topN,
-                        limit,
-                        variantAccess);
+                createFormatReaderMappingBuilder(outputRowType, topN, limit);
 
         for (DataFileMeta file : files) {
             suppliers.add(
@@ -202,10 +219,62 @@ public class RawFileSplitRead implements SplitRead<InternalRow> {
                             dataFilePathFactory,
                             file,
                             formatReaderMappingBuilder,
-                            dvFactories));
+                            outputRowType,
+                            dvFactories,
+                            null));
         }
 
-        return ConcatRecordReader.create(suppliers);
+        RecordReader<InternalRow> reader = ConcatRecordReader.create(suppliers);
+        // Apply the final limit after deletion vectors when no later predicate can drop rows.
+        if (topN == null && (filters == null || filters.isEmpty())) {
+            return LimitRecordReader.limit(reader, limit);
+        }
+        return reader;
+    }
+
+    FileRecordReader<InternalRow> createFileReader(
+            DataSplit dataSplit, RoaringBitmap32 selectedPositions) throws IOException {
+        DataFileMeta dataFile = dataSplit.dataFiles().get(0);
+        DeletionVector.Factory dvFactory =
+                DeletionVector.factory(
+                        fileIO, dataSplit.dataFiles(), dataSplit.deletionFiles().orElse(null));
+        Map<String, IOExceptionSupplier<DeletionVector>> dvFactories = new HashMap<>();
+        dvFactories.put(
+                dataFile.fileName(), () -> dvFactory.create(dataFile.fileName()).orElse(null));
+        DataFilePathFactory dataFilePathFactory =
+                pathFactory.createDataFilePathFactory(dataSplit.partition(), dataSplit.bucket());
+        RowType outputRowType = readRowType;
+        return (FileRecordReader<InternalRow>)
+                createFileReader(
+                                dataSplit.partition(),
+                                dataFilePathFactory,
+                                dataFile,
+                                // The caller has already selected the rows. Applying a regular
+                                // TopN or limit before position filtering can drop hits.
+                                createFormatReaderMappingBuilder(outputRowType, null, null),
+                                outputRowType,
+                                dvFactories,
+                                selectedPositions)
+                        .get();
+    }
+
+    private Builder createFormatReaderMappingBuilder(
+            RowType outputRowType, @Nullable TopN pushDownTopN, @Nullable Integer pushDownLimit) {
+        return new Builder(
+                formatDiscover,
+                outputRowType.getFields(),
+                schema -> {
+                    if (rowTrackingEnabled) {
+                        // maybe file has no row id and sequence number, but in manifest entry
+                        return rowTypeWithRowTracking(schema.logicalRowType(), true, true)
+                                .getFields();
+                    }
+                    return schema.fields();
+                },
+                filters,
+                pushDownTopN,
+                pushDownLimit,
+                nestedFieldEnabled);
     }
 
     private ReaderSupplier<InternalRow> createFileReader(
@@ -213,7 +282,9 @@ public class RawFileSplitRead implements SplitRead<InternalRow> {
             DataFilePathFactory dataFilePathFactory,
             DataFileMeta file,
             Builder formatBuilder,
-            @Nullable Map<String, IOExceptionSupplier<DeletionVector>> dvFactories) {
+            RowType outputRowType,
+            @Nullable Map<String, IOExceptionSupplier<DeletionVector>> dvFactories,
+            @Nullable RoaringBitmap32 selectedPositions) {
         String formatIdentifier = DataFilePathFactory.formatIdentifier(file.fileName());
         long schemaId = file.schemaId();
 
@@ -232,7 +303,13 @@ public class RawFileSplitRead implements SplitRead<InternalRow> {
                 dvFactories == null ? null : dvFactories.get(file.fileName());
         return () ->
                 createFileReader(
-                        partition, file, dataFilePathFactory, formatReaderMapping, dvFactory);
+                        partition,
+                        file,
+                        dataFilePathFactory,
+                        formatReaderMapping,
+                        outputRowType,
+                        dvFactory,
+                        selectedPositions);
     }
 
     private FileRecordReader<InternalRow> createFileReader(
@@ -240,7 +317,9 @@ public class RawFileSplitRead implements SplitRead<InternalRow> {
             DataFileMeta file,
             DataFilePathFactory dataFilePathFactory,
             FormatReaderMapping formatReaderMapping,
-            IOExceptionSupplier<DeletionVector> dvFactory)
+            RowType outputRowType,
+            IOExceptionSupplier<DeletionVector> dvFactory,
+            @Nullable RoaringBitmap32 selectedPositions)
             throws IOException {
         FileIndexResult fileIndexResult = null;
         DeletionVector deletionVector = dvFactory == null ? null : dvFactory.get();
@@ -264,15 +343,30 @@ public class RawFileSplitRead implements SplitRead<InternalRow> {
         if (fileIndexResult instanceof BitmapIndexResult) {
             selection = ((BitmapIndexResult) fileIndexResult).get();
         }
+        if (selectedPositions != null) {
+            selection =
+                    selection == null
+                            ? selectedPositions.clone()
+                            : RoaringBitmap32.and(selection, selectedPositions);
+            if (selection.isEmpty()) {
+                return new EmptyFileRecordReader<>();
+            }
+        }
 
         FormatReaderContext formatReaderContext =
                 new FormatReaderContext(
-                        fileIO, dataFilePathFactory.toPath(file), file.fileSize(), selection);
+                        fileIO,
+                        dataFilePathFactory.toPath(file),
+                        file.fileSize(),
+                        selection,
+                        readBatchSizer);
         FileRecordReader<InternalRow> fileRecordReader =
                 new DataFileRecordReader(
-                        schema.logicalRowType(),
+                        outputRowType,
                         formatReaderMapping.getReaderFactory(),
                         formatReaderContext,
+                        ignoreCorruptFiles,
+                        ignoreLostFiles,
                         formatReaderMapping.getIndexMapping(),
                         formatReaderMapping.getCastMapping(),
                         PartitionUtils.create(formatReaderMapping.getPartitionPair(), partition),

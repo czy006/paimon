@@ -75,12 +75,15 @@ public final class BinaryArray extends BinarySection implements InternalArray, D
             case VARCHAR:
             case BINARY:
             case VARBINARY:
+            case GEOMETRY:
+            case GEOGRAPHY:
             case DECIMAL:
             case BIGINT:
             case DOUBLE:
             case TIMESTAMP_WITHOUT_TIME_ZONE:
             case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
             case ARRAY:
+            case VECTOR:
             case MULTISET:
             case MAP:
             case ROW:
@@ -247,13 +250,19 @@ public final class BinaryArray extends BinarySection implements InternalArray, D
 
     @Override
     public Blob getBlob(int pos) {
-        return new BlobData(getBinary(pos));
+        return Blob.fromBytes(getBinary(pos), null, null);
     }
 
     @Override
     public InternalArray getArray(int pos) {
         assertIndexIsValid(pos);
         return MemorySegmentUtils.readArrayData(segments, offset, getLong(pos));
+    }
+
+    @Override
+    public InternalVector getVector(int pos) {
+        assertIndexIsValid(pos);
+        return MemorySegmentUtils.readVectorData(segments, offset, getLong(pos));
     }
 
     @Override

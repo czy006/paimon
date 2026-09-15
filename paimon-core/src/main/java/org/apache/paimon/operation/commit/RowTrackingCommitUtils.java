@@ -23,10 +23,13 @@ import org.apache.paimon.manifest.ManifestEntry;
 import org.apache.paimon.table.SpecialFields;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import static org.apache.paimon.format.blob.BlobFileFormat.isBlobFile;
+import static org.apache.paimon.types.VectorType.isVectorStoreFile;
 import static org.apache.paimon.utils.Preconditions.checkArgument;
 
 /** Utils for row tracking commit. */
@@ -47,7 +50,22 @@ public class RowTrackingCommitUtils {
     private static void assignSnapshotId(
             long snapshotId, List<ManifestEntry> deltaFiles, List<ManifestEntry> snapshotAssigned) {
         for (ManifestEntry entry : deltaFiles) {
-            snapshotAssigned.add(entry.assignSequenceNumber(snapshotId, snapshotId));
+            long minSeqNumber = entry.file().minSequenceNumber();
+            long maxSeqNumber = entry.file().maxSequenceNumber();
+            if (minSeqNumber == 0L) {
+                // Case 1: New file (e.g., from INSERT)
+                // All records in this file get the current snapshot ID as sequence number
+                snapshotAssigned.add(entry.assignSequenceNumber(snapshotId, snapshotId));
+            } else if (maxSeqNumber == 0L) {
+                // Case 2: File with some modified records
+                // - min: Preserve original sequence number (from unmodified records)
+                // - max: Assign current snapshot ID
+                snapshotAssigned.add(entry.assignSequenceNumber(minSeqNumber, snapshotId));
+            } else {
+                // Case 3: Pure compact file (no modified records)
+                // Preserve original min/max sequence numbers from source files
+                snapshotAssigned.add(entry);
+            }
         }
     }
 
@@ -60,7 +78,9 @@ public class RowTrackingCommitUtils {
         }
         // assign row id for new files
         long start = firstRowIdStart;
-        long blobStart = firstRowIdStart;
+        long blobStartDefault = firstRowIdStart;
+        Map<String, Long> blobStarts = new HashMap<>();
+        long vectorStoreStart = firstRowIdStart;
         for (ManifestEntry entry : deltaFiles) {
             Optional<FileSource> fileSource = entry.file().fileSource();
             checkArgument(
@@ -74,6 +94,8 @@ public class RowTrackingCommitUtils {
                     && !containsRowId) {
                 long rowCount = entry.file().rowCount();
                 if (isBlobFile(entry.file().fileName())) {
+                    String blobFieldName = entry.file().writeCols().get(0);
+                    long blobStart = blobStarts.getOrDefault(blobFieldName, blobStartDefault);
                     if (blobStart >= start) {
                         throw new IllegalStateException(
                                 String.format(
@@ -81,10 +103,20 @@ public class RowTrackingCommitUtils {
                                         blobStart, start));
                     }
                     rowIdAssigned.add(entry.assignFirstRowId(blobStart));
-                    blobStart += rowCount;
+                    blobStarts.put(blobFieldName, blobStart + rowCount);
+                } else if (isVectorStoreFile(entry.file().fileName())) {
+                    if (vectorStoreStart >= start) {
+                        throw new IllegalStateException(
+                                String.format(
+                                        "This is a bug, vectorStoreStart %d should be less than start %d when assigning a vector-store entry file.",
+                                        vectorStoreStart, start));
+                    }
+                    rowIdAssigned.add(entry.assignFirstRowId(vectorStoreStart));
+                    vectorStoreStart += rowCount;
                 } else {
                     rowIdAssigned.add(entry.assignFirstRowId(start));
-                    blobStart = start;
+                    blobStartDefault = start;
+                    blobStarts.clear();
                     start += rowCount;
                 }
             } else {

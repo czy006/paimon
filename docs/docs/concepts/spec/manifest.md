@@ -1,0 +1,180 @@
+---
+title: "Manifest"
+sidebar_position: 4
+---
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# Manifest
+
+Manifests describe the files belonging to a table state. A [snapshot](./snapshot) references
+manifest lists for data and changelog files, and an optional index manifest for table indexes.
+This metadata lets readers plan a scan without listing every data directory.
+
+## File Kinds and Encoding
+
+The default `manifest/` directory contains three kinds of Avro files:
+
+| File name pattern | Contents | On-disk `_VERSION` identifier |
+| --- | --- | --- |
+| `manifest-list-<uuid>-<id>` | Metadata about data or changelog manifests. | `2` |
+| `manifest-<uuid>-<id>` | Data-file or changelog-file additions and deletions. | `2` |
+| `index-manifest-<uuid>-<id>` | Table index additions and deletions. | `1` |
+
+Each serialized record begins with an integer field named `_VERSION`. This is a permanent
+format identifier, not a counter that increases whenever nullable fields are added. The field
+tables below describe the remaining fields. Newer nullable metadata can be absent in older files.
+
+## Manifest List
+
+A manifest list contains one record per referenced manifest. Its statistics allow readers to
+skip manifests before opening them.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `_FILE_NAME` | STRING | Manifest file name. |
+| `_FILE_SIZE` | BIGINT | Manifest size in bytes. |
+| `_NUM_ADDED_FILES` | BIGINT | Number of ADD entries. |
+| `_NUM_DELETED_FILES` | BIGINT | Number of DELETE entries. |
+| `_PARTITION_STATS` | SimpleStats | Minimums, maximums, and null counts for partition fields. |
+| `_SCHEMA_ID` | BIGINT | Schema ID used when writing the manifest. |
+| `_MIN_BUCKET`, `_MAX_BUCKET` | INT, nullable | Bucket bounds in the manifest. |
+| `_MIN_LEVEL`, `_MAX_LEVEL` | INT, nullable | Data-file level bounds in the manifest. |
+| `_MIN_ROW_ID`, `_MAX_ROW_ID` | BIGINT, nullable | Row-ID bounds when available. |
+| `_EXTRA_FILES` | ARRAY of STRING, nullable | Names of additional files in the manifest directory; defaults to null. |
+
+Each extra file belongs exclusively to one manifest. It is retained and cleaned up together with
+that manifest during snapshot, tag, or changelog deletion.
+
+## Manifest
+
+Data manifests record **ADD** (`0`) and **DELETE** (`1`) entries. Readers reconcile these entries
+in manifest order to determine the live files. A DELETE entry removes a file from the logical
+state; it does not immediately delete the physical file, which older snapshots can still use.
+
+For example, compaction can add file C and delete files A and B in the new snapshot. The old
+snapshot still references A and B. See [snapshot expiration](../../maintenance/manage-snapshots#expire-snapshots)
+for physical cleanup.
+
+### Data Manifest
+
+Data and changelog manifests use the same entry schema. Their snapshot references distinguish
+which role they serve.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `_KIND` | TINYINT | ADD (`0`) or DELETE (`1`). |
+| `_PARTITION` | BYTES | Serialized BinaryRow containing the partition values. |
+| `_BUCKET` | INT | Bucket containing the file. |
+| `_TOTAL_BUCKETS` | INT | Bucket count recorded when the file was written, used for compatibility checks. |
+| `_FILE` | DataFileMeta | Nested data file metadata described below. |
+
+### Data File Metadata
+
+The `_FILE` record includes file identity, statistics, and optional feature metadata.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `_FILE_NAME` | STRING | Data or changelog file name. |
+| `_FILE_SIZE` | BIGINT | File size in bytes. |
+| `_ROW_COUNT` | BIGINT | Physical record count, including row kinds that represent deletions. |
+| `_MIN_KEY`, `_MAX_KEY` | BYTES | Serialized BinaryRow key bounds, not SQL strings. |
+| `_KEY_STATS`, `_VALUE_STATS` | SimpleStats | Statistics for key and value fields. |
+| `_MIN_SEQUENCE_NUMBER`, `_MAX_SEQUENCE_NUMBER` | BIGINT | Sequence-number bounds. |
+| `_SCHEMA_ID` | BIGINT | Schema ID used to write this file. |
+| `_LEVEL` | INT | File level in the LSM layout. |
+| `_EXTRA_FILES` | ARRAY of STRING | Associated files, such as external per-file indexes. |
+| `_CREATION_TIME` | TIMESTAMP(3), nullable | File creation time. |
+| `_DELETE_ROW_COUNT` | BIGINT, nullable | Count of deletion records within `_ROW_COUNT`, when known. |
+| `_EMBEDDED_FILE_INDEX` | BYTES, nullable | Per-file index bytes stored directly in metadata. |
+| `_FILE_SOURCE` | TINYINT, nullable | Whether the file was generated by append or compaction. |
+| `_VALUE_STATS_COLS` | ARRAY of STRING, nullable | Names of columns represented in value statistics. |
+| `_EXTERNAL_PATH` | STRING, nullable | External file path when the file is outside the default location. |
+| `_FIRST_ROW_ID` | BIGINT, nullable | First row ID for row-tracked file ranges. |
+| `_WRITE_COLS` | ARRAY of STRING, nullable | Columns written in this file for data evolution. |
+| `_WRITE_COLS_SEQUENCES` | ARRAY of BIGINT, nullable | Maximum sequence numbers per physical table field after data-evolution compaction, ordered by `_WRITE_COLS` when present. |
+
+These counts describe physical files; they need not equal the logical table row count. See
+[Snapshot record counts](./snapshot#interpreting-record-counts) and
+[Data Evolution](../../multimodal-table/data-evolution) for examples.
+
+### Index Manifest
+
+An index manifest describes index files through these fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `_KIND` | TINYINT | ADD (`0`) or DELETE (`1`). |
+| `_PARTITION` | BYTES | Serialized partition BinaryRow. |
+| `_BUCKET` | INT | Bucket associated with the index entry. |
+| `_INDEX_TYPE` | STRING | Index type identifier, for example `HASH` or `DELETION_VECTORS`. |
+| `_FILE_NAME` | STRING | Index file name. |
+| `_FILE_SIZE` | BIGINT | Index file size in bytes. |
+| `_ROW_COUNT` | BIGINT | Entry count recorded by the index implementation. |
+| `_DELETIONS_VECTORS_RANGES` | ARRAY of DeletionVectorMeta, nullable | Mapping from data files to deletion vectors. |
+| `_EXTERNAL_PATH` | STRING, nullable | External index file path. |
+| `_GLOBAL_INDEX` | GlobalIndexMeta, nullable | Row-range and field metadata for a global index. |
+
+`_DELETIONS_VECTORS_RANGES` is the serialized field name, including its historical spelling.
+
+#### DeletionVectorMeta
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `f0` | STRING | Data file name. |
+| `f1` | INT | Starting offset of the deletion vector in the index file. |
+| `f2` | INT | Stored vector length. See [Deletion Vectors](./tableindex#deletion-vectors) for the 32-bit and 64-bit length conventions. |
+| `_CARDINALITY` | BIGINT, nullable | Number of deleted rows. |
+
+#### GlobalIndexMeta
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `_ROW_RANGE_START`, `_ROW_RANGE_END` | BIGINT | Inclusive row-ID range covered by the index. |
+| `_INDEX_FIELD_ID` | INT | Field ID indexed by this file. |
+| `_EXTRA_FIELD_IDS` | ARRAY of INT, nullable | Additional field IDs recorded by the index. |
+| `_INDEX_META` | BYTES, nullable | Metadata specific to the index implementation. |
+| `_SOURCE_META` | BYTES, nullable | Source metadata recorded by the index implementation. |
+
+See [Table Index](./tableindex) for dynamic bucket indexes and deletion vectors, and the
+[global index guide](../../primary-key-table/global-index) for query-index behavior.
+
+## Appendix
+
+### SimpleStats
+
+SimpleStats is a nested record. Decoding its minimum and maximum values requires the corresponding
+field types.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `_MIN_VALUES` | BYTES | Serialized BinaryRow of minimum values. |
+| `_MAX_VALUES` | BYTES | Serialized BinaryRow of maximum values. |
+| `_NULL_COUNTS` | ARRAY of nullable BIGINT, nullable | Null counts for the corresponding columns. An individual count can be null when unknown. |
+
+### BinaryRow
+
+BinaryRow stores values in a fixed-length region and a variable-length region. The fixed region
+contains a one-byte header, a null bitmap aligned to 8-byte words, and 8-byte field slots.
+Slots hold fixed-width values or the information needed to locate larger variable-width values.
+Some short variable-width values can be stored inline.
+
+BinaryRow is used inside manifest metadata. It is distinct from the compact row encoding in the
+[Row file format](./rowformat#row-serialization-format).

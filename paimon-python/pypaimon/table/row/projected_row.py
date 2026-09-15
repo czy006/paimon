@@ -1,22 +1,21 @@
-################################################################################
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-# limitations under the License.
-################################################################################
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
-from typing import Any, List
+from typing import Any, List, Tuple
 from pypaimon.table.row.internal_row import InternalRow
 from pypaimon.table.row.row_kind import RowKind
 
@@ -49,13 +48,24 @@ class ProjectedRow(InternalRow):
             return None
         return self.row.get_field(self.index_mapping[pos])
 
+    def get_blob(self, pos: int):
+        """Returns the Blob at the projected position; delegates to the inner row."""
+        if self.index_mapping[pos] < 0:
+            return None
+        return self.row.get_blob(self.index_mapping[pos])
+
+    def get_vector(self, pos: int):
+        if self.index_mapping[pos] < 0:
+            return None
+        return self.row.get_vector(self.index_mapping[pos])
+
     def get_row_kind(self) -> RowKind:
         """Returns the kind of change that this row describes in a changelog."""
         return self.row.get_row_kind()
 
     def __len__(self) -> int:
         """Returns the number of fields in this row."""
-        return len(self.row)
+        return len(self.index_mapping)
 
     def __str__(self) -> str:
         """String representation of the projected row."""
@@ -74,3 +84,13 @@ class ProjectedRow(InternalRow):
             ProjectedRow instance
         """
         return ProjectedRow(projection)
+
+    def to_tuple(self) -> Tuple[Any, ...]:
+        assert isinstance(self.row, InternalRow), (
+            f"Expected InternalRow, but got {type(self.row).__name__}"
+        )
+        return tuple(
+            self.row.get_field(index)
+            if index >= 0 else None
+            for index in self.index_mapping
+        )

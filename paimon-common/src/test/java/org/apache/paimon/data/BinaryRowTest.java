@@ -23,7 +23,9 @@ import org.apache.paimon.data.serializer.InternalArraySerializer;
 import org.apache.paimon.data.serializer.InternalMapSerializer;
 import org.apache.paimon.data.serializer.InternalRowSerializer;
 import org.apache.paimon.data.serializer.InternalSerializers;
+import org.apache.paimon.data.serializer.InternalVectorSerializer;
 import org.apache.paimon.data.serializer.Serializer;
+import org.apache.paimon.data.variant.BufferOnlyVariant;
 import org.apache.paimon.data.variant.GenericVariant;
 import org.apache.paimon.memory.MemorySegment;
 import org.apache.paimon.types.DataType;
@@ -323,6 +325,86 @@ public class BinaryRowTest {
     }
 
     @Test
+    public void testAnyNullWithNonZeroOffset() {
+        BinaryRow rowWithNull = new BinaryRow(1);
+        BinaryRowWriter writer = new BinaryRowWriter(rowWithNull);
+        writer.setNullAt(0);
+        writer.complete();
+
+        BinaryRow rowWithoutNull = new BinaryRow(1);
+        writer = new BinaryRowWriter(rowWithoutNull);
+        writer.writeInt(0, 42);
+        writer.complete();
+
+        // A four-byte pad in front, as BinaryRowSerializer leaves when it points a row at the
+        // bytes following a length prefix, so the row offset is not a multiple of eight either.
+        // The leading row is an INSERT row with no nulls, so a read that starts at zero finds
+        // only zero bytes and reports no null.
+        int pad = 4;
+        MemorySegment segment = concat(pad, rowWithoutNull, rowWithNull);
+        int notNullLength = rowWithoutNull.getSizeInBytes();
+
+        BinaryRow atOffset = new BinaryRow(1);
+        atOffset.pointTo(segment, pad + notNullLength, rowWithNull.getSizeInBytes());
+        assertThat(atOffset.isNullAt(0)).isTrue();
+        assertThat(atOffset.anyNull()).isTrue();
+
+        BinaryRow leading = new BinaryRow(1);
+        leading.pointTo(segment, pad, notNullLength);
+        assertThat(leading.anyNull()).isFalse();
+    }
+
+    @Test
+    public void testAnyNullHighFieldWithNonZeroOffset() {
+        // 60 fields push the null-bit set past the first 8-byte word, so the loop in anyNull()
+        // has to honor the offset as well as the header read above it does.
+        int arity = 60;
+        int nullField = 59;
+        BinaryRow rowWithNull = new BinaryRow(arity);
+        BinaryRowWriter writer = new BinaryRowWriter(rowWithNull);
+        writer.setNullAt(nullField);
+        writer.complete();
+
+        BinaryRow rowWithoutNull = new BinaryRow(arity);
+        writer = new BinaryRowWriter(rowWithoutNull);
+        for (int i = 0; i < arity; i++) {
+            writer.writeInt(i, i);
+        }
+        writer.complete();
+
+        MemorySegment segment = concat(0, rowWithoutNull, rowWithNull);
+        int notNullLength = rowWithoutNull.getSizeInBytes();
+
+        BinaryRow atOffset = new BinaryRow(arity);
+        atOffset.pointTo(segment, notNullLength, rowWithNull.getSizeInBytes());
+        assertThat(atOffset.isNullAt(nullField)).isTrue();
+        assertThat(atOffset.anyNull()).isTrue();
+
+        BinaryRow leading = new BinaryRow(arity);
+        leading.pointTo(segment, 0, notNullLength);
+        assertThat(leading.anyNull()).isFalse();
+    }
+
+    /**
+     * Lays the rows out back to back in one segment behind {@code pad} bytes. The row without nulls
+     * goes first, so a read that ignores the row offset lands on it and reports no null.
+     */
+    private static MemorySegment concat(int pad, BinaryRow... rows) {
+        int size = pad;
+        for (BinaryRow row : rows) {
+            size += row.getSizeInBytes();
+        }
+        byte[] bytes = new byte[size];
+        int position = pad;
+        for (BinaryRow row : rows) {
+            byte[] rowBytes = row.toBytes();
+            System.arraycopy(rowBytes, 0, bytes, position, rowBytes.length);
+            position += rowBytes.length;
+        }
+        return MemorySegment.wrap(bytes);
+    }
+
+    @Test
     public void testSingleSegmentBinaryRowHashCode() {
         final Random rnd = new Random(System.currentTimeMillis());
         // test hash stabilization
@@ -516,6 +598,44 @@ public class BinaryRowTest {
         assertThat(array2.getInt(0)).isEqualTo(6);
         assertThat(array2.isNullAt(1)).isTrue();
         assertThat(array2.getInt(2)).isEqualTo(666);
+    }
+
+    @Test
+    public void testBinaryVector() {
+        // 1. vector test
+        final Random rnd = new Random(System.currentTimeMillis());
+        float[] vectorValues = new float[rnd.nextInt(128) + 1];
+        {
+            byte[] bytes = new byte[vectorValues.length];
+            rnd.nextBytes(bytes);
+            for (int i = 0; i < vectorValues.length; i++) {
+                vectorValues[i] = bytes[i];
+            }
+        }
+        BinaryVector vector = BinaryVector.fromPrimitiveArray(vectorValues);
+
+        assertThat(vectorValues.length).isEqualTo(vector.size());
+        int[] checkIndexList = {0, rnd.nextInt(vectorValues.length), vectorValues.length - 1};
+        for (int checkIndex : checkIndexList) {
+            assertThat(vectorValues[checkIndex]).isEqualTo(vector.getFloat(checkIndex));
+        }
+
+        // 2. test write vector to binary row
+        BinaryRow row = new BinaryRow(1);
+        BinaryRowWriter rowWriter = new BinaryRowWriter(row);
+        InternalVectorSerializer serializer =
+                new InternalVectorSerializer(DataTypes.FLOAT(), vector.size());
+        rowWriter.writeVector(0, vector, serializer);
+        rowWriter.complete();
+
+        InternalVector vector2 = row.getVector(0);
+        assertThat(vector2.size()).isEqualTo(vector.size());
+        assertThat(vector2.toFloatArray()).isEqualTo(vector.toFloatArray());
+        assertThat(
+                        DataFormatTestUtil.toStringNoRowKind(
+                                row,
+                                RowType.of(DataTypes.VECTOR(vector.size(), DataTypes.FLOAT()))))
+                .isEqualTo(Arrays.toString(vector.toFloatArray()));
     }
 
     @Test
@@ -924,7 +1044,10 @@ public class BinaryRowTest {
         BinaryRow row = new BinaryRow(2);
         BinaryRowWriter writer = new BinaryRowWriter(row);
 
-        writer.writeVariant(0, GenericVariant.fromJson("{\"age\":27,\"city\":\"Beijing\"}"));
+        writer.writeVariant(
+                0,
+                new BufferOnlyVariant(
+                        GenericVariant.fromJson("{\"age\":27,\"city\":\"Beijing\"}")));
         writer.setNullAt(1);
         writer.complete();
 

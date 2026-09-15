@@ -18,6 +18,7 @@
 
 package org.apache.paimon.hive.utils;
 
+import org.apache.paimon.fs.Path;
 import org.apache.paimon.hive.HiveConnectorOptions;
 import org.apache.paimon.hive.mapred.PaimonInputSplit;
 import org.apache.paimon.io.DataFileMeta;
@@ -31,6 +32,7 @@ import org.apache.paimon.table.source.InnerTableScan;
 import org.apache.paimon.tag.TagPreview;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.BinPacking;
+import org.apache.paimon.utils.PartitionPathUtils;
 
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.mapred.InputSplit;
@@ -55,7 +57,6 @@ import static java.util.Collections.singletonMap;
 import static org.apache.paimon.CoreOptions.SCAN_TAG_NAME;
 import static org.apache.paimon.hive.utils.HiveUtils.createPredicate;
 import static org.apache.paimon.hive.utils.HiveUtils.extractTagName;
-import static org.apache.paimon.partition.PartitionPredicate.createPartitionPredicate;
 
 /** Generator to generate hive input splits. */
 public class HiveSplitGenerator {
@@ -81,7 +82,7 @@ public class HiveSplitGenerator {
         List<PaimonInputSplit> splits = new ArrayList<>();
         // locations may contain multiple partitions
         for (String location : locations.split(",")) {
-            if (!location.startsWith(table.location().toUri().toString())) {
+            if (!location.startsWith(table.location().toString())) {
                 // Hive create dummy file for empty table or partition. If this location doesn't
                 // belong to this table, nothing to do.
                 continue;
@@ -136,17 +137,13 @@ public class HiveSplitGenerator {
             String defaultPartName) {
         Set<String> partitionKeySet = new HashSet<>(partitionKeys);
         LinkedHashMap<String, String> partition = new LinkedHashMap<>();
-        for (String s : partitionDir.split("/")) {
-            s = s.trim();
-            if (s.isEmpty()) {
-                continue;
-            }
-            String[] kv = s.split("=");
-            if (kv.length != 2) {
-                continue;
-            }
-            if (partitionKeySet.contains(kv[0])) {
-                partition.put(kv[0], kv[1]);
+        // the directory names are escaped by PartitionPathUtils#escapePathName when the partition
+        // is created, so they must be unescaped to get back the raw partition values
+        LinkedHashMap<String, String> spec =
+                PartitionPathUtils.extractPartitionSpecFromPath(new Path(partitionDir));
+        for (Map.Entry<String, String> entry : spec.entrySet()) {
+            if (partitionKeySet.contains(entry.getKey())) {
+                partition.put(entry.getKey(), entry.getValue());
             }
         }
         if (partition.isEmpty() || partition.size() != partitionKeys.size()) {
@@ -174,7 +171,7 @@ public class HiveSplitGenerator {
         for (DataSplit split : splits) {
             if (split instanceof FallbackReadFileStoreTable.FallbackSplit) {
                 dataSplits.add(split);
-            } else if (split.beforeFiles().isEmpty() && split.rawConvertible()) {
+            } else if (split.rawConvertible()) {
                 numFiles += split.dataFiles().size();
                 toPack.add(split);
             } else {
@@ -234,8 +231,14 @@ public class HiveSplitGenerator {
 
     private static Long computeSplitSize(
             JobConf jobConf, List<DataSplit> splits, int numSplits, long openCostInBytes) {
-        long maxSize = HiveConf.getLongVar(jobConf, HiveConf.ConfVars.MAPREDMAXSPLITSIZE);
-        long minSize = HiveConf.getLongVar(jobConf, HiveConf.ConfVars.MAPREDMINSPLITSIZE);
+        long maxSize =
+                HiveConf.getLongVar(
+                        jobConf,
+                        HiveConf.getConfVars("mapreduce.input.fileinputformat.split.maxsize"));
+        long minSize =
+                HiveConf.getLongVar(
+                        jobConf,
+                        HiveConf.getConfVars("mapreduce.input.fileinputformat.split.minsize"));
         long avgSize;
         long splitSize;
         if (numSplits > 0) {

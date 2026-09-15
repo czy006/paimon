@@ -18,11 +18,12 @@
 
 package org.apache.paimon.flink.sink;
 
+import org.apache.paimon.CoreOptions;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.table.sink.ChannelComputer;
-import org.apache.paimon.table.sink.RowPartitionKeyExtractor;
+import org.apache.paimon.table.sink.FixedBucketRowKeyExtractor;
 
 import java.util.Map;
 
@@ -36,26 +37,33 @@ public class PostponeFixedBucketChannelComputer implements ChannelComputer<Inter
 
     private final TableSchema schema;
     private final Map<BinaryRow, Integer> knownNumBuckets;
+    private final int maxNumBuckets;
 
     private transient int numChannels;
-    private transient RowPartitionKeyExtractor partitionKeyExtractor;
+    private transient FixedBucketRowKeyExtractor keyExtractor;
 
     public PostponeFixedBucketChannelComputer(
             TableSchema schema, Map<BinaryRow, Integer> knownNumBuckets) {
         this.schema = schema;
         this.knownNumBuckets = knownNumBuckets;
+        this.maxNumBuckets =
+                new CoreOptions(schema.options()).postponeBatchWriteFixedBucketMaxParallelism();
     }
 
     @Override
     public void setup(int numChannels) {
         this.numChannels = numChannels;
-        this.partitionKeyExtractor = new RowPartitionKeyExtractor(schema);
+        this.keyExtractor = new FixedBucketRowKeyExtractor(schema);
     }
 
     @Override
     public int channel(InternalRow record) {
-        BinaryRow partition = partitionKeyExtractor.partition(record);
-        int bucket = knownNumBuckets.computeIfAbsent(partition, p -> numChannels);
+        keyExtractor.setRecord(record);
+        BinaryRow partition = keyExtractor.partition();
+        int numBuckets =
+                knownNumBuckets.computeIfAbsent(
+                        partition.copy(), p -> Math.min(numChannels, maxNumBuckets));
+        int bucket = keyExtractor.bucket(numBuckets);
         return ChannelComputer.select(partition, bucket, numChannels);
     }
 

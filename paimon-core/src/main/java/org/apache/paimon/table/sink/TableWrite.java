@@ -20,11 +20,12 @@ package org.apache.paimon.table.sink;
 
 import org.apache.paimon.annotation.Public;
 import org.apache.paimon.data.BinaryRow;
+import org.apache.paimon.data.BlobConsumer;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.disk.IOManager;
 import org.apache.paimon.io.BundleRecords;
 import org.apache.paimon.memory.MemoryPoolFactory;
-import org.apache.paimon.memory.MemorySegmentPool;
+import org.apache.paimon.mergetree.compact.CompactRewriterFactory;
 import org.apache.paimon.metrics.MetricRegistry;
 import org.apache.paimon.table.Table;
 import org.apache.paimon.types.RowType;
@@ -43,12 +44,25 @@ public interface TableWrite extends AutoCloseable {
     /** Specified the write rowType. */
     TableWrite withWriteType(RowType writeType);
 
-    /** With {@link MemorySegmentPool} for the current table write. */
-    default TableWrite withMemoryPool(MemorySegmentPool memoryPool) {
-        return withMemoryPoolFactory(new MemoryPoolFactory(memoryPool));
-    }
-
+    /** With a shared {@link MemoryPoolFactory} for the current table write. */
     TableWrite withMemoryPoolFactory(MemoryPoolFactory memoryPoolFactory);
+
+    /**
+     * With a blob consumer for the current table write, all newly written Blobs will be called back
+     * through this interface. Note that when this method is invoked, temporary files will not be
+     * deleted in case of exceptions. Please delete them yourself.
+     */
+    TableWrite withBlobConsumer(BlobConsumer blobConsumer);
+
+    /**
+     * Installs a rewriter factory for primary-key merge-tree compaction. Configure this before
+     * writing, restoring, or compacting any bucket, and configure it again on each recovered
+     * writer. Paimon retains compaction scheduling and commit coordination. Append and clustering
+     * writers do not support this hook; write-only writers never invoke it.
+     */
+    default TableWrite withCompactRewriterFactory(CompactRewriterFactory factory) {
+        throw new UnsupportedOperationException("Custom compaction rewriters are not supported.");
+    }
 
     /** Calculate which partition {@code row} belongs to. */
     BinaryRow getPartition(InternalRow row);

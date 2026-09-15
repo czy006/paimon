@@ -247,11 +247,15 @@ public class SparkZOrderUDF implements Serializable {
                 functions
                         .udf(
                                 (Boolean value) -> {
+                                    if (value == null) {
+                                        return PRIMITIVE_EMPTY;
+                                    }
                                     ByteBuffer buffer =
                                             inputBuffer(
                                                     position,
                                                     ZOrderByteUtils.PRIMITIVE_BUFFER_SIZE);
-                                    buffer.put(0, (byte) (value ? -127 : 0));
+                                    // FALSE must not encode to the all-zero sentinel.
+                                    buffer.put(0, (byte) (value ? -127 : 1));
                                     return buffer.array();
                                 },
                                 DataTypes.BinaryType)
@@ -267,12 +271,16 @@ public class SparkZOrderUDF implements Serializable {
         UserDefinedFunction udf =
                 functions
                         .udf(
-                                (String value) ->
-                                        ZOrderByteUtils.stringToOrderedBytes(
-                                                        value,
-                                                        varTypeSize,
-                                                        inputBuffer(position, varTypeSize))
-                                                .array(),
+                                (String value) -> {
+                                    if (value == null) {
+                                        return new byte[varTypeSize];
+                                    }
+                                    return ZOrderByteUtils.stringToOrderedBytes(
+                                                    value,
+                                                    varTypeSize,
+                                                    inputBuffer(position, varTypeSize))
+                                            .array();
+                                },
                                 DataTypes.BinaryType)
                         .withName("STRING-LEXICAL-BYTES");
 
@@ -287,12 +295,16 @@ public class SparkZOrderUDF implements Serializable {
         UserDefinedFunction udf =
                 functions
                         .udf(
-                                (byte[] value) ->
-                                        ZOrderByteUtils.byteTruncateOrFill(
-                                                        value,
-                                                        varTypeSize,
-                                                        inputBuffer(position, varTypeSize))
-                                                .array(),
+                                (byte[] value) -> {
+                                    if (value == null) {
+                                        return new byte[varTypeSize];
+                                    }
+                                    return ZOrderByteUtils.byteTruncateOrFill(
+                                                    value,
+                                                    varTypeSize,
+                                                    inputBuffer(position, varTypeSize))
+                                            .array();
+                                },
                                 DataTypes.BinaryType)
                         .withName("BYTE-TRUNCATE");
 

@@ -23,9 +23,12 @@ import org.apache.paimon.arrow.ArrowUtils;
 import org.apache.paimon.arrow.vector.ArrowCStruct;
 import org.apache.paimon.arrow.vector.ArrowFormatCWriter;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.data.columnar.ColumnVector;
+import org.apache.paimon.data.columnar.VectorizedColumnBatch;
 import org.apache.paimon.format.BundleFormatWriter;
 import org.apache.paimon.fs.PositionOutputStream;
 import org.apache.paimon.io.BundleRecords;
+import org.apache.paimon.io.VectorizedBundleRecords;
 
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
@@ -33,6 +36,8 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
 
 import java.io.IOException;
 
@@ -63,7 +68,7 @@ public class ArrowBundleWriter implements BundleFormatWriter {
         if (!arrowFormatWriter.write(internalRow)) {
             flush();
             if (!arrowFormatWriter.write(internalRow)) {
-                throw new RuntimeException("Exception happens while write to orc file");
+                throw new RuntimeException("Exception happens while writing arrow record");
             }
         }
     }
@@ -71,11 +76,22 @@ public class ArrowBundleWriter implements BundleFormatWriter {
     @Override
     public void writeBundle(BundleRecords bundleRecords) throws IOException {
         if (bundleRecords instanceof ArrowBundleRecords) {
-            add(((ArrowBundleRecords) bundleRecords).getVectorSchemaRoot());
-        } else {
-            for (InternalRow row : bundleRecords) {
-                addElement(row);
+            ArrowBundleRecords arrowBundle = (ArrowBundleRecords) bundleRecords;
+            VectorSchemaRoot root = arrowBundle.getVectorSchemaRoot();
+            if (arrowFormatWriter.formatWriter().isArrowBundleSchemaCompatible(arrowBundle)
+                    && ArrowUtils.hasSameRootAllocator(root, root.getVector(0).getAllocator())) {
+                flush();
+                add(root);
+                return;
             }
+        } else if (bundleRecords instanceof VectorizedBundleRecords) {
+            VectorizedBundleRecords records = (VectorizedBundleRecords) bundleRecords;
+            add(records.batch(), records.selected());
+            return;
+        }
+
+        for (InternalRow row : bundleRecords) {
+            addElement(row);
         }
     }
 
@@ -88,13 +104,35 @@ public class ArrowBundleWriter implements BundleFormatWriter {
                     ArrowUtils.serializeToCStruct(vsr, array, schema, bufferAllocator);
             long t2 = System.currentTimeMillis();
             serializeCost += (t2 - t1);
-            this.nativeWriter.writeIpcBytes(struct.arrayAddress(), struct.schemaAddress());
-            array.release();
-            schema.release();
+            try {
+                this.nativeWriter.writeIpcBytes(struct.arrayAddress(), struct.schemaAddress());
+            } finally {
+                ArrowUtils.releaseCDataIfNeeded(array, schema);
+            }
             jniCost += (System.currentTimeMillis() - t2);
         } catch (RuntimeException e) {
             LOG.error("Exception happens while add vsr", e);
             throw e;
+        }
+    }
+
+    public void add(VectorizedColumnBatch batch, @Nullable int[] selected) {
+        if (!arrowFormatWriter.empty()) {
+            flush();
+        }
+
+        int batchSize = arrowFormatWriter.formatWriter().getBatchSize();
+        ColumnVector[] columns = batch.columns;
+        int totalNumRows = selected != null ? selected.length : batch.getNumRows();
+
+        int startIndex = 0;
+        while (startIndex < totalNumRows) {
+            int batchRows = Math.min(batchSize, totalNumRows - startIndex);
+            arrowFormatWriter.write(columns, selected, startIndex, batchRows);
+            startIndex += batchRows;
+            if (startIndex < totalNumRows) {
+                flush();
+            }
         }
     }
 
@@ -106,8 +144,8 @@ public class ArrowBundleWriter implements BundleFormatWriter {
     @Override
     public void close() throws IOException {
         flush();
-        System.out.println("Serialize vsr cost: " + serializeCost + "ms");
-        System.out.println("Jni cost: " + jniCost + "ms");
+        LOG.debug("Serialize vsr cost: {}ms", serializeCost);
+        LOG.debug("Jni cost: {}ms", jniCost);
         this.nativeWriter.close();
         this.arrowFormatWriter.close();
     }

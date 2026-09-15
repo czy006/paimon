@@ -18,9 +18,10 @@
 
 package org.apache.paimon.spark.data
 
-import org.apache.paimon.types.DataType
+import org.apache.paimon.types.{DataType, GeographyType, GeometryType}
 
-import org.apache.spark.unsafe.types.VariantVal
+import org.apache.spark.sql.paimon.shims.SparkShimLoader
+import org.apache.spark.unsafe.types.{GeographyVal, GeometryVal, VariantVal}
 
 class Spark4ArrayData(override val elementType: DataType) extends AbstractSparkArrayData {
 
@@ -28,4 +29,19 @@ class Spark4ArrayData(override val elementType: DataType) extends AbstractSparkA
     val v = paimonArray.getVariant(ordinal)
     new VariantVal(v.value(), v.metadata())
   }
+
+  override def getGeography(ordinal: Int): GeographyVal =
+    SparkShimLoader.shim
+      .toSparkGeography(
+        paimonArray.getBinary(ordinal),
+        elementType.asInstanceOf[GeographyType].getCrs,
+        elementType.asInstanceOf[GeographyType].getAlgorithm.toString)
+      .asInstanceOf[GeographyVal]
+
+  override def getGeometry(ordinal: Int): GeometryVal =
+    SparkShimLoader.shim
+      .toSparkGeometry(
+        paimonArray.getBinary(ordinal),
+        elementType.asInstanceOf[GeometryType].getCrs)
+      .asInstanceOf[GeometryVal]
 }

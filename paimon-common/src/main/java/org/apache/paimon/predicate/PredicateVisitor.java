@@ -18,6 +18,14 @@
 
 package org.apache.paimon.predicate;
 
+import org.apache.paimon.types.RowType;
+
+import javax.annotation.Nullable;
+
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
+
 /** A visitor to visit {@link Predicate}. */
 public interface PredicateVisitor<T> {
 
@@ -25,5 +33,51 @@ public interface PredicateVisitor<T> {
 
     T visit(CompoundPredicate predicate);
 
-    T visit(TransformPredicate predicate);
+    static Set<String> collectFieldNames(@Nullable Predicate predicate) {
+        if (predicate == null) {
+            return Collections.emptySet();
+        }
+        return predicate.visit(new FieldNameCollector());
+    }
+
+    static Set<String> collectTransformFieldNames(Transform transform) {
+        Set<String> fieldNames = new HashSet<>();
+        for (Object input : transform.inputs()) {
+            if (input instanceof FieldRef) {
+                fieldNames.add(((FieldRef) input).name());
+            }
+        }
+        return fieldNames;
+    }
+
+    static Set<Integer> collectFieldIds(RowType rowType, @Nullable Predicate predicate) {
+        if (predicate == null) {
+            return Collections.emptySet();
+        }
+        Set<Integer> fieldIds = new HashSet<>();
+        for (String name : collectFieldNames(predicate)) {
+            if (rowType.containsField(name)) {
+                fieldIds.add(rowType.getField(name).id());
+            }
+        }
+        return fieldIds;
+    }
+
+    /** A visitor that collects all field names referenced by a predicate. */
+    class FieldNameCollector implements PredicateVisitor<Set<String>> {
+
+        @Override
+        public Set<String> visit(LeafPredicate predicate) {
+            return collectTransformFieldNames(predicate.transform());
+        }
+
+        @Override
+        public Set<String> visit(CompoundPredicate predicate) {
+            Set<String> fieldNames = new HashSet<>();
+            for (Predicate child : predicate.children()) {
+                fieldNames.addAll(child.visit(this));
+            }
+            return fieldNames;
+        }
+    }
 }

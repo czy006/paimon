@@ -21,7 +21,6 @@ package org.apache.paimon.table.sink;
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.table.InnerTable;
-import org.apache.paimon.table.Table;
 import org.apache.paimon.types.RowType;
 
 import javax.annotation.Nullable;
@@ -40,18 +39,11 @@ public class BatchWriteBuilderImpl implements BatchWriteBuilder {
     private final String commitUser;
 
     private Map<String, String> staticPartition;
-    private boolean appendCommitCheckConflict = false;
+    private @Nullable Long rowIdCheckFromSnapshot = null;
 
     public BatchWriteBuilderImpl(InnerTable table) {
         this.table = table;
         this.commitUser = createCommitUser(new Options(table.options()));
-    }
-
-    private BatchWriteBuilderImpl(
-            InnerTable table, String commitUser, @Nullable Map<String, String> staticPartition) {
-        this.table = table;
-        this.commitUser = commitUser;
-        this.staticPartition = staticPartition;
     }
 
     @Override
@@ -85,7 +77,7 @@ public class BatchWriteBuilderImpl implements BatchWriteBuilder {
         InnerTableCommit commit =
                 table.newCommit(commitUser)
                         .withOverwrite(staticPartition)
-                        .appendCommitCheckConflict(appendCommitCheckConflict);
+                        .rowIdCheckConflict(rowIdCheckFromSnapshot);
         commit.ignoreEmptyCommit(
                 Options.fromMap(table.options())
                         .getOptional(CoreOptions.SNAPSHOT_IGNORE_EMPTY_COMMIT)
@@ -93,12 +85,8 @@ public class BatchWriteBuilderImpl implements BatchWriteBuilder {
         return commit;
     }
 
-    public BatchWriteBuilderImpl copyWithNewTable(Table newTable) {
-        return new BatchWriteBuilderImpl((InnerTable) newTable, commitUser, staticPartition);
-    }
-
-    public BatchWriteBuilderImpl appendCommitCheckConflict(boolean appendCommitCheckConflict) {
-        this.appendCommitCheckConflict = appendCommitCheckConflict;
+    public BatchWriteBuilderImpl rowIdCheckConflict(@Nullable Long rowIdCheckFromSnapshot) {
+        this.rowIdCheckFromSnapshot = rowIdCheckFromSnapshot;
         return this;
     }
 }

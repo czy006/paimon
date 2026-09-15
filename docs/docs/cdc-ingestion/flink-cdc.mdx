@@ -1,0 +1,113 @@
+---
+title: "Paimon as a Flink CDC Source"
+sidebar_label: "Paimon Source (Flink CDC)"
+sidebar_position: 10
+---
+
+import ConfigTable from '@site/src/components/ConfigTable';
+import cdcConfigurationHtml from '@site/generated/cdc_configuration.html';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# Paimon as a Flink CDC Source {#flink-cdc}
+
+Use the Paimon pipeline source connector to read Paimon tables and send changes to an external
+system through a Flink CDC YAML pipeline.
+
+![Paimon tables feed a Flink CDC pipeline, which sends row and schema changes to an external sink.](/img/cdc-ingestion-flink-pipeline.svg)
+
+To write **into Paimon** using a YAML pipeline, see Flink CDC's
+[Paimon sink connector](https://nightlies.apache.org/flink/flink-cdc-docs-release-3.5/docs/connectors/pipeline-connectors/paimon/).
+For Paimon's source-specific ingestion commands, return to the [CDC ingestion overview](./).
+
+## Capabilities {#what-can-the-connector-do}
+
+- Read a Paimon warehouse, database, or table.
+- Emit row events and schema changes to the pipeline.
+- Discover newly created tables when the configured scope includes multiple tables.
+
+## Create a Pipeline {#how-to-create-pipeline}
+
+This example reads `default.test_table` from a filesystem catalog and writes to Doris. Make the
+Paimon source and destination connector dependencies available to the Flink CDC runtime, and
+replace the catalog path and sink connection values for your deployment.
+
+```yaml
+source:
+  type: paimon
+  name: Paimon Source
+  database: default
+  table: test_table
+  catalog.properties.metastore: filesystem
+  catalog.properties.warehouse: /path/warehouse
+
+sink:
+  type: doris
+  name: Doris Sink
+  fenodes: 127.0.0.1:8030
+  username: root
+  password: pass
+
+pipeline:
+  name: Paimon to Doris Pipeline
+  parallelism: 2
+```
+
+## Pipeline Connector Options
+
+| Scope | Source settings |
+| --- | --- |
+| One table | Set `database` and `table`. |
+| One database | Set `database`; omit `table`. |
+| Whole warehouse | Omit both `database` and `table`. |
+
+Use `table.discovery-interval` to control discovery of new tables when the scope is not fixed to
+one table. This is separate from waiting for the next snapshot of an existing table.
+
+<ConfigTable html={cdcConfigurationHtml} />
+
+## Catalog Options
+
+Prefix catalog settings with `catalog.properties.`. For example,
+`catalog.properties.warehouse` becomes the catalog's `warehouse` option, and
+`catalog.properties.metastore` becomes `metastore`. See [Configurations](../maintenance/configurations)
+for catalog options.
+
+## Usage Notes
+
+* Data updates for primary key tables (-U, +U) will be replaced with -D and +I.
+* Does not support dropping tables. If you need to drop a table from the Paimon warehouse, please restart the Flink CDC job after performing the drop operation. When the job restarts, it will stop reading data from the dropped table, and the target table in the external system will remain unchanged from its state before the job was stopped.
+* Data from the same table will be consumed by the same Flink source subtask. If the amount of data varies significantly across different tables, performance bottlenecks caused by data skew may be observed in Flink CDC jobs.
+* If the CDC job has consumed up to the latest snapshot of a table and the next snapshot is not available yet, the monitoring and consumption of this table may be temporarily paused until `continuous.discovery-interval` has passed.
+
+## Data Type Mapping
+Common scalar mappings are shown below. The connector converts through Flink's logical types;
+acceptance of a type also depends on the destination connector.
+
+| Paimon type | Flink CDC type |
+| --- | --- |
+| `TINYINT`, `SMALLINT`, `INT`, `BIGINT` | Corresponding integer type |
+| `FLOAT`, `DOUBLE` | Corresponding floating-point type |
+| `DECIMAL(p, s)` | `DECIMAL(p, s)` |
+| `BOOLEAN` | `BOOLEAN` |
+| `DATE` | `DATE` |
+| `TIMESTAMP` | `TIMESTAMP` |
+| `TIMESTAMP_LTZ` | `TIMESTAMP_LTZ` |
+| `CHAR(n)`, `VARCHAR(n)` | Corresponding character type |

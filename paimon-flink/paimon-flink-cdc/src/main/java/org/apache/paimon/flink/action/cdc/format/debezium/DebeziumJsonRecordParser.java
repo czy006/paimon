@@ -119,6 +119,7 @@ public class DebeziumJsonRecordParser extends AbstractJsonRecordParser {
 
     @Override
     protected void setRoot(CdcSourceRecord record) {
+        super.setRoot(record); // Store current record for metadata access
         JsonNode node = (JsonNode) record.getValue();
 
         hasSchema = false;
@@ -212,8 +213,48 @@ public class DebeziumJsonRecordParser extends AbstractJsonRecordParser {
         }
 
         evalComputedColumns(resultMap, schemaBuilder);
+        evalMetadataColumns(resultMap, schemaBuilder);
 
         return resultMap;
+    }
+
+    @Override
+    protected List<String> extractPrimaryKeys() {
+        List<String> primaryKeys = super.extractPrimaryKeys();
+        if (!primaryKeys.isEmpty()) {
+            return primaryKeys;
+        }
+
+        Object key = currentRecord.getKey();
+        if (!(key instanceof JsonNode)) {
+            return Collections.emptyList();
+        }
+
+        JsonNode keyNode = (JsonNode) key;
+        JsonNode keySchema = keyNode.get(FIELD_SCHEMA);
+        if (!isNull(keySchema)
+                && keySchema.isObject()
+                && keySchema.has("fields")
+                && keySchema.get("fields").isArray()
+                && keyNode.has(FIELD_PAYLOAD)) {
+            ArrayNode fields = getNodeAs(keySchema, "fields", ArrayNode.class);
+            List<String> fieldNames = new ArrayList<>(fields.size());
+            for (JsonNode field : fields) {
+                String fieldName = getString(field, "field");
+                if (fieldName != null) {
+                    fieldNames.add(fieldName);
+                }
+            }
+            return fieldNames;
+        }
+
+        if (!keyNode.isObject()) {
+            return Collections.emptyList();
+        }
+
+        List<String> fieldNames = new ArrayList<>();
+        keyNode.fieldNames().forEachRemaining(fieldNames::add);
+        return fieldNames;
     }
 
     @Override

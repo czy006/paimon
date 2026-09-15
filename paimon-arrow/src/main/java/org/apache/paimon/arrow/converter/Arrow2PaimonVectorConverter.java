@@ -22,6 +22,7 @@ import org.apache.paimon.data.Decimal;
 import org.apache.paimon.data.InternalArray;
 import org.apache.paimon.data.InternalMap;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.data.InternalVector;
 import org.apache.paimon.data.Timestamp;
 import org.apache.paimon.data.columnar.ArrayColumnVector;
 import org.apache.paimon.data.columnar.BooleanColumnVector;
@@ -31,6 +32,7 @@ import org.apache.paimon.data.columnar.ColumnVector;
 import org.apache.paimon.data.columnar.ColumnarArray;
 import org.apache.paimon.data.columnar.ColumnarMap;
 import org.apache.paimon.data.columnar.ColumnarRow;
+import org.apache.paimon.data.columnar.ColumnarVec;
 import org.apache.paimon.data.columnar.DecimalColumnVector;
 import org.apache.paimon.data.columnar.DoubleColumnVector;
 import org.apache.paimon.data.columnar.FloatColumnVector;
@@ -40,7 +42,9 @@ import org.apache.paimon.data.columnar.MapColumnVector;
 import org.apache.paimon.data.columnar.RowColumnVector;
 import org.apache.paimon.data.columnar.ShortColumnVector;
 import org.apache.paimon.data.columnar.TimestampColumnVector;
+import org.apache.paimon.data.columnar.VecColumnVector;
 import org.apache.paimon.data.columnar.VectorizedColumnBatch;
+import org.apache.paimon.data.variant.Variant;
 import org.apache.paimon.types.ArrayType;
 import org.apache.paimon.types.BigIntType;
 import org.apache.paimon.types.BinaryType;
@@ -50,10 +54,13 @@ import org.apache.paimon.types.CharType;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.DataTypeVisitor;
+import org.apache.paimon.types.DataTypes;
 import org.apache.paimon.types.DateType;
 import org.apache.paimon.types.DecimalType;
 import org.apache.paimon.types.DoubleType;
 import org.apache.paimon.types.FloatType;
+import org.apache.paimon.types.GeographyType;
+import org.apache.paimon.types.GeometryType;
 import org.apache.paimon.types.IntType;
 import org.apache.paimon.types.LocalZonedTimestampType;
 import org.apache.paimon.types.MapType;
@@ -66,7 +73,9 @@ import org.apache.paimon.types.TinyIntType;
 import org.apache.paimon.types.VarBinaryType;
 import org.apache.paimon.types.VarCharType;
 import org.apache.paimon.types.VariantType;
+import org.apache.paimon.types.VectorType;
 
+import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.DateDayVector;
@@ -77,14 +86,20 @@ import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.SmallIntVector;
+import org.apache.arrow.vector.TimeMicroVector;
 import org.apache.arrow.vector.TimeMilliVector;
+import org.apache.arrow.vector.TimeNanoVector;
+import org.apache.arrow.vector.TimeSecVector;
 import org.apache.arrow.vector.TimeStampVector;
 import org.apache.arrow.vector.TinyIntVector;
 import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.complex.FixedSizeListVector;
 import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.complex.StructVector;
 
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -189,7 +204,12 @@ public interface Arrow2PaimonVectorConverter {
 
                         @Override
                         public Bytes getBytes(int index) {
-                            byte[] bytes = ((VarBinaryVector) vector).getObject(index);
+                            byte[] bytes;
+                            if (vector instanceof FixedSizeBinaryVector) {
+                                bytes = ((FixedSizeBinaryVector) vector).get(index);
+                            } else {
+                                bytes = ((VarBinaryVector) vector).getObject(index);
+                            }
                             return new Bytes(bytes, 0, bytes.length) {
                                 @Override
                                 public byte[] getBytes() {
@@ -220,7 +240,28 @@ public interface Arrow2PaimonVectorConverter {
                                 }
                             };
                         }
+
+                        @Override
+                        public ByteBuffer getByteBuffer(int index) {
+                            VarBinaryVector binaryVector = (VarBinaryVector) vector;
+                            int start = binaryVector.getStartOffset(index);
+                            int end = binaryVector.getEndOffset(index);
+                            return binaryVector
+                                    .getDataBuffer()
+                                    .nioBuffer(start, end - start)
+                                    .order(ByteOrder.LITTLE_ENDIAN);
+                        }
                     };
+        }
+
+        @Override
+        public Arrow2PaimonVectorConverter visit(GeometryType geometryType) {
+            return visit(new VarBinaryType(geometryType.isNullable(), VarBinaryType.MAX_LENGTH));
+        }
+
+        @Override
+        public Arrow2PaimonVectorConverter visit(GeographyType geographyType) {
+            return visit(new VarBinaryType(geographyType.isNullable(), VarBinaryType.MAX_LENGTH));
         }
 
         @Override
@@ -372,7 +413,7 @@ public interface Arrow2PaimonVectorConverter {
 
                         @Override
                         public int getInt(int index) {
-                            return ((TimeMilliVector) vector).get(index);
+                            return getTimeInMillis(vector, index);
                         }
                     };
         }
@@ -390,16 +431,7 @@ public interface Arrow2PaimonVectorConverter {
                         @Override
                         public Timestamp getTimestamp(int i, int precision) {
                             long value = ((TimeStampVector) vector).get(i);
-                            if (precision == 0) {
-                                return Timestamp.fromEpochMillis(value * 1000);
-                            } else if (precision >= 1 && precision <= 3) {
-                                return Timestamp.fromEpochMillis(value);
-                            } else if (precision >= 4 && precision <= 6) {
-                                return Timestamp.fromMicros(value);
-                            } else {
-                                return Timestamp.fromEpochMillis(
-                                        value / 1_000_000, (int) (value % 1_000_000));
-                            }
+                            return convertEpochToTimestamp(value, precision);
                         }
                     };
         }
@@ -416,24 +448,59 @@ public interface Arrow2PaimonVectorConverter {
 
                         @Override
                         public Timestamp getTimestamp(int i, int precision) {
-                            long value = (long) vector.getObject(i);
-                            if (precision == 0) {
-                                return Timestamp.fromEpochMillis(value * 1000);
-                            } else if (precision >= 1 && precision <= 3) {
-                                return Timestamp.fromEpochMillis(value);
-                            } else if (precision >= 4 && precision <= 6) {
-                                return Timestamp.fromMicros(value);
-                            } else {
-                                return Timestamp.fromEpochMillis(
-                                        value / 1_000_000, (int) (value % 1_000_000));
-                            }
+                            long value = ((TimeStampVector) vector).get(i);
+                            return convertEpochToTimestamp(value, precision);
                         }
                     };
         }
 
+        private int getTimeInMillis(FieldVector vector, int index) {
+            if (vector instanceof TimeMilliVector) {
+                return ((TimeMilliVector) vector).get(index);
+            } else if (vector instanceof TimeMicroVector) {
+                return (int) (((TimeMicroVector) vector).get(index) / 1_000);
+            } else if (vector instanceof TimeNanoVector) {
+                return (int) (((TimeNanoVector) vector).get(index) / 1_000_000);
+            } else if (vector instanceof TimeSecVector) {
+                return ((TimeSecVector) vector).get(index) * 1_000;
+            } else {
+                throw new UnsupportedOperationException(
+                        "Unsupported Arrow time vector: " + vector.getClass().getName());
+            }
+        }
+
+        private Timestamp convertEpochToTimestamp(long value, int precision) {
+            if (precision == 0) {
+                return Timestamp.fromEpochMillis(value * 1000);
+            } else if (precision >= 1 && precision <= 3) {
+                return Timestamp.fromEpochMillis(value);
+            } else if (precision >= 4 && precision <= 6) {
+                return Timestamp.fromMicros(value);
+            } else {
+                return Timestamp.fromEpochMillis(
+                        Math.floorDiv(value, 1_000_000L), (int) Math.floorMod(value, 1_000_000L));
+            }
+        }
+
         @Override
         public Arrow2PaimonVectorConverter visit(VariantType variantType) {
-            throw new UnsupportedOperationException();
+            final Arrow2PaimonVectorConverter rawConverter =
+                    visit(
+                            RowType.builder()
+                                    .field(Variant.VALUE, DataTypes.BYTES().notNull())
+                                    .field(Variant.METADATA, DataTypes.BYTES().notNull())
+                                    .build());
+            return vector -> {
+                List<FieldVector> children = ((StructVector) vector).getChildrenFromFields();
+                if (children.size() != 2
+                        || !Variant.VALUE.equals(children.get(0).getName())
+                        || !Variant.METADATA.equals(children.get(1).getName())) {
+                    throw new IllegalArgumentException(
+                            "Expected raw Variant Arrow layout [value, metadata]. Physical "
+                                    + "shredded layouts must be handled by a shredding read plan.");
+                }
+                return rawConverter.convertVector(vector);
+            };
         }
 
         @Override
@@ -478,6 +545,61 @@ public interface Arrow2PaimonVectorConverter {
                         public ColumnVector getColumnVector() {
                             init();
                             return columnVector;
+                        }
+                    };
+        }
+
+        @Override
+        public Arrow2PaimonVectorConverter visit(VectorType vectorType) {
+            final Arrow2PaimonVectorConverter arrowVectorConvertor =
+                    vectorType.getElementType().accept(this);
+
+            return vector ->
+                    new VecColumnVector() {
+
+                        private boolean inited = false;
+                        private ColumnVector columnVector;
+                        private ColumnarVec.Factory factory;
+
+                        private void init() {
+                            if (!inited) {
+                                if (!(vector instanceof FixedSizeListVector)) {
+                                    throw new UnsupportedOperationException(
+                                            "Cannot convert " + vector.getClass() + " to vector");
+                                }
+                                FixedSizeListVector listVector = (FixedSizeListVector) vector;
+                                FieldVector dataVector = listVector.getDataVector();
+                                factory =
+                                        new Arrow2ColumnarVecFactory(
+                                                dataVector.getValidityBuffer());
+                                this.columnVector = arrowVectorConvertor.convertVector(dataVector);
+                                inited = true;
+                            }
+                        }
+
+                        @Override
+                        public boolean isNullAt(int index) {
+                            return vector.isNull(index);
+                        }
+
+                        @Override
+                        public InternalVector getVector(int index) {
+                            init();
+                            FixedSizeListVector listVector = (FixedSizeListVector) vector;
+                            int start = listVector.getElementStartIndex(index);
+                            int end = listVector.getElementEndIndex(index);
+                            return factory.create(columnVector, start, end - start);
+                        }
+
+                        @Override
+                        public ColumnVector getColumnVector() {
+                            init();
+                            return columnVector;
+                        }
+
+                        @Override
+                        public int getVectorSize() {
+                            return vectorType.getLength();
                         }
                     };
         }
@@ -588,6 +710,61 @@ public interface Arrow2PaimonVectorConverter {
                             return vectorizedColumnBatch;
                         }
                     };
+        }
+
+        private static final int[] VALIDITY_BYTE_MASK =
+                new int[] {0b0, 0b1, 0b11, 0b111, 0b1111, 0b11111, 0b111111, 0b1111111, 0b11111111};
+
+        private static class Arrow2ColumnarVecFactory extends ColumnarVec.Factory {
+
+            private final ArrowBuf validityBuf;
+            private final boolean nullable;
+
+            private Arrow2ColumnarVecFactory(ArrowBuf validityBuf) {
+                this.validityBuf = validityBuf;
+                this.nullable = validityBuf != null && validityBuf.capacity() > 0;
+            }
+
+            @Override
+            public void ensureNonNull(ColumnVector data, int offset, int numElements) {
+                if (!nullable) {
+                    return;
+                }
+
+                final int startByteIndex = offset >> 3;
+                final int startBitIndex = offset & 7;
+                final int endByteIndex = (offset + numElements - 1) >> 3;
+                final int endBitIndex = (offset + numElements - 1) & 7;
+
+                if (startByteIndex == endByteIndex) {
+                    byte bits = validityBuf.getByte(startByteIndex);
+                    checkValidityRange(bits, startBitIndex, endBitIndex);
+                    return;
+                }
+
+                byte bits = validityBuf.getByte(startByteIndex);
+                checkValidityRange(bits, startBitIndex, 7);
+                for (int i = startByteIndex + 1; i < endByteIndex; ++i) {
+                    bits = validityBuf.getByte(i);
+                    checkValidityAll(bits);
+                }
+                bits = validityBuf.getByte(endByteIndex);
+                checkValidityRange(bits, 0, endBitIndex);
+            }
+
+            private void checkValidityAll(byte bits) {
+                if ((bits & 0xFF) != 0xFF) {
+                    throw new UnsupportedOperationException("Vector elements must be nonNull");
+                }
+            }
+
+            private void checkValidityRange(byte bits, int start, int end) {
+                int r = (bits & 0xFF) | VALIDITY_BYTE_MASK[start];
+                int m = VALIDITY_BYTE_MASK[end + 1];
+                if ((r & m) != m) {
+                    throw new UnsupportedOperationException("Vector elements must be nonNull");
+                }
+            }
         }
     }
 }

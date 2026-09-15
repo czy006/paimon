@@ -22,9 +22,12 @@ import org.apache.paimon.CoreOptions;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.types.VarCharType;
 import org.apache.paimon.utils.BinaryStringUtils;
+import org.apache.paimon.utils.StringUtils;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 import static org.apache.paimon.utils.BinaryStringUtils.splitByWholeSeparatorPreserveAllTokens;
 
@@ -35,44 +38,48 @@ public class FieldListaggAgg extends FieldAggregator {
 
     private final String delimiter;
 
+    private final BinaryString delimiterBinaryString;
+
     private final boolean distinct;
 
     public FieldListaggAgg(String name, VarCharType dataType, CoreOptions options, String field) {
         super(name, dataType);
         this.delimiter = options.fieldListAggDelimiter(field);
+        this.delimiterBinaryString = BinaryString.fromString(this.delimiter);
         this.distinct = options.fieldCollectAggDistinct(field);
     }
 
     @Override
     public Object agg(Object accumulator, Object inputField) {
-        if (accumulator == null || inputField == null) {
-            return accumulator == null ? inputField : accumulator;
+        if (inputField == null || StringUtils.isBlank(inputField.toString())) {
+            return accumulator;
         }
         // ordered by type root definition
 
-        // TODO: ensure not VARCHAR(n)
+        if (accumulator == null || StringUtils.isBlank(accumulator.toString())) {
+            return inputField;
+        }
+
         BinaryString mergeFieldSD = (BinaryString) accumulator;
         BinaryString inFieldSD = (BinaryString) inputField;
 
-        if (inFieldSD.getSizeInBytes() <= 0) {
-            return mergeFieldSD;
-        }
-
-        if (mergeFieldSD.getSizeInBytes() <= 0) {
-            return inFieldSD;
-        }
-
         if (distinct) {
-            BinaryString delimiterBinaryString = BinaryString.fromString(delimiter);
+            BinaryString[] accumulatorTokens =
+                    splitByWholeSeparatorPreserveAllTokens(mergeFieldSD, delimiterBinaryString);
+            Set<BinaryString> existingTokens = new HashSet<>(accumulatorTokens.length);
+            for (BinaryString token : accumulatorTokens) {
+                existingTokens.add(token);
+            }
 
             List<BinaryString> result = new ArrayList<>();
             result.add(mergeFieldSD);
             for (BinaryString str :
                     splitByWholeSeparatorPreserveAllTokens(inFieldSD, delimiterBinaryString)) {
-                if (str.getSizeInBytes() == 0 || mergeFieldSD.contains(str)) {
+                if (StringUtils.isBlank(str.toString()) || existingTokens.contains(str)) {
                     continue;
                 }
 
+                existingTokens.add(str);
                 result.add(delimiterBinaryString);
                 result.add(str);
             }
@@ -84,7 +91,6 @@ public class FieldListaggAgg extends FieldAggregator {
             return BinaryStringUtils.concat(result);
         }
 
-        return BinaryStringUtils.concat(
-                mergeFieldSD, BinaryString.fromString(delimiter), inFieldSD);
+        return BinaryStringUtils.concat(mergeFieldSD, delimiterBinaryString, inFieldSD);
     }
 }

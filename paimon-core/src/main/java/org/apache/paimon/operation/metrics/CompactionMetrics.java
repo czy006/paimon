@@ -51,6 +51,14 @@ public class CompactionMetrics {
     public static final String AVG_COMPACTION_OUTPUT_SIZE = "avgCompactionOutputSize";
     public static final String MAX_TOTAL_FILE_SIZE = "maxTotalFileSize";
     public static final String AVG_TOTAL_FILE_SIZE = "avgTotalFileSize";
+    public static final String MAX_TOTAL_FILE_COUNT = "maxTotalFileCount";
+    public static final String AVG_TOTAL_FILE_COUNT = "avgTotalFileCount";
+    public static final String MIN_AVG_FILE_SIZE = "minAvgFileSize";
+
+    public static final String MAX_SORT_BUFFER_USED_BYTES = "maxSortBufferUsedBytes";
+    public static final String AVG_SORT_BUFFER_USED_BYTES = "avgSortBufferUsedBytes";
+    public static final String MAX_SORT_BUFFER_UTILISATION = "maxSortBufferUtilisationPercent";
+    public static final String AVG_SORT_BUFFER_UTILISATION = "avgSortBufferUtilisationPercent";
 
     private static final long BUSY_MEASURE_MILLIS = 60_000;
     private static final int COMPACTION_TIME_WINDOW = 100;
@@ -102,6 +110,22 @@ public class CompactionMetrics {
 
         metricGroup.gauge(MAX_TOTAL_FILE_SIZE, () -> getTotalFileSizeStream().max().orElse(-1));
         metricGroup.gauge(AVG_TOTAL_FILE_SIZE, () -> getTotalFileSizeStream().average().orElse(-1));
+        metricGroup.gauge(MAX_TOTAL_FILE_COUNT, () -> getTotalFileCountStream().max().orElse(-1));
+        metricGroup.gauge(
+                AVG_TOTAL_FILE_COUNT, () -> getTotalFileCountStream().average().orElse(-1));
+        metricGroup.gauge(MIN_AVG_FILE_SIZE, () -> getAvgFileSizeStream().min().orElse(-1));
+
+        metricGroup.gauge(
+                MAX_SORT_BUFFER_USED_BYTES, () -> getSortBufferUsedBytesStream().max().orElse(-1));
+        metricGroup.gauge(
+                AVG_SORT_BUFFER_USED_BYTES,
+                () -> getSortBufferUsedBytesStream().average().orElse(-1));
+        metricGroup.gauge(
+                MAX_SORT_BUFFER_UTILISATION,
+                () -> getSortBufferUtilisationStream().max().orElse(-1));
+        metricGroup.gauge(
+                AVG_SORT_BUFFER_UTILISATION,
+                () -> getSortBufferUtilisationStream().average().orElse(-1));
     }
 
     private LongStream getLevel0FileCountStream() {
@@ -128,6 +152,26 @@ public class CompactionMetrics {
     @VisibleForTesting
     public LongStream getTotalFileSizeStream() {
         return reporters.values().stream().mapToLong(r -> r.totalFileSize);
+    }
+
+    @VisibleForTesting
+    public LongStream getTotalFileCountStream() {
+        return reporters.values().stream().mapToLong(r -> r.totalFileCount);
+    }
+
+    @VisibleForTesting
+    public LongStream getAvgFileSizeStream() {
+        return reporters.values().stream()
+                .filter(r -> r.totalFileCount > 0)
+                .mapToLong(r -> r.totalFileSize / r.totalFileCount);
+    }
+
+    private LongStream getSortBufferUsedBytesStream() {
+        return reporters.values().stream().mapToLong(r -> r.sortBufferUsedBytes);
+    }
+
+    private DoubleStream getSortBufferUtilisationStream() {
+        return reporters.values().stream().mapToDouble(r -> r.sortBufferUtilisationPercent);
     }
 
     public void close() {
@@ -157,6 +201,10 @@ public class CompactionMetrics {
 
         void reportTotalFileSize(long bytes);
 
+        void reportTotalFileCount(long count);
+
+        void reportSortBufferMetrics(long usedBytes, long totalBytes);
+
         void unregister();
     }
 
@@ -167,6 +215,9 @@ public class CompactionMetrics {
         private long compactionInputSize = 0;
         private long compactionOutputSize = 0;
         private long totalFileSize = 0;
+        private long totalFileCount = 0;
+        private long sortBufferUsedBytes = 0;
+        private double sortBufferUtilisationPercent = 0.0;
 
         private ReporterImpl(PartitionAndBucket key) {
             this.key = key;
@@ -206,8 +257,20 @@ public class CompactionMetrics {
         }
 
         @Override
+        public void reportTotalFileCount(long count) {
+            this.totalFileCount = count;
+        }
+
+        @Override
         public void reportLevel0FileCount(long count) {
             this.level0FileCount = count;
+        }
+
+        @Override
+        public void reportSortBufferMetrics(long usedBytes, long totalBytes) {
+            this.sortBufferUsedBytes = usedBytes;
+            this.sortBufferUtilisationPercent =
+                    totalBytes > 0 ? 100.0 * usedBytes / totalBytes : 0.0;
         }
 
         @Override

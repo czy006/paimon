@@ -22,11 +22,15 @@ import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.BinaryRowWriter;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.globalindex.IndexedSplit;
+import org.apache.paimon.globalindex.btree.BTreeIndexOptions;
+import org.apache.paimon.globalindex.sorted.SortedIndexOptions;
 import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.io.PojoDataFileMeta;
 import org.apache.paimon.manifest.FileKind;
 import org.apache.paimon.manifest.ManifestEntry;
 import org.apache.paimon.manifest.PojoManifestEntry;
+import org.apache.paimon.options.Options;
+import org.apache.paimon.spark.globalindex.DefaultGlobalIndexTopoBuilder;
 import org.apache.paimon.stats.SimpleStats;
 import org.apache.paimon.table.source.DataSplit;
 import org.apache.paimon.utils.Range;
@@ -51,6 +55,26 @@ public class CreateGlobalIndexProcedureTest {
             (a, b) -> new Path(UUID.randomUUID().toString());
 
     @Test
+    void testCreateUserOptionsUsesTableOptionsAndParsedOptionsOverride() {
+        Map<String, String> tableOptions = new HashMap<>();
+        tableOptions.put(BTreeIndexOptions.BTREE_INDEX_COMPRESSION.key(), "zstd");
+        tableOptions.put(BTreeIndexOptions.BTREE_INDEX_RECORDS_PER_RANGE.key(), "100");
+        tableOptions.put("unrelated-table-option", "table-value");
+
+        Options userOptions =
+                CreateGlobalIndexProcedure.createUserOptions(
+                        tableOptions,
+                        SortedIndexOptions.SORTED_INDEX_RECORDS_PER_RANGE.key()
+                                + "=200, procedure-only=procedure-value");
+
+        assertThat(userOptions.get(BTreeIndexOptions.BTREE_INDEX_COMPRESSION)).isEqualTo("zstd");
+        assertThat(userOptions.get(SortedIndexOptions.SORTED_INDEX_RECORDS_PER_RANGE))
+                .isEqualTo(200L);
+        assertThat(userOptions.get("unrelated-table-option")).isEqualTo("table-value");
+        assertThat(userOptions.get("procedure-only")).isEqualTo("procedure-value");
+    }
+
+    @Test
     void testGroupFilesIntoShardsByPartitionSingleFileInSingleShard() {
         // Create a partition
         BinaryRow partition = createPartition(0);
@@ -64,7 +88,7 @@ public class CreateGlobalIndexProcedureTest {
 
         // Execute
         Map<BinaryRow, List<IndexedSplit>> result =
-                CreateGlobalIndexProcedure.groupFilesIntoShardsByPartition(
+                DefaultGlobalIndexTopoBuilder.groupFilesIntoShardsByPartition(
                         entriesByPartition, 1000L, pathFactory);
 
         // Verify
@@ -98,7 +122,7 @@ public class CreateGlobalIndexProcedureTest {
 
         // Execute
         Map<BinaryRow, List<IndexedSplit>> result =
-                CreateGlobalIndexProcedure.groupFilesIntoShardsByPartition(
+                DefaultGlobalIndexTopoBuilder.groupFilesIntoShardsByPartition(
                         entriesByPartition, 1000L, pathFactory);
 
         // Verify
@@ -147,7 +171,7 @@ public class CreateGlobalIndexProcedureTest {
 
         // Execute
         Map<BinaryRow, List<IndexedSplit>> result =
-                CreateGlobalIndexProcedure.groupFilesIntoShardsByPartition(
+                DefaultGlobalIndexTopoBuilder.groupFilesIntoShardsByPartition(
                         entriesByPartition, 1000L, pathFactory);
 
         // Verify
@@ -184,7 +208,7 @@ public class CreateGlobalIndexProcedureTest {
 
         // Execute
         Map<BinaryRow, List<IndexedSplit>> result =
-                CreateGlobalIndexProcedure.groupFilesIntoShardsByPartition(
+                DefaultGlobalIndexTopoBuilder.groupFilesIntoShardsByPartition(
                         entriesByPartition, 1000L, pathFactory);
 
         // Verify
@@ -208,6 +232,34 @@ public class CreateGlobalIndexProcedureTest {
     }
 
     @Test
+    void testGroupFilesIntoShardsByPartitionUsesUnindexedRanges() {
+        BinaryRow partition = createPartition(0);
+        DataFileMeta indexedLaterFile = createDataFileMeta(1000L, 100L);
+        DataFileMeta unindexedEarlierFile = createDataFileMeta(0L, 100L);
+
+        Map<BinaryRow, List<ManifestEntry>> entriesByPartition = new HashMap<>();
+        entriesByPartition.put(
+                partition,
+                Arrays.asList(
+                        createManifestEntry(partition, indexedLaterFile),
+                        createManifestEntry(partition, unindexedEarlierFile)));
+
+        Map<BinaryRow, List<IndexedSplit>> result =
+                DefaultGlobalIndexTopoBuilder.groupFilesIntoShardsByPartition(
+                        entriesByPartition,
+                        1000L,
+                        pathFactory,
+                        Collections.singletonList(new Range(0L, 99L)));
+
+        assertThat(result).hasSize(1);
+        List<IndexedSplit> shardSplits = result.get(partition);
+        assertThat(shardSplits).hasSize(1);
+        assertThat(shardSplits.get(0).rowRanges()).containsExactly(new Range(0L, 99L));
+        assertThat(shardSplits.get(0).dataSplit().dataFiles())
+                .containsExactly(unindexedEarlierFile);
+    }
+
+    @Test
     void testGroupFilesIntoShardsByPartitionMultiplePartitions() {
         // Create two partitions
         BinaryRow partition1 = createPartition(0);
@@ -227,7 +279,7 @@ public class CreateGlobalIndexProcedureTest {
 
         // Execute
         Map<BinaryRow, List<IndexedSplit>> result =
-                CreateGlobalIndexProcedure.groupFilesIntoShardsByPartition(
+                DefaultGlobalIndexTopoBuilder.groupFilesIntoShardsByPartition(
                         entriesByPartition, 100L, pathFactory);
 
         // Verify
@@ -270,7 +322,7 @@ public class CreateGlobalIndexProcedureTest {
 
         // Execute
         Map<BinaryRow, List<IndexedSplit>> result =
-                CreateGlobalIndexProcedure.groupFilesIntoShardsByPartition(
+                DefaultGlobalIndexTopoBuilder.groupFilesIntoShardsByPartition(
                         entriesByPartition, 1000L, pathFactory);
 
         // Verify - file ending at row 999 should be in shard [0,999] only
@@ -295,7 +347,7 @@ public class CreateGlobalIndexProcedureTest {
 
         // Execute with shard size of 10
         Map<BinaryRow, List<IndexedSplit>> result =
-                CreateGlobalIndexProcedure.groupFilesIntoShardsByPartition(
+                DefaultGlobalIndexTopoBuilder.groupFilesIntoShardsByPartition(
                         entriesByPartition, 10L, pathFactory);
 
         // Verify - file [0, 24] spans 3 shards with ranges clamped:
@@ -331,7 +383,7 @@ public class CreateGlobalIndexProcedureTest {
 
         // Execute
         Map<BinaryRow, List<IndexedSplit>> result =
-                CreateGlobalIndexProcedure.groupFilesIntoShardsByPartition(
+                DefaultGlobalIndexTopoBuilder.groupFilesIntoShardsByPartition(
                         entriesByPartition, 1000L, pathFactory);
 
         // Verify - should create 2 separate DataSplits due to gap
@@ -378,7 +430,7 @@ public class CreateGlobalIndexProcedureTest {
 
         // Execute
         Map<BinaryRow, List<IndexedSplit>> result =
-                CreateGlobalIndexProcedure.groupFilesIntoShardsByPartition(
+                DefaultGlobalIndexTopoBuilder.groupFilesIntoShardsByPartition(
                         entriesByPartition, 1000L, pathFactory);
 
         // Verify - should create 2 DataSplits
@@ -429,6 +481,7 @@ public class CreateGlobalIndexProcedureTest {
                 null,
                 null,
                 firstRowId,
+                null,
                 null);
     }
 

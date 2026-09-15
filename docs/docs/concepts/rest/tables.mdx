@@ -1,0 +1,224 @@
+---
+title: "Tables"
+sidebar_position: 5
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# Tables
+
+The REST Catalog can expose three table categories. Choose one based on how the underlying data
+is organized and the capabilities implemented by your catalog service.
+
+| Category | Data model | Guide |
+| --- | --- | --- |
+| Paimon Table | Snapshot-managed data, with or without a primary key. | [Primary-key table](#primary-key-table), [Append table](#append-table) |
+| Format Table | Files in a common format, including Hive-compatible tables. | [Format Table](#format-table) |
+| Object Table | Metadata for unstructured objects in a storage directory. | [Object Table](#object-table) |
+
+## Paimon Table
+
+### Primary Key Table
+
+A primary-key table merges records with the same primary key according to its configured merge
+engine. It supports streaming updates and changelog reads. See
+[Primary Key Table](../../primary-key-table/) for bucket modes, merge engines, and changelog
+configuration.
+
+The following examples create a table with eight buckets:
+
+<Tabs groupId="primary-table">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+```sql
+CREATE TABLE my_table (
+    a INT PRIMARY KEY NOT ENFORCED,
+    b STRING
+) WITH (
+    'bucket' = '8'
+);
+```
+
+</TabItem>
+
+<TabItem value="spark-sql" label="Spark SQL">
+
+```sql
+CREATE TABLE my_table (
+    a INT,
+    b STRING
+) TBLPROPERTIES (
+    'primary-key' = 'a',
+    'bucket' = '8'
+);
+```
+
+</TabItem>
+
+</Tabs>
+
+### Append Table
+
+A table without a primary key is an append table. Streaming writes append records rather than
+applying primary-key upserts. Batch `DELETE`, `UPDATE`, and `MERGE INTO` operations are available
+where supported by the compute engine. See [Append Table](../../append-table/) for write and
+read behavior.
+
+```sql
+CREATE TABLE my_table (
+    a INT,
+    b STRING
+);
+```
+
+## Format Table
+
+A Format Table describes files in a common format, including compatible Hive tables exposed
+through the catalog. It lets engines read existing files and add new files without using Paimon's
+snapshot-managed table layout.
+
+Common formats include CSV, Parquet, ORC, JSON, and text. Mosaic is also available with the
+corresponding format module. Format availability depends on the modules and table implementation
+used by the engine.
+
+By default, partition discovery follows the directory layout. REST internal Format Tables can
+instead use `metastore.partitioned-table = true` to read registered partitions from the catalog;
+unregistered directories are then excluded from scans. This mode uses the Paimon implementation
+and cannot be combined with `format-table.implementation = engine`. See
+[partition API compatibility](./rest-api#partition-compatibility) for partition options and
+custom locations.
+
+The following examples assume that a REST Catalog and database are already selected:
+
+<Tabs groupId="format-table">
+
+<TabItem value="flink-csv" label="Flink-CSV">
+
+```sql
+CREATE TABLE my_csv_table (
+    a INT,
+    b STRING
+) WITH (
+    'type' = 'format-table',
+    'file.format' = 'csv',
+    'csv.field-delimiter' = ','
+);
+```
+
+</TabItem>
+
+<TabItem value="spark-csv" label="Spark-CSV">
+
+```sql
+CREATE TABLE my_csv_table (
+    a INT,
+    b STRING
+) USING csv OPTIONS ('csv.field-delimiter' ',');
+```
+
+</TabItem>
+
+<TabItem value="flink-parquet" label="Flink-Parquet">
+
+```sql
+CREATE TABLE my_parquet_table (
+    a INT,
+    b STRING
+) WITH (
+    'type' = 'format-table',
+    'file.format' = 'parquet'
+);
+```
+
+</TabItem>
+
+<TabItem value="spark-parquet" label="Spark-Parquet">
+
+```sql
+CREATE TABLE my_parquet_table (
+    a INT,
+    b STRING
+) USING parquet;
+```
+
+</TabItem>
+
+<TabItem value="flink-json" label="Flink-JSON">
+
+```sql
+CREATE TABLE my_json_table (
+    a INT,
+    b STRING
+) WITH (
+    'type' = 'format-table',
+    'file.format' = 'json'
+);
+```
+
+</TabItem>
+
+<TabItem value="spark-json" label="Spark-JSON">
+
+```sql
+CREATE TABLE my_json_table (
+    a INT,
+    b STRING
+) USING json;
+```
+
+</TabItem>
+
+</Tabs>
+
+## Object Table
+
+An Object Table exposes metadata for unstructured files in a storage directory. Use SQL to query
+the file list and [PVFS](./pvfs) to access file contents through a REST Catalog.
+
+REST, Hive, and JDBC catalogs support Object Tables. The available permissions and storage
+credentials depend on the catalog service. Create an Object Table without declaring user columns:
+
+<Tabs groupId="create-object-table">
+
+<TabItem value="flink-sql" label="Flink-SQL">
+
+```sql
+CREATE TABLE `my_object_table` WITH (
+  'type' = 'object-table'
+);
+```
+
+</TabItem>
+
+<TabItem value="spark-sql" label="Spark-SQL">
+
+```sql
+CREATE TABLE `my_object_table` TBLPROPERTIES (
+  'type' = 'object-table'
+);
+```
+
+</TabItem>
+
+</Tabs>

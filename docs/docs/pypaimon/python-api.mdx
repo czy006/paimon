@@ -1,0 +1,147 @@
+---
+title: "Python API"
+description: "Use the Python API to manage catalogs and control table reads, writes, and commits."
+---
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# Python API
+
+Use the Python API to manage catalogs and control table reads, writes, and commits. Start with the [quick start](./quick-start) for a runnable example. For a compact interface to text, vector, and BLOB data, see the [Multimodal API](./multimodal-api).
+
+| Task | Guide |
+| --- | --- |
+| Connect and define schemas | [Catalogs and tables](./catalogs) |
+| Write and commit data | [Batch writes](./writing) |
+| Filter, project, and plan reads | [Batch reads](./reading) |
+| Follow new snapshots | [Streaming and consumers](./streaming) |
+| Choose Arrow types or use VARIANT | [Data types](./data-types) |
+| Maintain dataset versions | [Branches and rollback](./branches), [tags](./manage-tags) |
+
+
+## Catalogs and tables
+
+<span id="create-catalog"></span>
+<span id="create-database"></span>
+<span id="create-table"></span>
+<span id="alter-table"></span>
+
+Connect to filesystem, JDBC, or REST catalogs. Create databases and tables, define partition and primary keys, and alter schemas.
+
+[Read the guide](./catalogs).
+
+## Batch writes
+
+<span id="batch-write"></span>
+<span id="commit-callback"></span>
+
+Write Arrow or pandas batches, publish a snapshot, overwrite data, and register commit callbacks.
+
+[Read the guide](./writing).
+
+## Batch reads
+
+<span id="batch-read"></span>
+<span id="predicate-pushdown"></span>
+<span id="generate-splits"></span>
+<span id="read-apache-arrow"></span>
+<span id="read-python-iterator"></span>
+<span id="read-pandas"></span>
+<span id="read-duckdb"></span>
+<span id="incremental-read"></span>
+<span id="shard-read"></span>
+<span id="explain-scan-plan"></span>
+<span id="cli"></span>
+<span id="predicate"></span>
+
+Push down predicates and projections, plan splits, and read Arrow, pandas, Python iterators, or DuckDB results. Includes incremental scans, sharding, and plan inspection.
+
+[Read the guide](./reading).
+
+## Streaming and consumers
+
+<span id="streaming-read"></span>
+<span id="basic-streaming-read"></span>
+<span id="synchronous-streaming"></span>
+<span id="manual-position-control"></span>
+<span id="filtering-streaming-data"></span>
+<span id="parallel-consumption"></span>
+<span id="row-kind-support"></span>
+<span id="consumer-management"></span>
+<span id="create-consumermanager"></span>
+<span id="get-consumer"></span>
+<span id="reset-consumer"></span>
+<span id="delete-consumer"></span>
+<span id="list-consumers"></span>
+<span id="list-all-consumer-ids"></span>
+<span id="get-minimum-next-snapshot"></span>
+<span id="expire-consumers"></span>
+<span id="clear-consumers"></span>
+<span id="branch-support"></span>
+
+Poll for new snapshots, filter streams, assign buckets to workers, and manage saved consumer positions.
+
+[Read the guide](./streaming).
+
+## Data types
+
+<span id="scalar-types"></span>
+<span id="complex-types"></span>
+<span id="variant-type"></span>
+<span id="variant-path-updates"></span>
+
+Map Arrow types to Paimon types, store semi-structured VARIANT data, and update VARIANT paths.
+
+[Read the guide](./data-types).
+
+## Branches and rollback
+
+<span id="branch-management"></span>
+<span id="create-branch"></span>
+<span id="list-branches"></span>
+<span id="check-branch-exists"></span>
+<span id="drop-branch"></span>
+<span id="rename-branch"></span>
+<span id="fast-forward"></span>
+<span id="branch-path-structure"></span>
+<span id="branch-name-validation"></span>
+<span id="rollback"></span>
+<span id="rollback-to-snapshot"></span>
+<span id="rollback-to-tag"></span>
+
+Create an empty branch or initialize one from a tag, manage branch histories, and roll back to a retained snapshot. Use [tags](./manage-tags) to pin a dataset version.
+
+[Read the guide](./branches).
+
+## Supported Features
+
+PyPaimon supports filesystem, JDBC, and REST catalogs; local storage, HDFS,
+S3, OSS, and GCS; and batch reads and writes for append and primary-key tables.
+The guides cover projections, predicates, overwrite, incremental and streaming
+reads, BLOB data, row sharding, and table version management.
+
+Primary-key reads support `deduplicate`, `first-row`, basic `partial-update`, and
+`aggregation` with supported built-in aggregators. Support depends on the engine
+configuration: for example, partial-update sequence groups and field aggregators
+are not supported, and some delete/retract options are rejected. Do not assume
+that every Java merge-engine option is available in Python.
+
+For media and column updates, use [data-evolution tables](./data-evolution).
+For optional file formats and compute engines, see [Installation](./installation).

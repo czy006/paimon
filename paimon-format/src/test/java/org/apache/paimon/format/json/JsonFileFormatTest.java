@@ -20,6 +20,7 @@ package org.apache.paimon.format.json;
 
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.data.BinaryString;
+import org.apache.paimon.data.BinaryVector;
 import org.apache.paimon.data.GenericMap;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
@@ -35,18 +36,21 @@ import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.PositionOutputStream;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.reader.RecordReader;
+import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.DataTypes;
 import org.apache.paimon.types.RowType;
 
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /** Test for {@link JsonFileFormat}. */
@@ -66,6 +70,65 @@ public class JsonFileFormatTest extends FormatReadWriteTest {
     @Override
     public String compression() {
         return HadoopCompressionType.NONE.value();
+    }
+
+    @Test
+    public void testValidateRejectsUnsupportedNestedType() {
+        JsonFileFormat format =
+                new JsonFileFormat(new FileFormatFactory.FormatContext(new Options(), 1024, 1024));
+
+        // VARIANT is not in the supported set, so it must be rejected wherever it is nested.
+        List<RowType> rejected =
+                Arrays.asList(
+                        RowType.of(DataTypes.ARRAY(DataTypes.VARIANT())),
+                        RowType.of(DataTypes.MAP(DataTypes.VARIANT(), DataTypes.STRING())),
+                        RowType.of(DataTypes.MAP(DataTypes.STRING(), DataTypes.VARIANT())),
+                        RowType.of(DataTypes.ROW(DataTypes.INT(), DataTypes.VARIANT())),
+                        RowType.of(DataTypes.ARRAY(DataTypes.ROW(DataTypes.VARIANT()))));
+        for (RowType rowType : rejected) {
+            assertThatThrownBy(() -> format.validateDataFields(rowType))
+                    .isInstanceOf(UnsupportedOperationException.class)
+                    .hasMessageContaining("Unsupported data type for JSON format");
+        }
+
+        // Supported types nested the same way still validate.
+        format.validateDataFields(
+                RowType.of(
+                        DataTypes.ARRAY(DataTypes.STRING()),
+                        DataTypes.MAP(DataTypes.STRING(), DataTypes.INT()),
+                        DataTypes.ROW(DataTypes.INT(), DataTypes.ARRAY(DataTypes.DOUBLE()))));
+    }
+
+    @Test
+    public void testUnresolvableCastFailsWithClearMessage() throws Exception {
+        JsonFileFormat format =
+                new JsonFileFormat(new FileFormatFactory.FormatContext(new Options(), 1024, 1024));
+
+        Path testFile = new Path(parent, "unresolvable_cast_" + UUID.randomUUID() + ".json");
+        try (PositionOutputStream out = fileIO.newOutputStream(testFile, true)) {
+            out.write("{\"f0\":{\"a\":1}}".getBytes(StandardCharsets.UTF_8));
+        }
+
+        // MULTISET has no cast rule from STRING. A format table is created without going
+        // through SchemaValidation, so such a column reaches the reader.
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.MULTISET(DataTypes.STRING())},
+                        new String[] {"f0"});
+
+        try (RecordReader<InternalRow> reader =
+                format.createReaderFactory(rowType, rowType, new ArrayList<>())
+                        .createReader(
+                                new FormatReaderContext(
+                                        fileIO,
+                                        testFile,
+                                        fileIO.getFileSize(testFile),
+                                        null,
+                                        null))) {
+            assertThatThrownBy(() -> reader.forEachRemaining(row -> {}))
+                    .hasRootCauseInstanceOf(UnsupportedOperationException.class)
+                    .hasRootCauseMessage("Unsupported data type for JSON format: MULTISET<STRING>");
+        }
     }
 
     @Test
@@ -101,7 +164,11 @@ public class JsonFileFormatTest extends FormatReadWriteTest {
                 format.createReaderFactory(rowType, rowType, new ArrayList<>())
                         .createReader(
                                 new FormatReaderContext(
-                                        fileIO, testFile, fileIO.getFileSize(testFile)))) {
+                                        fileIO,
+                                        testFile,
+                                        fileIO.getFileSize(testFile),
+                                        null,
+                                        null))) {
 
             InternalRowSerializer serializer = new InternalRowSerializer(rowType);
             List<InternalRow> result = new ArrayList<>();
@@ -150,7 +217,11 @@ public class JsonFileFormatTest extends FormatReadWriteTest {
                 format.createReaderFactory(rowType, rowType, new ArrayList<>())
                         .createReader(
                                 new FormatReaderContext(
-                                        fileIO, testFile, fileIO.getFileSize(testFile)))) {
+                                        fileIO,
+                                        testFile,
+                                        fileIO.getFileSize(testFile),
+                                        null,
+                                        null))) {
 
             InternalRowSerializer serializer = new InternalRowSerializer(rowType);
             List<InternalRow> result = new ArrayList<>();
@@ -210,7 +281,11 @@ public class JsonFileFormatTest extends FormatReadWriteTest {
                 format.createReaderFactory(rowType, rowType, new ArrayList<>())
                         .createReader(
                                 new FormatReaderContext(
-                                        fileIO, testFile, fileIO.getFileSize(testFile)))) {
+                                        fileIO,
+                                        testFile,
+                                        fileIO.getFileSize(testFile),
+                                        null,
+                                        null))) {
 
             InternalRowSerializer serializer = new InternalRowSerializer(rowType);
             List<InternalRow> result = new ArrayList<>();
@@ -378,6 +453,21 @@ public class JsonFileFormatTest extends FormatReadWriteTest {
         }
     }
 
+    @Test
+    public void testVectorTypeReadWrite() throws IOException {
+        RowType rowType = DataTypes.ROW(DataTypes.INT(), DataTypes.VECTOR(3, DataTypes.FLOAT()));
+
+        float[] values = new float[] {1.0f, 2.0f, 3.0f};
+        List<InternalRow> testData =
+                Arrays.asList(GenericRow.of(1, BinaryVector.fromPrimitiveArray(values)));
+
+        List<InternalRow> result = writeThenRead(new Options(), rowType, testData, "test_vector");
+
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).getInt(0)).isEqualTo(1);
+        assertThat(result.get(0).getVector(1).toFloatArray()).isEqualTo(values);
+    }
+
     @Override
     public boolean supportDataFileWithoutExtension() {
         return true;
@@ -419,7 +509,11 @@ public class JsonFileFormatTest extends FormatReadWriteTest {
                 format.createReaderFactory(rowType, rowType, new ArrayList<>())
                         .createReader(
                                 new FormatReaderContext(
-                                        fileIO, testFile, fileIO.getFileSize(testFile)))) {
+                                        fileIO,
+                                        testFile,
+                                        fileIO.getFileSize(testFile),
+                                        null,
+                                        null))) {
 
             InternalRowSerializer serializer = new InternalRowSerializer(rowType);
             List<InternalRow> result = new ArrayList<>();

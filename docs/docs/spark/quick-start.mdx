@@ -1,0 +1,106 @@
+---
+title: "Quick Start"
+---
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# Quick Start
+
+Run a local Spark SQL session, create a primary key table, and read an update back.
+The examples use Spark 3.5 with Scala 2.12. Choose the matching connector for another version in
+[Installation](./installation).
+
+## Preparation
+
+Install Spark and download the matching Paimon JAR from [Installation](./installation#download-the-connector).
+The connector's Spark minor version and Scala binary version must match your Spark distribution.
+
+## Setup
+
+Start a local session with the connector, catalog, and SQL extensions configured together:
+
+```bash
+spark-sql --master 'local[2]' \
+  --jars /path/to/paimon-spark-3.5_2.12-@@VERSION@@.jar \
+  --conf spark.sql.catalog.paimon=org.apache.paimon.spark.SparkCatalog \
+  --conf spark.sql.catalog.paimon.warehouse=file:/tmp/paimon \
+  --conf spark.sql.extensions=org.apache.paimon.spark.extensions.PaimonSparkSessionExtensions
+```
+
+Replace the JAR path with your downloaded file. The local warehouse is for this single-machine
+example; a cluster needs storage accessible to the driver and every executor. See
+[Catalogs](./catalogs) for Hive, JDBC, REST, and `SparkGenericCatalog` setup.
+
+Select the catalog and database:
+
+```sql
+USE paimon.default;
+```
+
+Use a fully qualified name such as `spark_catalog.default.other_table` to access a table in
+Spark's built-in catalog while `paimon` is selected.
+
+## Create Table
+
+```sql
+CREATE TABLE my_table (
+    k INT,
+    v STRING
+) TBLPROPERTIES (
+    'primary-key' = 'k',
+    'bucket' = '1'
+);
+```
+
+A primary key table merges records with the same key. Without the `primary-key` property,
+Paimon creates an append table. See [Create Tables, Views, and Tags](./sql-ddl) for partitioned
+and external tables.
+
+## Insert Table
+
+```sql
+INSERT INTO my_table VALUES (1, 'Hi'), (2, 'Hello');
+INSERT INTO my_table VALUES (1, 'Hello Paimon');
+```
+
+The second write updates key `1` under the default deduplicate merge engine.
+
+## Query Table
+
+```sql
+SELECT * FROM my_table ORDER BY k;
+-- 1  Hello Paimon
+-- 2  Hello
+```
+
+## Next Steps
+
+| Task | Guide |
+| --- | --- |
+| Read and write from Scala | [DataFrame API](./dataframe) |
+| Filter data or query an older snapshot | [SQL Queries](./sql-query) |
+| Overwrite partitions, update, or merge rows | [SQL Writes](./sql-write) |
+| Consume or produce streaming data | [Structured Streaming](./structured-streaming) |
+| Tune the connector or table options | [Configuration](./configuration) |
+
+## Spark Type Conversion
+
+The mapping table and timestamp, variant, and geospatial compatibility notes are in
+[Data Types](./data-types).

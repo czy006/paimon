@@ -18,10 +18,10 @@
 
 package org.apache.paimon.operation;
 
-import org.apache.paimon.data.variant.VariantAccessInfo;
 import org.apache.paimon.disk.IOManager;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.predicate.TopN;
+import org.apache.paimon.reader.ReadBatchSizer;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.table.source.Split;
 import org.apache.paimon.types.RowType;
@@ -44,8 +44,6 @@ public interface SplitRead<T> {
 
     SplitRead<T> withReadType(RowType readType);
 
-    SplitRead<T> withVariantAccess(VariantAccessInfo[] variantAccess);
-
     SplitRead<T> withFilter(@Nullable Predicate predicate);
 
     default SplitRead<T> withTopN(@Nullable TopN topN) {
@@ -53,6 +51,10 @@ public interface SplitRead<T> {
     }
 
     default SplitRead<T> withLimit(@Nullable Integer limit) {
+        return this;
+    }
+
+    default SplitRead<T> withReadBatchSizer(ReadBatchSizer sizer) {
         return this;
     }
 
@@ -81,14 +83,14 @@ public interface SplitRead<T> {
             }
 
             @Override
-            public SplitRead<R> withVariantAccess(VariantAccessInfo[] variantAccess) {
-                read.withVariantAccess(variantAccess);
+            public SplitRead<R> withFilter(@Nullable Predicate predicate) {
+                read.withFilter(predicate);
                 return this;
             }
 
             @Override
-            public SplitRead<R> withFilter(@Nullable Predicate predicate) {
-                read.withFilter(predicate);
+            public SplitRead<R> withReadBatchSizer(ReadBatchSizer sizer) {
+                read.withReadBatchSizer(sizer);
                 return this;
             }
 

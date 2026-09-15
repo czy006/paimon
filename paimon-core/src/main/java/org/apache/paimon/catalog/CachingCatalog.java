@@ -18,12 +18,14 @@
 
 package org.apache.paimon.catalog;
 
+import org.apache.paimon.CoreOptions;
 import org.apache.paimon.annotation.VisibleForTesting;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.partition.Partition;
 import org.apache.paimon.partition.PartitionStatistics;
+import org.apache.paimon.schema.Schema;
 import org.apache.paimon.schema.SchemaChange;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.Table;
@@ -51,6 +53,7 @@ import static org.apache.paimon.options.CatalogOptions.CACHE_EXPIRE_AFTER_WRITE;
 import static org.apache.paimon.options.CatalogOptions.CACHE_MANIFEST_MAX_MEMORY;
 import static org.apache.paimon.options.CatalogOptions.CACHE_MANIFEST_SMALL_FILE_MEMORY;
 import static org.apache.paimon.options.CatalogOptions.CACHE_MANIFEST_SMALL_FILE_THRESHOLD;
+import static org.apache.paimon.options.CatalogOptions.CACHE_MANIFEST_SOFT_VALUES;
 import static org.apache.paimon.options.CatalogOptions.CACHE_PARTITION_MAX_NUM;
 import static org.apache.paimon.options.CatalogOptions.CACHE_SNAPSHOT_MAX_NUM_PER_TABLE;
 import static org.apache.paimon.utils.Preconditions.checkNotNull;
@@ -96,7 +99,14 @@ public class CachingCatalog extends DelegateCatalog {
         }
 
         this.snapshotMaxNumPerTable = options.get(CACHE_SNAPSHOT_MAX_NUM_PER_TABLE);
-        this.manifestCache = SegmentsCache.create(manifestMaxMemory, manifestCacheThreshold);
+        boolean manifestCacheSoftValues = options.get(CACHE_MANIFEST_SOFT_VALUES);
+        this.manifestCache =
+                SegmentsCache.create(
+                        (int) CoreOptions.PAGE_SIZE.defaultValue().getBytes(),
+                        manifestMaxMemory,
+                        manifestCacheThreshold,
+                        expireAfterAccess,
+                        manifestCacheSoftValues);
 
         this.cachedPartitionMaxNum = options.get(CACHE_PARTITION_MAX_NUM);
 
@@ -225,12 +235,14 @@ public class CachingCatalog extends DelegateCatalog {
     }
 
     @Override
-    public Table getTable(Identifier identifier) throws TableNotExistException {
-        Table table = tableCache.getIfPresent(identifier);
-        if (table != null) {
-            return table;
-        }
+    public void replaceTable(Identifier identifier, Schema newSchema, boolean ignoreIfNotExists)
+            throws TableNotExistException {
+        super.replaceTable(identifier, newSchema, ignoreIfNotExists);
+        invalidateTable(identifier);
+    }
 
+    @Override
+    public Table getTable(Identifier identifier) throws TableNotExistException {
         // For system table, do not cache it directly. Instead, cache the origin table and then wrap
         // it to generate the system table.
         if (identifier.isSystemTable()) {
@@ -241,7 +253,7 @@ public class CachingCatalog extends DelegateCatalog {
                             identifier.getBranchName(),
                             null);
             Table originTable = getTable(originIdentifier);
-            table =
+            Table table =
                     SystemTableLoader.load(
                             checkNotNull(identifier.getSystemTableName()),
                             (FileStoreTable) originTable);
@@ -251,12 +263,21 @@ public class CachingCatalog extends DelegateCatalog {
             return table;
         }
 
-        table = wrapped.getTable(identifier);
-        putTableCache(identifier, table);
-        return table;
+        try {
+            return tableCache.get(identifier, this::loadTable);
+        } catch (TableLoadingException e) {
+            throw e.tableNotExistException();
+        }
     }
 
-    private void putTableCache(Identifier identifier, Table table) {
+    private Table loadTable(Identifier identifier) {
+        Table table;
+        try {
+            table = wrapped.getTable(identifier);
+        } catch (TableNotExistException e) {
+            throw new TableLoadingException(e);
+        }
+
         if (table instanceof FileStoreTable) {
             FileStoreTable storeTable = (FileStoreTable) table;
             storeTable.setSnapshotCache(
@@ -283,7 +304,21 @@ public class CachingCatalog extends DelegateCatalog {
             }
         }
 
-        tableCache.put(identifier, table);
+        return table;
+    }
+
+    private static class TableLoadingException extends RuntimeException {
+
+        private final TableNotExistException tableNotExistException;
+
+        private TableLoadingException(TableNotExistException cause) {
+            super(cause);
+            this.tableNotExistException = cause;
+        }
+
+        private TableNotExistException tableNotExistException() {
+            return tableNotExistException;
+        }
     }
 
     @Override
@@ -298,6 +333,36 @@ public class CachingCatalog extends DelegateCatalog {
             partitionCache.put(identifier, result);
         }
         return result;
+    }
+
+    @Override
+    public void createPartitions(Identifier identifier, List<Map<String, String>> partitions)
+            throws TableNotExistException {
+        wrapped.createPartitions(identifier, partitions);
+        if (partitionCache != null) {
+            partitionCache.invalidate(identifier);
+        }
+    }
+
+    @Override
+    public void createPartitions(
+            Identifier identifier,
+            List<Map<String, String>> partitions,
+            boolean ignoreIfExists,
+            @Nullable List<PartitionStatistics> statistics,
+            boolean replaceStatistics,
+            @Nullable List<Map<String, String>> partitionOptions)
+            throws TableNotExistException {
+        wrapped.createPartitions(
+                identifier,
+                partitions,
+                ignoreIfExists,
+                statistics,
+                replaceStatistics,
+                partitionOptions);
+        if (partitionCache != null) {
+            partitionCache.invalidate(identifier);
+        }
     }
 
     @Override
@@ -323,6 +388,13 @@ public class CachingCatalog extends DelegateCatalog {
         tableCache.invalidate(identifier);
         if (partitionCache != null) {
             partitionCache.invalidate(identifier);
+        }
+        // clear all branches of this table
+        for (Identifier i : tableCache.asMap().keySet()) {
+            if (identifier.getTableName().equals(i.getTableName())
+                    && identifier.getDatabaseName().equals(i.getDatabaseName())) {
+                tableCache.invalidate(i);
+            }
         }
     }
 

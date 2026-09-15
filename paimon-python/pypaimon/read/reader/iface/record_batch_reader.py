@@ -1,26 +1,25 @@
-################################################################################
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-# limitations under the License.
-################################################################################
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
 from abc import abstractmethod
 from typing import Iterator, Optional, TypeVar
 
 import polars
-from pyarrow import RecordBatch
+from pyarrow import RecordBatch, Table
 
 from pypaimon.read.reader.iface.record_iterator import RecordIterator
 from pypaimon.read.reader.iface.record_reader import RecordReader
@@ -34,6 +33,15 @@ class RecordBatchReader(RecordReader):
     """
     The reader that reads the pyarrow batches of records.
     """
+
+    file_io = None
+    blob_field_indices = None
+    vector_field_indices = None
+
+    def _adopt_metadata(self, reader: "RecordBatchReader") -> None:
+        self.file_io = reader.file_io
+        self.blob_field_indices = reader.blob_field_indices
+        self.vector_field_indices = reader.vector_field_indices
 
     @abstractmethod
     def read_arrow_batch(self) -> Optional[RecordBatch]:
@@ -50,25 +58,41 @@ class RecordBatchReader(RecordReader):
         arrow_batch = self.read_arrow_batch()
         if arrow_batch is None:
             return None
-        return polars.from_arrow(arrow_batch)
+        # Older Polars versions accept Arrow Table but not RecordBatch.
+        return polars.from_arrow(Table.from_batches([arrow_batch]))
 
     def tuple_iterator(self) -> Optional[Iterator[tuple]]:
         df = self.read_next_df()
         if df is None:
             return None
-        return df.iter_rows()
+        return self._iter_df_rows(df)
 
     def read_batch(self) -> Optional[RecordIterator[InternalRow]]:
         df = self.read_next_df()
         if df is None:
             return None
-        return InternalRowWrapperIterator(df.iter_rows(), df.width)
+        return InternalRowWrapperIterator(
+            self._iter_df_rows(df), df.width, self.file_io,
+            self.blob_field_indices, self.vector_field_indices)
+
+    @staticmethod
+    def _iter_df_rows(df) -> Iterator[tuple]:
+        iter_rows = getattr(df, "iter_rows", None)
+        if iter_rows is not None:
+            return iter_rows()
+        # Older Polars exposes eager row iteration as rows().
+        return iter(df.rows())
 
 
 class InternalRowWrapperIterator(RecordIterator[InternalRow]):
-    def __init__(self, iterator: Iterator[tuple], width: int):
+    def __init__(self, iterator: Iterator[tuple], width: int,
+                 file_io=None, blob_field_indices=None,
+                 vector_field_indices=None):
         self._iterator = iterator
-        self._reused_row = OffsetRow(None, 0, width)
+        self._reused_row = OffsetRow(None, 0, width,
+                                     file_io=file_io,
+                                     blob_field_indices=blob_field_indices,
+                                     vector_field_indices=vector_field_indices)
 
     def next(self) -> Optional[InternalRow]:
         row_tuple = next(self._iterator, None)
@@ -84,6 +108,7 @@ class RowPositionReader(RecordBatchReader):
         self._data_reader = data_reader
         self._row_iterator = RowPositionRecordIterator()
         self.batch_pos = 0
+        self._adopt_metadata(data_reader)
 
     def read_arrow_batch(self) -> Optional[RecordBatch]:
         batch = self._data_reader.read_arrow_batch()
@@ -126,3 +151,12 @@ class RowPositionRecordIterator(RecordIterator[tuple]):
 
     def __next__(self):
         return self.next()
+
+
+class EmptyRecordBatchReader(RecordBatchReader):
+
+    def read_arrow_batch(self) -> Optional[RecordBatch]:
+        return None
+
+    def close(self):
+        return None

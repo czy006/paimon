@@ -96,11 +96,12 @@ public class RewriteFileIndexProcedure extends BaseProcedure {
         Identifier tableIdent = toIdentifier(args.getString(0), PARAMETERS[0].name());
         String where = args.isNullAt(1) ? null : args.getString(1);
 
-        return modifyPaimonTable(
+        return modifySparkTable(
                 tableIdent,
-                t -> {
+                sparkTable -> {
+                    org.apache.paimon.table.Table t = sparkTable.getTable();
                     FileStoreTable table = (FileStoreTable) t;
-                    DataSourceV2Relation relation = createRelation(tableIdent);
+                    DataSourceV2Relation relation = createRelation(tableIdent, sparkTable);
                     PartitionPredicate partitionPredicate =
                             SparkProcedureUtils.convertToPartitionPredicate(
                                     where,
@@ -189,6 +190,9 @@ public class RewriteFileIndexProcedure extends BaseProcedure {
                 BinaryRow partition = entry.partition();
                 int bucket = entry.bucket();
                 DataFileMeta indexedFile = fileIndexProcessor.process(partition, bucket, entry);
+                if (entry.file().equals(indexedFile)) {
+                    continue;
+                }
 
                 CommitMessageImpl commitMessage =
                         new CommitMessageImpl(

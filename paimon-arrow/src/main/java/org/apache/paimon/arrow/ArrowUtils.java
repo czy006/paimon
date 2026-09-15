@@ -22,12 +22,15 @@ import org.apache.paimon.arrow.vector.ArrowCStruct;
 import org.apache.paimon.arrow.writer.ArrowFieldWriter;
 import org.apache.paimon.arrow.writer.ArrowFieldWriterFactoryVisitor;
 import org.apache.paimon.data.Timestamp;
+import org.apache.paimon.data.variant.Variant;
 import org.apache.paimon.table.SpecialFields;
 import org.apache.paimon.types.ArrayType;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.MapType;
 import org.apache.paimon.types.RowType;
+import org.apache.paimon.types.VariantType;
+import org.apache.paimon.types.VectorType;
 
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
@@ -45,6 +48,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 
 import javax.annotation.Nullable;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.time.Instant;
@@ -52,7 +56,9 @@ import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 import static org.apache.paimon.utils.StringUtils.toLowerCaseIfNeed;
@@ -128,21 +134,18 @@ public class ArrowUtils {
             int depth,
             ArrowFieldTypeConversion.ArrowFieldTypeVisitor visitor) {
         FieldType fieldType = dataType.accept(visitor);
-        fieldType =
-                new FieldType(
-                        fieldType.isNullable(),
-                        fieldType.getType(),
-                        fieldType.getDictionary(),
-                        Collections.singletonMap(PARQUET_FIELD_ID, String.valueOf(fieldId)));
+        fieldType = withFieldId(fieldType, fieldId);
         List<Field> children = null;
-        if (dataType instanceof ArrayType) {
+        if (dataType instanceof ArrayType || dataType instanceof VectorType) {
+            final DataType elementType;
+            if (dataType instanceof VectorType) {
+                elementType = ((VectorType) dataType).getElementType();
+            } else {
+                elementType = ((ArrayType) dataType).getElementType();
+            }
             Field field =
                     toArrowField(
-                            ListVector.DATA_VECTOR_NAME,
-                            fieldId,
-                            ((ArrayType) dataType).getElementType(),
-                            depth + 1,
-                            visitor);
+                            ListVector.DATA_VECTOR_NAME, fieldId, elementType, depth + 1, visitor);
             FieldType typeInner = field.getFieldType();
             field =
                     new Field(
@@ -151,11 +154,10 @@ public class ArrowUtils {
                                     typeInner.isNullable(),
                                     typeInner.getType(),
                                     typeInner.getDictionary(),
-                                    Collections.singletonMap(
-                                            PARQUET_FIELD_ID,
-                                            String.valueOf(
-                                                    SpecialFields.getArrayElementFieldId(
-                                                            fieldId, depth + 1)))),
+                                    withFieldIdMetadata(
+                                            typeInner,
+                                            SpecialFields.getArrayElementFieldId(
+                                                    fieldId, depth + 1))),
                             field.getChildren());
             children = Collections.singletonList(field);
         } else if (dataType instanceof MapType) {
@@ -176,11 +178,9 @@ public class ArrowUtils {
                                     keyType.isNullable(),
                                     keyType.getType(),
                                     keyType.getDictionary(),
-                                    Collections.singletonMap(
-                                            PARQUET_FIELD_ID,
-                                            String.valueOf(
-                                                    SpecialFields.getMapKeyFieldId(
-                                                            fieldId, depth + 1)))),
+                                    withFieldIdMetadata(
+                                            keyType,
+                                            SpecialFields.getMapKeyFieldId(fieldId, depth + 1))),
                             keyField.getChildren());
 
             Field valueField =
@@ -198,11 +198,9 @@ public class ArrowUtils {
                                     valueType.isNullable(),
                                     valueType.getType(),
                                     valueType.getDictionary(),
-                                    Collections.singletonMap(
-                                            PARQUET_FIELD_ID,
-                                            String.valueOf(
-                                                    SpecialFields.getMapValueFieldId(
-                                                            fieldId, depth + 1)))),
+                                    withFieldIdMetadata(
+                                            valueType,
+                                            SpecialFields.getMapValueFieldId(fieldId, depth + 1))),
                             valueField.getChildren());
 
             FieldType structType =
@@ -219,6 +217,17 @@ public class ArrowUtils {
                             Arrays.asList(keyField, valueField));
 
             children = Collections.singletonList(mapField);
+        } else if (dataType instanceof VariantType) {
+            children =
+                    Arrays.asList(
+                            new Field(
+                                    Variant.VALUE,
+                                    new FieldType(false, Types.MinorType.VARBINARY.getType(), null),
+                                    null),
+                            new Field(
+                                    Variant.METADATA,
+                                    new FieldType(false, Types.MinorType.VARBINARY.getType(), null),
+                                    null));
         } else if (dataType instanceof RowType) {
             RowType rowType = (RowType) dataType;
             children = new ArrayList<>();
@@ -227,6 +236,23 @@ public class ArrowUtils {
             }
         }
         return new Field(fieldName, fieldType, children);
+    }
+
+    private static FieldType withFieldId(FieldType fieldType, int fieldId) {
+        return new FieldType(
+                fieldType.isNullable(),
+                fieldType.getType(),
+                fieldType.getDictionary(),
+                withFieldIdMetadata(fieldType, fieldId));
+    }
+
+    private static Map<String, String> withFieldIdMetadata(FieldType fieldType, int fieldId) {
+        Map<String, String> metadata = new LinkedHashMap<>();
+        if (fieldType.getMetadata() != null) {
+            metadata.putAll(fieldType.getMetadata());
+        }
+        metadata.put(PARQUET_FIELD_ID, String.valueOf(fieldId));
+        return metadata;
     }
 
     public static ArrowFieldWriter[] createArrowFieldWriters(
@@ -238,7 +264,7 @@ public class ArrowUtils {
             fieldWriters[i] =
                     rowType.getTypeAt(i)
                             .accept(ArrowFieldWriterFactoryVisitor.INSTANCE)
-                            .create(vectors.get(i), rowType.isNullable());
+                            .create(vectors.get(i), rowType.getTypeAt(i).isNullable());
         }
 
         return fieldWriters;
@@ -260,11 +286,38 @@ public class ArrowUtils {
         return ArrowCStruct.of(array, schema);
     }
 
+    /** Releases Arrow C Data callbacks that have not already been consumed by native code. */
+    public static void releaseCDataIfNeeded(ArrowArray array, ArrowSchema schema) {
+        try {
+            if (array.snapshot().release != 0) {
+                array.release();
+            }
+        } finally {
+            if (schema.snapshot().release != 0) {
+                schema.release();
+            }
+        }
+    }
+
+    public static byte[] serializeToIpc(VectorSchemaRoot vsr) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        serializeToIpc(vsr, out);
+        return out.toByteArray();
+    }
+
+    /**
+     * Returns whether the schema root contains at least one vector and all top-level and nested
+     * vectors share the root allocator of the supplied allocator.
+     */
+    public static boolean hasSameRootAllocator(
+            VectorSchemaRoot vectorSchemaRoot, BufferAllocator allocator) {
+        List<FieldVector> vectors = vectorSchemaRoot.getFieldVectors();
+        return !vectors.isEmpty() && allVectorsShareRootWith(vectors, allocator.getRoot());
+    }
+
     public static void serializeToIpc(VectorSchemaRoot vsr, OutputStream out) {
         try (ArrowStreamWriter writer = new ArrowStreamWriter(vsr, null, out)) {
-            writer.start();
             writer.writeBatch();
-            writer.end();
         } catch (IOException e) {
             throw new RuntimeException("Failed to serialize VectorSchemaRoot to IPC", e);
         }
@@ -272,7 +325,7 @@ public class ArrowUtils {
 
     private static long nonCastedTimestampToEpoch(Timestamp timestamp, int precision) {
         if (precision == 0) {
-            return timestamp.getMillisecond() / 1000;
+            return Math.floorDiv(timestamp.getMillisecond(), 1000L);
         } else if (precision >= 1 && precision <= 3) {
             return timestamp.getMillisecond();
         } else if (precision >= 4 && precision <= 6) {
@@ -294,5 +347,16 @@ public class ArrowUtils {
         } else {
             return instant.getEpochSecond() * 1_000_000_000 + instant.getNano();
         }
+    }
+
+    private static boolean allVectorsShareRootWith(
+            List<FieldVector> vectors, BufferAllocator expectedRoot) {
+        for (FieldVector vector : vectors) {
+            if (vector.getAllocator().getRoot() != expectedRoot
+                    || !allVectorsShareRootWith(vector.getChildrenFromFields(), expectedRoot)) {
+                return false;
+            }
+        }
+        return true;
     }
 }

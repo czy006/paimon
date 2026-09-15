@@ -1,0 +1,190 @@
+---
+title: "Consumer ID"
+sidebar_position: 5
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# Consumer ID
+
+A consumer ID records a streaming reader's next snapshot in the table. It provides two related
+features:
+
+- **Retain needed history:** expiration respects active consumers so their required snapshots
+  or changelogs remain available.
+- **Resume table progress:** a new reader can start from the recorded snapshot without restoring
+  Flink state. This restores table consumption progress, not downstream operator or sink state.
+
+![A consumer records its next snapshot and protects still-needed history from expiration; reset progress only after stopping the reader.](/img/flink-consumer-progress.svg)
+
+## Usage
+
+Configure a consumer lifetime before starting the reader. Without expiration, an abandoned
+consumer can keep history retained indefinitely. Choose a lifetime that covers the downtime you
+intend to support.
+
+```sql
+ALTER TABLE t SET ('consumer.expiration-time' = '1 d');
+```
+
+Restart existing streaming writers so they pick up the option. Consumer expiration is checked
+during table commits. Then start the reader with a consumer ID:
+
+```sql
+SET 'execution.runtime-mode' = 'streaming';
+SET 'execution.checkpointing.interval' = '10 s';
+
+-- The default consumer mode is exactly-once.
+SELECT * FROM t /*+ OPTIONS('consumer-id' = 'myid') */;
+```
+
+## Ignore Progress
+
+Set `consumer.ignore-progress = true` when the consumer should protect the reader's required
+history but a fresh job should choose its startup position from scan options instead of the
+stored consumer position. For example, follow only new changes on a fresh start:
+
+```sql
+SELECT * FROM t /*+ OPTIONS(
+    'consumer-id' = 'myid',
+    'consumer.ignore-progress' = 'true',
+    'scan.mode' = 'latest'
+) */;
+```
+
+This setting affects fresh scan initialization. It is not an instruction to discard restored
+Flink checkpoint or savepoint state.
+
+## Consumer Mode
+
+| Mode | How progress is recorded | Tradeoff |
+| --- | --- | --- |
+| `exactly-once` (default) | Align snapshot consumption with checkpoints. | Provides an exact table resume position through the consumer. |
+| `at-least-once` | Let readers progress at different rates and record the slowest reader's next snapshot. | Avoids snapshot alignment; restarting from the consumer can replay data already processed by faster readers. Supports capabilities such as watermark alignment. |
+
+```sql
+SELECT * FROM t /*+ OPTIONS(
+    'consumer-id' = 'myid',
+    'consumer.mode' = 'at-least-once'
+) */;
+```
+
+:::warning
+
+The two consumer modes use different Flink state implementations. Do not restore a checkpoint
+or savepoint from one mode into a job configured with the other mode. Consumer progress alone
+does not provide end-to-end recovery of a stateful pipeline; retain Flink state when it is needed.
+
+:::
+
+## Reset Consumer
+
+Stop the streaming reader using this consumer ID before resetting or deleting its progress.
+Set `next_snapshot_id` to the next snapshot to consume; omit it to delete the consumer.
+Choose a snapshot whose required history is still retained.
+
+The named SQL examples below require Flink 1.19+. For positional signatures on Flink 1.18,
+see [Consumer Procedures](./procedures/consumers).
+
+Run the following command:
+
+<Tabs groupId="reset-consumer">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+```sql
+CALL sys.reset_consumer(
+    `table` => 'default.t',
+    consumer_id => 'myid',
+    next_snapshot_id => CAST(10 AS BIGINT)
+);
+
+-- Delete the consumer instead of resetting its position.
+CALL sys.reset_consumer(`table` => 'default.t', consumer_id => 'myid');
+```
+
+</TabItem>
+
+<TabItem value="flink-action" label="Flink Action">
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    reset-consumer \
+    --warehouse <warehouse-path> \
+    --database <database-name> \
+    --table <table-name> \
+    --consumer_id <consumer-id> \
+    [--next_snapshot <next-snapshot-id>] \
+    [--catalog_conf <paimon-catalog-conf> [--catalog_conf <paimon-catalog-conf> ...]]
+
+# Omit --next_snapshot to delete the consumer.
+```
+
+</TabItem>
+
+</Tabs>
+
+## Clear Consumers
+
+Clear consumers in bulk using inclusion and exclusion regular expressions. Stop readers that
+use the selected consumer IDs first. Removing a consumer also removes its protection against
+snapshot expiration.
+
+Run the following command:
+
+<Tabs groupId="clear-consumers">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+```sql
+CALL sys.clear_consumers(
+    `table` => 'default.t',
+    including_consumers => 'test_.*',
+    excluding_consumers => 'test_keep'
+);
+-- Omit including_consumers only when you intend to include every consumer
+-- that is not matched by excluding_consumers.
+```
+
+</TabItem>
+
+<TabItem value="flink-action" label="Flink Action">
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    clear_consumers \
+    --warehouse <warehouse-path> \
+    --database <database-name> \
+    --table <table-name> \
+    [--including_consumers <including-consumers>] \
+    [--excluding_consumers <excluding-consumers>] \
+    [--catalog_conf <paimon-catalog-conf> [--catalog_conf <paimon-catalog-conf> ...]]
+
+# Omit --including_consumers to clear all consumers except those excluded.
+```
+
+</TabItem>
+
+</Tabs>

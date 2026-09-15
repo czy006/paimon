@@ -30,6 +30,7 @@ import org.apache.paimon.types.SmallIntType;
 import org.apache.paimon.types.TinyIntType;
 
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 
 import static org.apache.paimon.utils.ListUtils.isNullOrEmpty;
@@ -55,16 +56,21 @@ public class PushDownUtils {
                 || type instanceof DateType;
     }
 
-    public static boolean minmaxAvailable(DataSplit split, Set<String> columns) {
+    public static boolean minmaxAvailable(Split split, Set<String> columns) {
+        if (!(split instanceof DataSplit)) {
+            return false;
+        }
+
+        DataSplit dataSplit = (DataSplit) split;
         if (isNullOrEmpty(columns)) {
             return false;
         }
 
-        if (!split.rawConvertible()) {
+        if (!dataSplit.rawConvertible()) {
             return false;
         }
 
-        return split.dataFiles().stream()
+        return dataSplit.dataFiles().stream()
                 .map(DataFileMeta::valueStatsCols)
                 .allMatch(
                         valueStatsCols ->
@@ -72,5 +78,22 @@ public class PushDownUtils {
                                 // null
                                 valueStatsCols == null
                                         || new HashSet<>(valueStatsCols).containsAll(columns));
+    }
+
+    /** Returns whether every data file in the split has tight stats. */
+    public static boolean tightBoundsAvailable(Split split) {
+        if (!(split instanceof DataSplit)) {
+            return false;
+        }
+        DataSplit dataSplit = (DataSplit) split;
+        List<DataFileMeta> files = dataSplit.dataFiles();
+        List<DeletionFile> dvs = dataSplit.deletionFiles().orElse(null);
+        for (int i = 0; i < files.size(); i++) {
+            DeletionFile dv = dvs == null ? null : dvs.get(i);
+            if (!DvAwareStats.isTightBounds(files.get(i), dv)) {
+                return false;
+            }
+        }
+        return true;
     }
 }

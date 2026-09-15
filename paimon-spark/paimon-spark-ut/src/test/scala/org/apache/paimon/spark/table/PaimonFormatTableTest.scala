@@ -22,8 +22,11 @@ import org.apache.paimon.catalog.Identifier
 import org.apache.paimon.fs.Path
 import org.apache.paimon.spark.PaimonSparkTestWithRestCatalogBase
 import org.apache.paimon.table.FormatTable
+import org.apache.paimon.table.format.FormatDataSplit
 
 import org.apache.spark.sql.Row
+import org.apache.spark.sql.connector.catalog.TableCapability
+import org.apache.spark.sql.connector.catalog.TableCatalog
 
 class PaimonFormatTableTest extends PaimonSparkTestWithRestCatalogBase {
 
@@ -48,13 +51,6 @@ class PaimonFormatTableTest extends PaimonSparkTestWithRestCatalogBase {
           "'format-table.implementation'='paimon') PARTITIONED BY (`ds` bigint)")
       val table =
         paimonCatalog.getTable(Identifier.create("test_db", tableName)).asInstanceOf[FormatTable]
-      val readTable =
-        paimonCatalog
-          .getTable(Identifier.create("test_db", s"$readTableName"))
-          .asInstanceOf[FormatTable]
-
-      table.fileIO().mkdirs(new Path(table.location()))
-      readTable.fileIO().mkdirs(new Path(readTable.location()))
 
       val partition = 20250920
       val partitionPath = new Path(table.location(), s"ds=$partition")
@@ -107,9 +103,6 @@ class PaimonFormatTableTest extends PaimonSparkTestWithRestCatalogBase {
            |CREATE TABLE $tableName (age INT, name STRING)
            |USING CSV TBLPROPERTIES ('format-table.implementation'='paimon', 'file.compression'='gzip', 'lineSep'='abc')
            |""".stripMargin)
-      val table =
-        paimonCatalog.getTable(Identifier.create("test_db", tableName)).asInstanceOf[FormatTable]
-      table.fileIO().mkdirs(new Path(table.location()))
       spark.sql(s"INSERT INTO $tableName  VALUES (5, 'ab'), (7, 'Larry')")
       checkAnswer(
         spark.sql(s"SELECT age, name FROM $tableName ORDER BY age"),
@@ -124,13 +117,9 @@ class PaimonFormatTableTest extends PaimonSparkTestWithRestCatalogBase {
       sql(
         s"CREATE TABLE $tableName (`ds` bigint, age INT, `ds1` bigint, name STRING, `ds2` bigint) USING ORC TBLPROPERTIES (" +
           s"'format-table.implementation'='paimon') PARTITIONED BY (`ds`, `ds1`, `ds2`)")
-      val table =
-        paimonCatalog.getTable(Identifier.create("test_db", tableName)).asInstanceOf[FormatTable]
-      val partition = 20250920
-      table.fileIO().mkdirs(new Path(table.location()))
       spark.sql(s"INSERT INTO $tableName  VALUES (5, 11, 12, 'ab', 13), (7, 11, 12, 'Larry', 13)")
       checkAnswer(
-        spark.sql(s"SELECT ds, age, ds1, name, ds2 FROM $tableName ORDER BY age"),
+        spark.sql(s"SELECT ds, age, ds1, name, ds2 FROM $tableName ORDER BY ds"),
         Row(5, 11, 12, "ab", 13) :: Row(7, 11, 12, "Larry", 13) :: Nil
       )
     }
@@ -147,6 +136,38 @@ class PaimonFormatTableTest extends PaimonSparkTestWithRestCatalogBase {
     }
   }
 
+  test("PaimonFormatTable: create table like copies properties for same provider") {
+    assume(gteqSpark3_4)
+    withTable("source_tbl", "target_tbl") {
+      sql("""
+            |CREATE TABLE source_tbl (
+            |  id INT,
+            |  pt STRING
+            |) USING CSV
+            |PARTITIONED BY (pt)
+            |COMMENT 'source comment'
+            |TBLPROPERTIES (
+            |  'k' = 'v',
+            |  'csv.field-delimiter' = ';'
+            |)
+            |""".stripMargin)
+
+      sql("""
+            |CREATE TABLE target_tbl
+            |LIKE source_tbl
+            |""".stripMargin)
+
+      val target =
+        paimonCatalog.getTable(Identifier.create("test_db", "target_tbl")).asInstanceOf[FormatTable]
+      assert(target.partitionKeys().size() == 1)
+      assert(target.partitionKeys().get(0) == "pt")
+      assert(target.comment.isPresent)
+      assert(target.comment.get == "source comment")
+      assert(target.options().get("k") == "v")
+      assert(target.options().get("csv.field-delimiter") == ";")
+    }
+  }
+
   test("PaimonFormatTable non partition table overwrite: csv") {
     val tableName = "paimon_non_partiiton_overwrite_test"
     withTable(tableName) {
@@ -154,9 +175,6 @@ class PaimonFormatTableTest extends PaimonSparkTestWithRestCatalogBase {
                    |CREATE TABLE $tableName (age INT, name STRING)
                    |USING CSV TBLPROPERTIES ('format-table.implementation'='paimon')
                    |""".stripMargin)
-      val table =
-        paimonCatalog.getTable(Identifier.create("test_db", tableName)).asInstanceOf[FormatTable]
-      table.fileIO().mkdirs(new Path(table.location()))
       spark.sql(s"INSERT INTO $tableName  VALUES (5, 'Ben'), (7, 'Larry')")
       checkAnswer(
         spark.sql(s"SELECT age, name FROM $tableName ORDER BY age"),
@@ -178,9 +196,6 @@ class PaimonFormatTableTest extends PaimonSparkTestWithRestCatalogBase {
                    |USING CSV TBLPROPERTIES ('format-table.implementation'='paimon')
                    |PARTITIONED BY (id INT)
                    |""".stripMargin)
-      val table =
-        paimonCatalog.getTable(Identifier.create("test_db", tableName)).asInstanceOf[FormatTable]
-      table.fileIO().mkdirs(new Path(table.location()))
       spark.sql(s"INSERT INTO $tableName PARTITION (id = 1) VALUES (5, 'Ben'), (7, 'Larry')")
       spark.sql(s"INSERT OVERWRITE $tableName PARTITION (id = 1) VALUES (5, 'Jerry'), (7, 'Tom')")
       checkAnswer(
@@ -188,11 +203,21 @@ class PaimonFormatTableTest extends PaimonSparkTestWithRestCatalogBase {
         Row(1, 5, "Jerry") :: Row(1, 7, "Tom") :: Nil
       )
       spark.sql(s"INSERT INTO $tableName PARTITION (id = 3) VALUES (5, 'Alice')")
+      // No PARTITION clause under Spark's default STATIC mode: the statement is about the whole
+      // table, so the partition it does not write is replaced too.
       spark.sql(s"INSERT OVERWRITE $tableName VALUES (5, 'Jerry', 1), (7, 'Tom', 2)")
       checkAnswer(
         spark.sql(s"SELECT id, age, name FROM $tableName ORDER BY id, age"),
-        Row(1, 5, "Jerry") :: Row(2, 7, "Tom") :: Row(3, 5, "Alice") :: Nil
+        Row(1, 5, "Jerry") :: Row(2, 7, "Tom") :: Nil
       )
+      withSparkSQLConf("spark.sql.sources.partitionOverwriteMode" -> "dynamic") {
+        spark.sql(s"INSERT INTO $tableName PARTITION (id = 3) VALUES (5, 'Alice')")
+        spark.sql(s"INSERT OVERWRITE $tableName VALUES (9, 'Jerry', 1)")
+        checkAnswer(
+          spark.sql(s"SELECT id, age, name FROM $tableName ORDER BY id, age"),
+          Row(1, 9, "Jerry") :: Row(2, 7, "Tom") :: Row(3, 5, "Alice") :: Nil
+        )
+      }
     }
   }
 
@@ -201,9 +226,6 @@ class PaimonFormatTableTest extends PaimonSparkTestWithRestCatalogBase {
     withTable(tableName) {
       sql(s"CREATE TABLE $tableName (f0 INT, f1 string) USING CSV TBLPROPERTIES (" +
         s"'seq'='|', 'lineSep'='\n', 'format-table.implementation'='paimon') PARTITIONED BY (`ds` bigint)")
-      val table =
-        paimonCatalog.getTable(Identifier.create("test_db", tableName)).asInstanceOf[FormatTable]
-      table.fileIO().mkdirs(new Path(table.location()))
       val partition = 20250920
       sql(
         s"INSERT INTO $tableName VALUES (1, 'asfasdfsdf', $partition), (2, 'asfasdfsdf', $partition)")
@@ -219,9 +241,6 @@ class PaimonFormatTableTest extends PaimonSparkTestWithRestCatalogBase {
     withTable(tableName) {
       sql(s"CREATE TABLE $tableName (f0 INT, f1 string) USING CSV TBLPROPERTIES (" +
         s"'format-table.implementation'='paimon','format-table.partition-path-only-value'='true') PARTITIONED BY (`ds` bigint)")
-      val table =
-        paimonCatalog.getTable(Identifier.create("test_db", tableName)).asInstanceOf[FormatTable]
-      table.fileIO().mkdirs(new Path(table.location()))
       val partition = 20250920
       sql(
         s"INSERT INTO $tableName VALUES (1, 'asfasdfsdf', $partition), (2, 'asfasdfsdf', $partition)")
@@ -233,6 +252,103 @@ class PaimonFormatTableTest extends PaimonSparkTestWithRestCatalogBase {
         sql(s"SELECT ds, f0 FROM $tableName where ds = $partition order by f0 limit 1"),
         Seq(Row(partition, 1))
       )
+    }
+  }
+
+  test("PaimonFormatTable: max_pt picks the largest partition") {
+    val tableName = "max_pt_t"
+    withTable(tableName) {
+      sql(
+        s"CREATE TABLE $tableName (f0 INT) USING CSV PARTITIONED BY (ds STRING) " +
+          "TBLPROPERTIES ('format-table.implementation'='paimon', " +
+          "'metastore.partitioned-table'='true')")
+      val table =
+        paimonCatalog.getTable(Identifier.create("test_db", tableName)).asInstanceOf[FormatTable]
+      assert(table.partitionManager() != null)
+      sql(s"INSERT INTO $tableName VALUES (1, '20240101')")
+      sql(s"INSERT INTO $tableName VALUES (2, '20240103')")
+      sql(s"INSERT INTO $tableName VALUES (3, '20240102')")
+
+      // Two things used to stop max_pt on a format table: it is not a SparkTable, and
+      // catalog partitions report zero before the partition-statistics contract exists.
+      checkAnswer(sql(s"SELECT sys.max_pt('test_db.$tableName')"), Seq(Row("20240103")))
+      checkAnswer(
+        sql(s"SELECT * FROM $tableName WHERE ds = sys.max_pt('test_db.$tableName')"),
+        Seq(Row(2, "20240103")))
+    }
+  }
+
+  test("PaimonFormatTable: max_pt skips the default partition") {
+    val tableName = "max_pt_null"
+    withTable(tableName) {
+      sql(
+        s"CREATE TABLE $tableName (f0 INT) USING CSV PARTITIONED BY (ds STRING) " +
+          "TBLPROPERTIES ('format-table.implementation'='paimon', " +
+          "'metastore.partitioned-table'='true')")
+      sql(s"INSERT INTO $tableName VALUES (1, '20240101')")
+      // A null partition value comes back as a real null, which the typed comparator would
+      // dereference; it is also not what anyone means by the max partition.
+      sql(s"INSERT INTO $tableName VALUES (2, null)")
+
+      checkAnswer(sql(s"SELECT sys.max_pt('test_db.$tableName')"), Seq(Row("20240101")))
+    }
+  }
+
+  test("PaimonFormatTable: max_pt skips an empty registered partition") {
+    val tableName = "max_pt_empty"
+    withTable(tableName) {
+      sql(
+        s"CREATE TABLE $tableName (f0 INT) USING CSV PARTITIONED BY (ds STRING) " +
+          "TBLPROPERTIES ('format-table.implementation'='paimon', " +
+          "'metastore.partitioned-table'='true')")
+      sql(s"INSERT INTO $tableName VALUES (1, '20240101')")
+      sql(s"ALTER TABLE $tableName ADD PARTITION (ds='20240103')")
+
+      checkAnswer(sql(s"SELECT sys.max_pt('test_db.$tableName')"), Seq(Row("20240101")))
+    }
+  }
+
+  test("PaimonFormatTable: max_pt skips an empty filesystem partition directory") {
+    val tableName = "max_pt_empty_dir"
+    withTable(tableName) {
+      sql(
+        s"CREATE TABLE $tableName (f0 INT) USING CSV PARTITIONED BY (ds STRING) " +
+          "TBLPROPERTIES ('format-table.implementation'='paimon')")
+      sql(s"INSERT INTO $tableName VALUES (1, '20240101')")
+      val table =
+        paimonCatalog.getTable(Identifier.create("test_db", tableName)).asInstanceOf[FormatTable]
+      assert(table.partitionManager() == null)
+      table.fileIO().mkdirs(new Path(table.location(), "ds=20240103"))
+
+      checkAnswer(sql(s"SELECT sys.max_pt('test_db.$tableName')"), Seq(Row("20240101")))
+    }
+  }
+
+  test("max_pt on a FileStoreTable skips a null partition instead of failing") {
+    val tableName = "max_pt_fst_null"
+    withTable(tableName) {
+      sql(s"CREATE TABLE $tableName (id INT, ds STRING) USING paimon PARTITIONED BY (ds)")
+      sql(s"INSERT INTO $tableName VALUES (1, '20240101')")
+      sql(s"INSERT INTO $tableName VALUES (2, null)")
+
+      // This is a behaviour change for FileStoreTable, not only for format tables: a null
+      // top-level partition value used to reach InternalRowUtils.compare and throw, and is now
+      // skipped. Pinned here so the change is visible rather than incidental.
+      checkAnswer(sql(s"SELECT sys.max_pt('test_db.$tableName')"), Seq(Row("20240101")))
+    }
+  }
+
+  test("PaimonFormatTable: max_pt rejects an unpartitioned table") {
+    val tableName = "max_pt_flat"
+    withTable(tableName) {
+      sql(
+        s"CREATE TABLE $tableName (f0 INT) USING CSV " +
+          "TBLPROPERTIES ('format-table.implementation'='paimon')")
+      sql(s"INSERT INTO $tableName VALUES (1)")
+      val e = intercept[Exception] {
+        sql(s"SELECT sys.max_pt('test_db.$tableName')").collect()
+      }
+      assert(e.getMessage.contains("not a partitioned table"))
     }
   }
 
@@ -251,9 +367,6 @@ class PaimonFormatTableTest extends PaimonSparkTestWithRestCatalogBase {
           s"CREATE TABLE $tableName (id INT, name STRING, value DOUBLE) USING $format " +
             s"TBLPROPERTIES ('file.compression'='$compression', 'seq'=',', 'lineSep'='\n'," +
             " 'format-table.implementation'='paimon')")
-        val path =
-          paimonCatalog.getTable(Identifier.create("test_db", tableName)).options().get("path")
-        fileIO.mkdirs(new Path(path))
         // Insert data using our new write implementation
         sql(s"INSERT INTO $tableName VALUES (1, 'Alice', 10.5)")
         sql(s"INSERT INTO $tableName VALUES (2, 'Bob', 20.7)")
@@ -306,10 +419,6 @@ class PaimonFormatTableTest extends PaimonSparkTestWithRestCatalogBase {
           s"CREATE TABLE $tableName (id INT, name STRING, value DOUBLE) USING $format " +
             s"PARTITIONED BY (dept STRING) TBLPROPERTIES ('file.compression'='$compression'," +
             " 'format-table.implementation'='paimon')")
-        val paimonTable = paimonCatalog.getTable(Identifier.create("test_db", tableName))
-        val path =
-          paimonCatalog.getTable(Identifier.create("test_db", tableName)).options().get("path")
-        fileIO.mkdirs(new Path(path))
         // Insert data into different partitions
         sql(
           s"INSERT INTO $tableName VALUES (1, 'Alice', 10.5, 'Engineering')," +
@@ -368,6 +477,63 @@ class PaimonFormatTableTest extends PaimonSparkTestWithRestCatalogBase {
     }
   }
 
+  test("PartitionedFormatTable: external table saveAsTable should support overwrite") {
+    val tableName = "paimon_format_external_overwrite_test"
+    Seq("paimon", "engine").foreach {
+      impl =>
+        withTable(tableName) {
+          val location = s"${tempDBDir.getCanonicalPath}/external_overwrite_test"
+
+          sql(s"""CREATE TABLE $tableName (a INT, b STRING, pt STRING)
+                 |USING CSV PARTITIONED BY (pt) LOCATION '$location'
+                 |TBLPROPERTIES ('format-table.implementation'='$impl')
+                 |""".stripMargin)
+
+          // Verify external format table has OVERWRITE_BY_FILTER capability
+          val catalog = spark.sessionState.catalogManager.currentCatalog
+            .asInstanceOf[TableCatalog]
+          val v2Table = catalog.loadTable(
+            org.apache.spark.sql.connector.catalog.Identifier.of(Array("test_db"), tableName))
+          val caps = v2Table.capabilities()
+          assert(
+            caps.contains(TableCapability.OVERWRITE_BY_FILTER),
+            s"External format table ($impl) should have OVERWRITE_BY_FILTER capability, but capabilities are: $caps"
+          )
+
+          spark
+            .createDataFrame(Seq((5, "x5", "p1")))
+            .toDF("a", "b", "pt")
+            .write
+            .format("csv")
+            .option("path", location)
+            .partitionBy("pt")
+            .mode("overwrite")
+            .saveAsTable(tableName)
+        }
+    }
+  }
+
+  test(
+    "PartitionedFormatTable: engine impl should return empty result when selecting a partition column on an empty table") {
+    val tableName = "engine_empty_partition_select"
+    withTable(tableName) {
+      val location = s"${tempDBDir.getCanonicalPath}/engine_empty_partition_select"
+      sql(s"""CREATE TABLE $tableName (clickid STRING, geo STRING, dt STRING, hour STRING)
+             |USING parquet PARTITIONED BY (dt, hour) LOCATION '$location'
+             |TBLPROPERTIES ('format-table.implementation'='engine')
+             |""".stripMargin)
+      fileIO.mkdirs(new Path(location))
+      checkAnswer(sql(s"SELECT clickid, hour FROM $tableName WHERE dt='20260418'"), Nil)
+      checkAnswer(sql(s"SELECT clickid, dt FROM $tableName WHERE hour='00'"), Nil)
+      checkAnswer(
+        sql(s"""SELECT clickid, max(hour) AS max_hour FROM $tableName
+               |WHERE dt='20260418' AND hour <= '11' AND geo IS NOT NULL
+               |GROUP BY clickid""".stripMargin),
+        Nil
+      )
+    }
+  }
+
   test("Paimon format table: show partitions") {
     withTable("t") {
       sql("""
@@ -387,6 +553,54 @@ class PaimonFormatTableTest extends PaimonSparkTestWithRestCatalogBase {
         sql("SHOW PARTITIONS t PARTITION (p1=2)"),
         Seq(Row("p1=2/p2=1"), Row("p1=2/p2=2")))
       checkAnswer(sql("SHOW PARTITIONS t PARTITION (p1=2, p2='2')"), Seq(Row("p1=2/p2=2")))
+    }
+  }
+
+  test("PaimonFormatTable: pack multiple files into one split by source.split.target-size") {
+    val tableName = "paimon_format_multifile_split"
+    withTable(tableName) {
+      sql(
+        s"CREATE TABLE $tableName (f0 INT, f1 STRING) USING CSV TBLPROPERTIES (" +
+          "'seq'='|', 'lineSep'='\n', 'file.compression'='none', " +
+          "'format-table.implementation'='paimon')")
+      val table =
+        paimonCatalog.getTable(Identifier.create("test_db", tableName)).asInstanceOf[FormatTable]
+
+      // Three data files of equal byte size, each with two distinct rows.
+      val contents = Seq("1|aaa\n2|bbb", "3|ccc\n4|ddd", "5|eee\n6|fff")
+      contents.zipWithIndex.foreach {
+        case (content, i) =>
+          table.fileIO().writeFile(new Path(table.location(), s"part-0000$i.csv"), content, false)
+      }
+      val fileSize = contents.head.getBytes("UTF-8").length
+
+      val expected = Seq(
+        Row(1, "aaa"),
+        Row(2, "bbb"),
+        Row(3, "ccc"),
+        Row(4, "ddd"),
+        Row(5, "eee"),
+        Row(6, "fff"))
+
+      // Default target size (128MB): all three files are packed into a single split.
+      val combined = getFormatTableScan(s"SELECT * FROM $tableName").inputSplits
+      assert(combined.length == 1, s"Expected 1 packed split but got ${combined.length}")
+      assert(
+        combined.head.asInstanceOf[FormatDataSplit].files().size() == 3,
+        "The single split should contain all 3 files")
+      checkAnswer(sql(s"SELECT * FROM $tableName ORDER BY f0"), expected)
+
+      // Target size = one file size: each file becomes its own split (no slicing since len <= target).
+      withSparkSQLConf("spark.paimon.source.split.target-size" -> s"${fileSize}b") {
+        val perFile = getFormatTableScan(s"SELECT * FROM $tableName").inputSplits
+        assert(perFile.length == 3, s"Expected 3 splits but got ${perFile.length}")
+        perFile.foreach(
+          s =>
+            assert(
+              s.asInstanceOf[FormatDataSplit].files().size() == 1,
+              "Each split should contain exactly 1 file"))
+        checkAnswer(sql(s"SELECT * FROM $tableName ORDER BY f0"), expected)
+      }
     }
   }
 }

@@ -101,9 +101,8 @@ class IcebergConversionsTimestampTest {
 
     private static Stream<Arguments> provideTimestampToPaimonCases() {
         return Stream.of(
-                // Provide binary in micros; p=3..6 should all parse as micros
-                Arguments.of(3, -1356022717123L, "1927-01-12T07:01:22.877"),
-                Arguments.of(3, 1713790983524L, "2024-04-22T13:03:03.524"),
+                Arguments.of(3, -1356022717123000L, "1927-01-12T07:01:22.877"),
+                Arguments.of(3, 1713790983524000L, "2024-04-22T13:03:03.524"),
                 Arguments.of(6, 1640690931207203L, "2021-12-28T11:28:51.207203"));
     }
 
@@ -124,5 +123,21 @@ class IcebergConversionsTimestampTest {
 
     private static Stream<Arguments> provideInvalidTimestampCases() {
         return Stream.of(Arguments.of(0, 1698686153L), Arguments.of(9, 1698686153123456789L));
+    }
+
+    @ParameterizedTest
+    @MethodSource("provideTimestampToPaimonCases")
+    @DisplayName("toPaimonObject decodes TIMESTAMP_WITH_LOCAL_TIME_ZONE without ClassCastException")
+    void testToPaimonObjectForTimestampWithLocalTimeZone(
+            int precision, long serializedMicros, String expectedTs) {
+        byte[] bytes = new byte[8];
+        ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).putLong(serializedMicros);
+
+        Timestamp actual =
+                (Timestamp)
+                        IcebergConversions.toPaimonObject(
+                                DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE(precision), bytes);
+
+        assertThat(actual.toString()).isEqualTo(expectedTs);
     }
 }

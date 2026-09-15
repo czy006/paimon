@@ -20,6 +20,7 @@ package org.apache.paimon.operation;
 
 import org.apache.paimon.Snapshot;
 import org.apache.paimon.data.BinaryRow;
+import org.apache.paimon.manifest.BucketFilter;
 import org.apache.paimon.manifest.ManifestFileMeta;
 import org.apache.paimon.manifest.ManifestList;
 import org.apache.paimon.partition.PartitionPredicate;
@@ -28,12 +29,15 @@ import org.apache.paimon.stats.SimpleStats;
 import org.apache.paimon.table.source.ScanMode;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.BiFilter;
-import org.apache.paimon.utils.Range;
+import org.apache.paimon.utils.Filter;
+import org.apache.paimon.utils.RowRangeIndex;
 import org.apache.paimon.utils.SnapshotManager;
+import org.apache.paimon.utils.TriFilter;
 
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.ThreadSafe;
 
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -52,10 +56,15 @@ public class ManifestsReader {
 
     private boolean onlyReadRealBuckets = false;
     @Nullable private Integer specifiedBucket = null;
+    @Nullable private Filter<Integer> bucketFilter = null;
+    @Nullable private TriFilter<BinaryRow, Integer, Integer> totalAwareBucketFilter = null;
     @Nullable private Integer specifiedLevel = null;
     @Nullable private PartitionPredicate partitionFilter = null;
+    // Auth partition filter (ANDed with partitionFilter); kept separate so it can be reset each
+    // plan without touching the base partitionFilter.
+    @Nullable private PartitionPredicate authPartitionFilter = null;
     @Nullable private BiFilter<Integer, Integer> levelMinMaxFilter = null;
-    @Nullable protected List<Range> rowRanges;
+    @Nullable protected RowRangeIndex rowRangeIndex = null;
 
     public ManifestsReader(
             RowType partitionType,
@@ -75,6 +84,17 @@ public class ManifestsReader {
 
     public ManifestsReader withBucket(int bucket) {
         this.specifiedBucket = bucket;
+        return this;
+    }
+
+    public ManifestsReader withBucketFilter(Filter<Integer> bucketFilter) {
+        this.bucketFilter = bucketFilter;
+        return this;
+    }
+
+    public ManifestsReader withTotalAwareBucketFilter(
+            TriFilter<BinaryRow, Integer, Integer> totalAwareBucketFilter) {
+        this.totalAwareBucketFilter = totalAwareBucketFilter;
         return this;
     }
 
@@ -108,14 +128,26 @@ public class ManifestsReader {
         return this;
     }
 
-    public ManifestsReader withRowRanges(List<Range> rowRanges) {
-        this.rowRanges = rowRanges;
+    /** Overwrites the auth-derived partition filter; {@code null} clears it. */
+    public ManifestsReader withAuthPartitionFilter(@Nullable PartitionPredicate predicate) {
+        this.authPartitionFilter = predicate;
+        return this;
+    }
+
+    public ManifestsReader withRowRangeIndex(RowRangeIndex rowRangeIndex) {
+        this.rowRangeIndex = rowRangeIndex;
         return this;
     }
 
     @Nullable
     public PartitionPredicate partitionFilter() {
-        return partitionFilter;
+        if (partitionFilter == null) {
+            return authPartitionFilter;
+        }
+        if (authPartitionFilter == null) {
+            return partitionFilter;
+        }
+        return PartitionPredicate.and(Arrays.asList(partitionFilter, authPartitionFilter));
     }
 
     public Result read(@Nullable Snapshot specifiedSnapshot, ScanMode scanMode) {
@@ -128,9 +160,18 @@ public class ManifestsReader {
             manifests = readManifests(snapshot, scanMode);
         }
 
+        // Compute the effective partition filter once (it ANDs the base and auth slots) instead of
+        // rebuilding it per manifest.
+        PartitionPredicate effectivePartitionFilter = partitionFilter();
+        BucketFilter effectiveBucketFilter =
+                BucketFilter.create(
+                        onlyReadRealBuckets, specifiedBucket, bucketFilter, totalAwareBucketFilter);
         List<ManifestFileMeta> filtered =
                 manifests.stream()
-                        .filter(this::filterManifestFileMeta)
+                        .filter(
+                                m ->
+                                        filterManifestFileMeta(
+                                                m, effectivePartitionFilter, effectiveBucketFilter))
                         .collect(Collectors.toList());
         return new Result(snapshot, manifests, filtered);
     }
@@ -150,7 +191,7 @@ public class ManifestsReader {
     }
 
     private boolean filterManifestByRowRanges(ManifestFileMeta manifest) {
-        if (rowRanges == null) {
+        if (rowRangeIndex == null) {
             return true;
         }
         Long min = manifest.minRowId();
@@ -159,28 +200,16 @@ public class ManifestsReader {
             return true;
         }
 
-        Range manifestRowRange = new Range(min, max);
-
-        for (Range expected : rowRanges) {
-            if (Range.intersection(manifestRowRange, expected) != null) {
-                return true;
-            }
-        }
-        return false;
+        return this.rowRangeIndex.intersects(min, max);
     }
 
     /** Note: Keep this thread-safe. */
-    private boolean filterManifestFileMeta(ManifestFileMeta manifest) {
-        Integer minBucket = manifest.minBucket();
-        Integer maxBucket = manifest.maxBucket();
-        if (minBucket != null && maxBucket != null) {
-            if (onlyReadRealBuckets && maxBucket < 0) {
-                return false;
-            }
-            if (specifiedBucket != null
-                    && (specifiedBucket < minBucket || specifiedBucket > maxBucket)) {
-                return false;
-            }
+    private boolean filterManifestFileMeta(
+            ManifestFileMeta manifest,
+            @Nullable PartitionPredicate effectivePartitionFilter,
+            @Nullable BucketFilter effectiveBucketFilter) {
+        if (effectiveBucketFilter != null && !effectiveBucketFilter.mayContain(manifest)) {
+            return false;
         }
 
         Integer minLevel = manifest.minLevel();
@@ -195,9 +224,9 @@ public class ManifestsReader {
             }
         }
 
-        if (partitionFilter != null) {
+        if (effectivePartitionFilter != null) {
             SimpleStats stats = manifest.partitionStats();
-            if (!partitionFilter.test(
+            if (!effectivePartitionFilter.test(
                     manifest.numAddedFiles() + manifest.numDeletedFiles(),
                     stats.minValues(),
                     stats.maxValues(),

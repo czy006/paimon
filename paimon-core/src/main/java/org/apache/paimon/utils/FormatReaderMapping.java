@@ -18,8 +18,11 @@
 
 package org.apache.paimon.utils;
 
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.CoreOptions.MapStorageLayout;
 import org.apache.paimon.casting.CastFieldGetter;
-import org.apache.paimon.data.variant.VariantAccessInfo;
+import org.apache.paimon.data.shredding.MapSelectedKeysMetadataUtils;
+import org.apache.paimon.data.variant.VariantMetadataUtils;
 import org.apache.paimon.format.FileFormatDiscover;
 import org.apache.paimon.format.FormatReaderFactory;
 import org.apache.paimon.partition.PartitionUtils;
@@ -39,15 +42,18 @@ import org.apache.paimon.types.RowType;
 import javax.annotation.Nullable;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.Function;
 
 import static org.apache.paimon.predicate.PredicateBuilder.excludePredicateWithFields;
 import static org.apache.paimon.table.SpecialFields.KEY_FIELD_ID_START;
+import static org.apache.paimon.utils.Preconditions.checkArgument;
 
 /** Class with index mapping and format reader. */
 public class FormatReaderMapping {
@@ -159,7 +165,17 @@ public class FormatReaderMapping {
         @Nullable private final List<Predicate> filters;
         @Nullable private final TopN topN;
         @Nullable private final Integer limit;
-        @Nullable private final VariantAccessInfo[] variantAccess;
+        private final boolean nestedFieldEnabled;
+
+        public Builder(
+                FileFormatDiscover formatDiscover,
+                List<DataField> readFields,
+                Function<TableSchema, List<DataField>> fieldsExtractor,
+                @Nullable List<Predicate> filters,
+                @Nullable TopN topN,
+                @Nullable Integer limit) {
+            this(formatDiscover, readFields, fieldsExtractor, filters, topN, limit, false);
+        }
 
         public Builder(
                 FileFormatDiscover formatDiscover,
@@ -168,14 +184,14 @@ public class FormatReaderMapping {
                 @Nullable List<Predicate> filters,
                 @Nullable TopN topN,
                 @Nullable Integer limit,
-                @Nullable VariantAccessInfo[] variantAccess) {
+                boolean nestedFieldEnabled) {
             this.formatDiscover = formatDiscover;
             this.readFields = readFields;
             this.fieldsExtractor = fieldsExtractor;
             this.filters = filters;
             this.topN = topN;
             this.limit = limit;
-            this.variantAccess = variantAccess;
+            this.nestedFieldEnabled = nestedFieldEnabled;
         }
 
         /**
@@ -208,7 +224,13 @@ public class FormatReaderMapping {
                     new ArrayList<>(fieldsExtractor.apply(dataSchema));
             Map<String, Integer> systemFields = findSystemFields(expectedFields);
 
-            List<DataField> readDataFields = readDataFields(allDataFieldsInFile, expectedFields);
+            Set<Integer> selectedKeysFieldIds = selectedKeysFieldIds(tableSchema, expectedFields);
+            List<DataField> readDataFields =
+                    readDataFields(
+                            allDataFieldsInFile,
+                            expectedFields,
+                            selectedKeysFieldIds,
+                            nestedFieldEnabled);
             IndexCastMapping indexCastMapping =
                     SchemaEvolutionUtil.createIndexCastMapping(expectedFields, readDataFields);
 
@@ -237,8 +259,7 @@ public class FormatReaderMapping {
                             .createReaderFactory(
                                     new RowType(allDataFieldsInFile),
                                     actualReadRowType,
-                                    readFilters,
-                                    variantAccess),
+                                    readFilters),
                     dataSchema,
                     readFilters,
                     systemFields,
@@ -318,7 +339,17 @@ public class FormatReaderMapping {
         }
 
         private List<DataField> readDataFields(
-                List<DataField> allDataFields, List<DataField> expectedFields) {
+                List<DataField> allDataFields,
+                List<DataField> expectedFields,
+                Set<Integer> selectedKeysFieldIds) {
+            return readDataFields(allDataFields, expectedFields, selectedKeysFieldIds, false);
+        }
+
+        private List<DataField> readDataFields(
+                List<DataField> allDataFields,
+                List<DataField> expectedFields,
+                Set<Integer> selectedKeysFieldIds,
+                boolean nestedFieldEnabled) {
             List<DataField> readDataFields = new ArrayList<>();
             for (DataField dataField : allDataFields) {
                 expectedFields.stream()
@@ -326,8 +357,17 @@ public class FormatReaderMapping {
                         .findFirst()
                         .ifPresent(
                                 field -> {
+                                    if (selectedKeysFieldIds.contains(field.id())) {
+                                        checkSelectedKeysDataField(dataField);
+                                        readDataFields.add(selectedKeysDataField(field, dataField));
+                                        return;
+                                    }
+
                                     DataType prunedType =
-                                            pruneDataType(field.type(), dataField.type());
+                                            pruneDataType(
+                                                    field.type(),
+                                                    dataField.type(),
+                                                    nestedFieldEnabled);
                                     if (prunedType != null) {
                                         readDataFields.add(dataField.newType(prunedType));
                                     }
@@ -336,17 +376,76 @@ public class FormatReaderMapping {
             return readDataFields;
         }
 
+        private DataField selectedKeysDataField(DataField expectedField, DataField dataField) {
+            RowType selectedKeysType = (RowType) expectedField.type();
+            DataType dataValueType = ((MapType) dataField.type()).getValueType();
+            List<DataField> selectedKeysDataFields = new ArrayList<>();
+            for (DataField selectedKeyField : selectedKeysType.getFields()) {
+                selectedKeysDataFields.add(
+                        selectedKeyField.newType(
+                                dataValueType.copy(selectedKeyField.type().isNullable())));
+            }
+            return dataField
+                    .newType(selectedKeysType.copy(selectedKeysDataFields))
+                    .newDescription(expectedField.description());
+        }
+
+        private void checkSelectedKeysDataField(DataField dataField) {
+            checkArgument(
+                    dataField.type() instanceof MapType,
+                    "Selected-key MAP field %s should be MAP type in data schema.",
+                    dataField.name());
+        }
+
+        private Set<Integer> selectedKeysFieldIds(
+                TableSchema tableSchema, List<DataField> expectedFields) {
+            CoreOptions options = CoreOptions.fromMap(tableSchema.options());
+            Map<Integer, DataField> tableFields = tableSchema.idToFieldMap();
+            Set<Integer> selectedKeysFieldIds = new HashSet<>();
+            for (DataField expectedField : expectedFields) {
+                DataField tableField = tableFields.get(expectedField.id());
+                if (MapSelectedKeysMetadataUtils.isMapSelectedKeysField(expectedField)
+                        && tableField != null
+                        && tableField.type() instanceof MapType) {
+                    checkArgument(
+                            options.mapStorageLayout(tableField.name())
+                                    == MapStorageLayout.SHARED_SHREDDING,
+                            "Selected-key MAP pushdown only supports top-level shared-shredding MAP field: %s.",
+                            tableField.name());
+                    validateSelectedKeyValueTypes(expectedField, tableField);
+                    selectedKeysFieldIds.add(expectedField.id());
+                }
+            }
+            return selectedKeysFieldIds;
+        }
+
+        private void validateSelectedKeyValueTypes(DataField expectedField, DataField tableField) {
+            RowType selectedKeysType = (RowType) expectedField.type();
+            DataType mapValueType = ((MapType) tableField.type()).getValueType();
+            for (DataField selectedKeyField : selectedKeysType.getFields()) {
+                checkArgument(
+                        selectedKeyField.type().equalsIgnoreNullable(mapValueType),
+                        "Selected-key MAP pushdown does not support pruning MAP value fields: %s.",
+                        tableField.name());
+            }
+        }
+
         @Nullable
-        private DataType pruneDataType(DataType readType, DataType dataType) {
+        private DataType pruneDataType(
+                DataType readType, DataType dataType, boolean nestedFieldEnabled) {
             switch (readType.getTypeRoot()) {
                 case ROW:
                     RowType r = (RowType) readType;
+                    if (VariantMetadataUtils.isVariantRowType(r)) {
+                        return readType;
+                    }
                     RowType d = (RowType) dataType;
                     ArrayList<DataField> newFields = new ArrayList<>();
                     for (DataField rf : r.getFields()) {
                         if (d.containsField(rf.id())) {
                             DataField df = d.getField(rf.id());
-                            DataType newType = pruneDataType(rf.type(), df.type());
+                            DataType newType =
+                                    pruneDataType(rf.type(), df.type(), nestedFieldEnabled);
                             if (newType == null) {
                                 continue;
                             }
@@ -354,19 +453,26 @@ public class FormatReaderMapping {
                         }
                     }
                     if (newFields.isEmpty()) {
-                        // When all fields are pruned, we should not return an empty row type
-                        return null;
+                        // Every requested child may have been added after this file was written.
+                        // Keep one physical child as a hidden anchor so the format reader can
+                        // preserve the ROW's nullness and row count; the schema-evolution cast
+                        // projects it away and null-fills the requested children.
+                        return !nestedFieldEnabled || d.getFields().isEmpty()
+                                ? null
+                                : d.copy(Collections.singletonList(d.getFields().get(0)));
                     }
                     return d.copy(newFields);
                 case MAP:
                     DataType keyType =
                             pruneDataType(
                                     ((MapType) readType).getKeyType(),
-                                    ((MapType) dataType).getKeyType());
+                                    ((MapType) dataType).getKeyType(),
+                                    nestedFieldEnabled);
                     DataType valueType =
                             pruneDataType(
                                     ((MapType) readType).getValueType(),
-                                    ((MapType) dataType).getValueType());
+                                    ((MapType) dataType).getValueType(),
+                                    nestedFieldEnabled);
                     if (keyType == null || valueType == null) {
                         return null;
                     }
@@ -375,7 +481,8 @@ public class FormatReaderMapping {
                     DataType elementType =
                             pruneDataType(
                                     ((ArrayType) readType).getElementType(),
-                                    ((ArrayType) dataType).getElementType());
+                                    ((ArrayType) dataType).getElementType(),
+                                    nestedFieldEnabled);
                     if (elementType == null) {
                         return null;
                     }

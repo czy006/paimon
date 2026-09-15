@@ -58,6 +58,49 @@ public class CompactionMetricsTest {
     @TempDir java.nio.file.Path tempDir;
 
     @Test
+    public void testSortBufferMetrics() {
+        CompactionMetrics metrics = new CompactionMetrics(new TestMetricRegistry(), "myTable");
+
+        // no reporters yet: gauges return -1 (no data)
+        assertThat(getMetric(metrics, CompactionMetrics.MAX_SORT_BUFFER_USED_BYTES)).isEqualTo(-1L);
+        assertThat(getMetric(metrics, CompactionMetrics.AVG_SORT_BUFFER_USED_BYTES))
+                .isEqualTo(-1.0);
+        assertThat(getMetric(metrics, CompactionMetrics.MAX_SORT_BUFFER_UTILISATION))
+                .isEqualTo(-1.0);
+        assertThat(getMetric(metrics, CompactionMetrics.AVG_SORT_BUFFER_UTILISATION))
+                .isEqualTo(-1.0);
+
+        CompactionMetrics.Reporter r0 = metrics.createReporter(BinaryRow.EMPTY_ROW, 0);
+        CompactionMetrics.Reporter r1 = metrics.createReporter(BinaryRow.EMPTY_ROW, 1);
+
+        // bucket 0: 32 MB used of 64 MB total = 50% utilisation
+        r0.reportSortBufferMetrics(32L * 1024 * 1024, 64L * 1024 * 1024);
+        // bucket 1: 48 MB used of 64 MB total = 75% utilisation
+        r1.reportSortBufferMetrics(48L * 1024 * 1024, 64L * 1024 * 1024);
+
+        assertThat(getMetric(metrics, CompactionMetrics.MAX_SORT_BUFFER_USED_BYTES))
+                .isEqualTo(48L * 1024 * 1024);
+        assertThat(getMetric(metrics, CompactionMetrics.AVG_SORT_BUFFER_USED_BYTES))
+                .isEqualTo(40.0 * 1024 * 1024);
+        assertThat(getMetric(metrics, CompactionMetrics.MAX_SORT_BUFFER_UTILISATION))
+                .isEqualTo(75.0);
+        assertThat(getMetric(metrics, CompactionMetrics.AVG_SORT_BUFFER_UTILISATION))
+                .isEqualTo(62.5);
+
+        // update bucket 0 to full utilisation
+        r0.reportSortBufferMetrics(64L * 1024 * 1024, 64L * 1024 * 1024);
+        assertThat(getMetric(metrics, CompactionMetrics.MAX_SORT_BUFFER_UTILISATION))
+                .isEqualTo(100.0);
+        assertThat(getMetric(metrics, CompactionMetrics.AVG_SORT_BUFFER_UTILISATION))
+                .isEqualTo(87.5);
+
+        // zero-total pool reports 0% utilisation (no division by zero)
+        r0.reportSortBufferMetrics(0L, 0L);
+        assertThat(getMetric(metrics, CompactionMetrics.MAX_SORT_BUFFER_UTILISATION))
+                .isEqualTo(75.0);
+    }
+
+    @Test
     public void testReportMetrics() {
         CompactionMetrics metrics = new CompactionMetrics(new TestMetricRegistry(), "myTable");
         assertThat(getMetric(metrics, CompactionMetrics.MAX_LEVEL0_FILE_COUNT)).isEqualTo(-1L);
@@ -88,6 +131,23 @@ public class CompactionMetricsTest {
         reporters[0].reportLevel0FileCount(8);
         assertThat(getMetric(metrics, CompactionMetrics.MAX_LEVEL0_FILE_COUNT)).isEqualTo(8L);
         assertThat(getMetric(metrics, CompactionMetrics.AVG_LEVEL0_FILE_COUNT)).isEqualTo(5.0);
+
+        reporters[0].reportTotalFileCount(10);
+        reporters[1].reportTotalFileCount(6);
+        reporters[2].reportTotalFileCount(8);
+        assertThat(getMetric(metrics, CompactionMetrics.MAX_TOTAL_FILE_COUNT)).isEqualTo(10L);
+        assertThat(getMetric(metrics, CompactionMetrics.AVG_TOTAL_FILE_COUNT)).isEqualTo(8.0);
+
+        reporters[0].reportTotalFileCount(15);
+        assertThat(getMetric(metrics, CompactionMetrics.MAX_TOTAL_FILE_COUNT)).isEqualTo(15L);
+        assertThat(getMetric(metrics, CompactionMetrics.AVG_TOTAL_FILE_COUNT))
+                .isEqualTo(29.0 / 3.0);
+
+        // report file sizes to test minAvgFileSize
+        reporters[0].reportTotalFileSize(150_000_000); // 150MB / 15 files = 10MB avg
+        reporters[1].reportTotalFileSize(6_000_000); // 6MB / 6 files = 1MB avg (smallest)
+        reporters[2].reportTotalFileSize(80_000_000); // 80MB / 8 files = 10MB avg
+        assertThat(getMetric(metrics, CompactionMetrics.MIN_AVG_FILE_SIZE)).isEqualTo(1_000_000L);
 
         reporters[0].reportCompactionTime(300000);
         reporters[0].reportCompactionTime(250000);
@@ -173,6 +233,12 @@ public class CompactionMetricsTest {
                         dataSplit.dataFiles().stream().mapToLong(DataFileMeta::fileSize).sum();
             }
 
+            long[] totalFileCounts = new long[bucketNum];
+            for (Split split : table.newScan().plan().splits()) {
+                DataSplit dataSplit = (DataSplit) split;
+                totalFileCounts[dataSplit.bucket()] += dataSplit.dataFiles().size();
+            }
+
             CompactionMetrics metrics =
                     ((AbstractFileStoreWrite<?>) write.getWrite()).compactionMetrics();
             assertThat(metrics.getTotalFileSizeStream()).hasSize(bucketNum);
@@ -180,6 +246,11 @@ public class CompactionMetricsTest {
                     .isEqualTo(Arrays.stream(totalFileSizes).max().orElse(0));
             assertThat(getMetric(metrics, CompactionMetrics.AVG_TOTAL_FILE_SIZE))
                     .isEqualTo(Arrays.stream(totalFileSizes).average().orElse(0));
+            assertThat(metrics.getTotalFileCountStream()).hasSize(bucketNum);
+            assertThat(getMetric(metrics, CompactionMetrics.MAX_TOTAL_FILE_COUNT))
+                    .isEqualTo(Arrays.stream(totalFileCounts).max().orElse(0));
+            assertThat(getMetric(metrics, CompactionMetrics.AVG_TOTAL_FILE_COUNT))
+                    .isEqualTo(Arrays.stream(totalFileCounts).average().orElse(0));
         }
 
         write.close();

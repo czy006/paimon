@@ -18,84 +18,51 @@
 
 package org.apache.paimon.format.blob;
 
-import org.apache.paimon.data.Blob;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.SeekableInputStream;
-import org.apache.paimon.memory.BytesUtils;
 import org.apache.paimon.reader.FileRecordIterator;
 import org.apache.paimon.reader.FileRecordReader;
-import org.apache.paimon.utils.DeltaVarintCompressor;
-import org.apache.paimon.utils.IOUtils;
-import org.apache.paimon.utils.RoaringBitmap32;
+import org.apache.paimon.types.DataType;
 
 import javax.annotation.Nullable;
 
 import java.io.IOException;
-import java.util.Iterator;
 
 /** {@link FileRecordReader} for blob file. */
 public class BlobFormatReader implements FileRecordReader<InternalRow> {
 
-    private final FileIO fileIO;
     private final Path filePath;
-    private final long[] blobLengths;
-    private final long[] blobOffsets;
-    private final int[] returnedPositions;
+    private final BlobFileMeta fileMeta;
+    private final int fieldCount;
+    private final int blobIndex;
+    private final BlobElementSerializer.Reader elementReader;
 
     private boolean returned;
 
     public BlobFormatReader(
-            FileIO fileIO, Path filePath, long fileSize, @Nullable RoaringBitmap32 selection)
-            throws IOException {
-        this.fileIO = fileIO;
+            FileIO fileIO,
+            Path filePath,
+            BlobFileMeta fileMeta,
+            @Nullable SeekableInputStream in,
+            int fieldCount,
+            int blobIndex,
+            DataType blobFieldType,
+            boolean blobAsDescriptor) {
         this.filePath = filePath;
+        this.fileMeta = fileMeta;
+        this.fieldCount = fieldCount;
+        this.blobIndex = blobIndex;
+        this.elementReader =
+                BlobElementSerializer.createReader(
+                        BlobElementSerializerFactory.create(blobFieldType),
+                        fileIO,
+                        filePath,
+                        in,
+                        blobAsDescriptor);
         this.returned = false;
-        try (SeekableInputStream in = fileIO.newInputStream(filePath)) {
-            in.seek(fileSize - 5);
-            byte[] header = new byte[5];
-            IOUtils.readFully(in, header);
-            byte version = header[4];
-            if (version != 1) {
-                throw new IOException("Unsupported version: " + version);
-            }
-            int indexLength = BytesUtils.getInt(header, 0);
-
-            in.seek(fileSize - 5 - indexLength);
-            byte[] indexBytes = new byte[indexLength];
-            IOUtils.readFully(in, indexBytes);
-
-            long[] blobLengths = DeltaVarintCompressor.decompress(indexBytes);
-            long[] blobOffsets = new long[blobLengths.length];
-            long offset = 0;
-            for (int i = 0; i < blobLengths.length; i++) {
-                blobOffsets[i] = offset;
-                offset += blobLengths[i];
-            }
-
-            int[] returnedPositions = null;
-            if (selection != null) {
-                int cardinality = (int) selection.getCardinality();
-                returnedPositions = new int[cardinality];
-                long[] newLengths = new long[cardinality];
-                long[] newOffsets = new long[cardinality];
-                Iterator<Integer> iterator = selection.iterator();
-                for (int i = 0; i < cardinality; i++) {
-                    Integer next = iterator.next();
-                    newLengths[i] = blobLengths[next];
-                    newOffsets[i] = blobOffsets[next];
-                    returnedPositions[i] = next;
-                }
-                blobLengths = newLengths;
-                blobOffsets = newOffsets;
-            }
-
-            this.returnedPositions = returnedPositions;
-            this.blobLengths = blobLengths;
-            this.blobOffsets = blobOffsets;
-        }
     }
 
     @Nullable
@@ -112,9 +79,7 @@ public class BlobFormatReader implements FileRecordReader<InternalRow> {
 
             @Override
             public long returnedPosition() {
-                return returnedPositions == null
-                        ? currentPosition
-                        : returnedPositions[currentPosition - 1];
+                return fileMeta.returnedPosition(currentPosition);
             }
 
             @Override
@@ -125,18 +90,33 @@ public class BlobFormatReader implements FileRecordReader<InternalRow> {
             @Nullable
             @Override
             public InternalRow next() {
-                if (currentPosition >= blobLengths.length) {
+                if (currentPosition >= fileMeta.recordNumber()) {
                     return null;
                 }
 
-                Blob blob =
-                        Blob.fromFile(
-                                fileIO,
-                                filePath.toString(),
-                                blobOffsets[currentPosition] + 4,
-                                blobLengths[currentPosition] - 16);
+                Object field;
+                if (fileMeta.isNull(currentPosition)) {
+                    field = null;
+                } else if (fileMeta.isPlaceHolder(currentPosition)) {
+                    field = elementReader.placeholder();
+                } else {
+                    long payloadPosition = fileMeta.blobOffset(currentPosition) + 4;
+                    long payloadLength = fileMeta.blobLength(currentPosition) - 16;
+                    field = elementReader.read(payloadPosition, payloadLength);
+                }
                 currentPosition++;
-                return GenericRow.of(blob);
+                GenericRow row = new GenericRow(fieldCount);
+                row.setField(blobIndex, field);
+                return row;
+            }
+
+            @Override
+            public boolean skip() {
+                if (currentPosition >= fileMeta.recordNumber()) {
+                    return false;
+                }
+                currentPosition++;
+                return true;
             }
 
             @Override
@@ -145,5 +125,7 @@ public class BlobFormatReader implements FileRecordReader<InternalRow> {
     }
 
     @Override
-    public void close() throws IOException {}
+    public void close() throws IOException {
+        elementReader.close();
+    }
 }

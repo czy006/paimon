@@ -346,13 +346,19 @@ public final class BinaryRow extends BinarySection implements InternalRow, DataS
 
     @Override
     public Blob getBlob(int pos) {
-        return new BlobData(getBinary(pos));
+        return Blob.fromBytes(getBinary(pos), null, null);
     }
 
     @Override
     public InternalArray getArray(int pos) {
         assertIndexIsValid(pos);
         return MemorySegmentUtils.readArrayData(segments, offset, getLong(pos));
+    }
+
+    @Override
+    public InternalVector getVector(int pos) {
+        assertIndexIsValid(pos);
+        return MemorySegmentUtils.readVectorData(segments, offset, getLong(pos));
     }
 
     @Override
@@ -370,11 +376,11 @@ public final class BinaryRow extends BinarySection implements InternalRow, DataS
     /** The bit is 1 when the field is null. Default is 0. */
     public boolean anyNull() {
         // Skip the header.
-        if ((segments[0].getLong(0) & FIRST_BYTE_ZERO) != 0) {
+        if ((segments[0].getLong(offset) & FIRST_BYTE_ZERO) != 0) {
             return true;
         }
         for (int i = 8; i < nullBitsSizeInBytes; i += 8) {
-            if (segments[0].getLong(i) != 0) {
+            if (segments[0].getLong(offset + i) != 0) {
                 return true;
             }
         }

@@ -25,8 +25,9 @@ import org.apache.paimon.spark.util.shim.TypeUtils.treatPaimonTimestampTypeAsSpa
 import org.apache.paimon.types.{DecimalType, RowType}
 import org.apache.paimon.types.DataTypeRoot._
 
-import org.apache.spark.sql.catalyst.util.DateTimeUtils
+import org.apache.spark.sql.catalyst.util.{ArrayData, DateTimeUtils}
 import org.apache.spark.sql.connector.expressions.{Cast, Expression, GeneralScalarExpression, Literal, NamedReference}
+import org.apache.spark.sql.types.{ArrayType => SparkArrayType, DataType => SparkDataType}
 
 import scala.collection.JavaConverters._
 
@@ -37,6 +38,11 @@ object SparkExpressionConverter {
   // Supported general scalar transform names
   private val CONCAT = "CONCAT"
   private val UPPER = "UPPER"
+  private val LOWER = "LOWER"
+  private val SUBSTRING = "SUBSTRING"
+  private val TRIM = "TRIM"
+  private val LTRIM = "LTRIM"
+  private val RTRIM = "RTRIM"
 
   /** Convert Spark [[Expression]] to Paimon [[Transform]], return None if not supported. */
   def toPaimonTransform(exp: Expression, rowType: RowType): Option[Transform] = {
@@ -60,6 +66,15 @@ object SparkExpressionConverter {
         s.name() match {
           case CONCAT => convertChildren(s.children()).map(i => new ConcatTransform(i))
           case UPPER => convertChildren(s.children()).map(i => new UpperTransform(i))
+          case LOWER => convertChildren(s.children()).map(i => new LowerTransform(i))
+          case SUBSTRING => convertChildren(s.children()).map(i => new SubstringTransform(i))
+          case TRIM =>
+            convertChildren(s.children()).map(i => new TrimTransform(i, TrimTransform.Flag.BOTH))
+          case LTRIM =>
+            convertChildren(s.children()).map(i => new TrimTransform(i, TrimTransform.Flag.LEADING))
+          case RTRIM =>
+            convertChildren(s.children()).map(
+              i => new TrimTransform(i, TrimTransform.Flag.TRAILING))
           case _ => None
         }
       case c: Cast =>
@@ -84,8 +99,29 @@ object SparkExpressionConverter {
       throw new UnsupportedOperationException(s"Convert value: $literal is unsupported.")
     }
 
-    val dataType = SparkTypeUtils.toPaimonType(literal.dataType())
-    val value = literal.value()
+    toPaimonLiteral(literal.value(), literal.dataType())
+  }
+
+  /** Convert a Spark ARRAY [[Literal]] to Paimon element literals. */
+  def toPaimonArrayLiteral(literal: Literal[_]): Seq[Object] = {
+    literal.dataType() match {
+      case SparkArrayType(elementType, _) =>
+        val array = literal.value().asInstanceOf[ArrayData]
+        (0 until array.numElements()).map {
+          i =>
+            if (array.isNullAt(i)) {
+              null
+            } else {
+              toPaimonLiteral(array.get(i, elementType), elementType)
+            }
+        }
+      case _ =>
+        throw new UnsupportedOperationException(s"Convert value: $literal is unsupported.")
+    }
+  }
+
+  private def toPaimonLiteral(value: Any, sparkDataType: SparkDataType): Object = {
+    val dataType = SparkTypeUtils.toPaimonType(sparkDataType)
     dataType.getTypeRoot match {
       case BOOLEAN | BIGINT | DOUBLE | TINYINT | SMALLINT | INTEGER | FLOAT | DATE =>
         value.asInstanceOf[AnyRef]

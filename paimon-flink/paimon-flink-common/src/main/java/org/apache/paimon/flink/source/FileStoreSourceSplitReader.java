@@ -27,7 +27,7 @@ import org.apache.paimon.reader.RecordReader.RecordIterator;
 import org.apache.paimon.table.source.DataSplit;
 import org.apache.paimon.table.source.Split;
 import org.apache.paimon.table.source.TableRead;
-import org.apache.paimon.types.DataTypeRoot;
+import org.apache.paimon.types.BlobType;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.Pool;
 
@@ -48,6 +48,7 @@ import java.io.IOException;
 import java.time.Duration;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.Objects;
 import java.util.Queue;
@@ -190,9 +191,19 @@ public class FileStoreSourceSplitReader
 
     @Override
     public void close() throws Exception {
-        if (currentReader != null) {
-            if (currentReader.lazyRecordReader != null) {
-                currentReader.lazyRecordReader.close();
+        try {
+            if (currentFirstBatch != null) {
+                try {
+                    currentFirstBatch.releaseBatch();
+                } finally {
+                    currentFirstBatch = null;
+                }
+            }
+        } finally {
+            if (currentReader != null) {
+                if (currentReader.lazyRecordReader != null) {
+                    currentReader.lazyRecordReader.close();
+                }
             }
         }
     }
@@ -267,19 +278,20 @@ public class FileStoreSourceSplitReader
 
         private final MutableRecordAndPosition<RowData> recordAndPosition =
                 new MutableRecordAndPosition<>();
-        @Nullable private final Integer blobField;
+        private final Set<Integer> blobFields;
 
         private FileStoreRecordIterator(@Nullable RowType rowType) {
-            this.blobField = rowType == null ? null : blobFieldIndex(rowType);
+            this.blobFields = rowType == null ? Collections.emptySet() : blobFieldIndexes(rowType);
         }
 
-        private Integer blobFieldIndex(RowType rowType) {
+        private Set<Integer> blobFieldIndexes(RowType rowType) {
+            Set<Integer> result = new HashSet<>();
             for (int i = 0; i < rowType.getFieldCount(); i++) {
-                if (rowType.getTypeAt(i).getTypeRoot() == DataTypeRoot.BLOB) {
-                    return i;
+                if (BlobType.isBlobFileField(rowType.getTypeAt(i))) {
+                    result.add(i);
                 }
             }
-            return null;
+            return result;
         }
 
         public FileStoreRecordIterator replace(RecordIterator<InternalRow> iterator) {
@@ -305,9 +317,9 @@ public class FileStoreSourceSplitReader
             }
 
             recordAndPosition.setNext(
-                    blobField == null
+                    blobFields.isEmpty()
                             ? new FlinkRowData(row)
-                            : new FlinkRowDataWithBlob(row, blobField, blobAsDescriptor));
+                            : new FlinkRowDataWithBlob(row, blobFields, blobAsDescriptor));
             currentNumRead++;
             if (limiter != null) {
                 limiter.increment();
@@ -317,8 +329,11 @@ public class FileStoreSourceSplitReader
 
         @Override
         public void releaseBatch() {
-            this.iterator.releaseBatch();
-            pool.recycler().recycle(this);
+            try {
+                this.iterator.releaseBatch();
+            } finally {
+                pool.recycler().recycle(this);
+            }
         }
     }
 

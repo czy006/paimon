@@ -21,8 +21,11 @@ package org.apache.paimon.globalindex.btree;
 import org.apache.paimon.compression.BlockCompressionFactory;
 import org.apache.paimon.compression.CompressOptions;
 import org.apache.paimon.globalindex.GlobalIndexIOMeta;
+import org.apache.paimon.globalindex.GlobalIndexKeyExtractor;
 import org.apache.paimon.globalindex.GlobalIndexReader;
 import org.apache.paimon.globalindex.GlobalIndexer;
+import org.apache.paimon.globalindex.KeySerializer;
+import org.apache.paimon.globalindex.SortedGlobalIndexer;
 import org.apache.paimon.globalindex.io.GlobalIndexFileReader;
 import org.apache.paimon.globalindex.io.GlobalIndexFileWriter;
 import org.apache.paimon.io.cache.CacheManager;
@@ -32,6 +35,7 @@ import org.apache.paimon.utils.LazyField;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
 
 /**
  * The {@link GlobalIndexer} for btree index. We do not build a B-tree directly in memory, instead,
@@ -56,16 +60,20 @@ import java.util.List;
  *
  * <p>This approach significantly reduces memory pressure during index reads.
  */
-public class BTreeGlobalIndexer implements GlobalIndexer {
+public class BTreeGlobalIndexer implements SortedGlobalIndexer {
 
     private final KeySerializer keySerializer;
+    private final GlobalIndexKeyExtractor keyExtractor;
     private final Options options;
+    private final long fallbackScanMaxSize;
     private final LazyField<CacheManager> cacheManager;
 
     public BTreeGlobalIndexer(DataField dataField, Options options) {
         this.keySerializer = KeySerializer.create(dataField.type());
+        this.keyExtractor = GlobalIndexKeyExtractor.identity(dataField.type());
         this.options = options;
-        // todo: cacheManager can be null to disallow data cache.
+        this.fallbackScanMaxSize =
+                options.get(BTreeIndexOptions.BTREE_INDEX_FALLBACK_SCAN_MAX_SIZE).getBytes();
         this.cacheManager =
                 new LazyField<>(
                         () ->
@@ -74,6 +82,11 @@ public class BTreeGlobalIndexer implements GlobalIndexer {
                                         options.get(
                                                 BTreeIndexOptions
                                                         .BTREE_INDEX_HIGH_PRIORITY_POOL_RATIO)));
+    }
+
+    @Override
+    public GlobalIndexKeyExtractor keyExtractor() {
+        return keyExtractor;
     }
 
     @Override
@@ -92,7 +105,17 @@ public class BTreeGlobalIndexer implements GlobalIndexer {
 
     @Override
     public GlobalIndexReader createReader(
-            GlobalIndexFileReader fileReader, List<GlobalIndexIOMeta> files) throws IOException {
-        return new LazyFilteredBTreeReader(files, keySerializer, fileReader, cacheManager.get());
+            GlobalIndexFileReader fileReader,
+            List<GlobalIndexIOMeta> files,
+            long totalRowCount,
+            ExecutorService executor) {
+        return new LazyFilteredBTreeReader(
+                files,
+                keySerializer,
+                fileReader,
+                cacheManager.get(),
+                fallbackScanMaxSize,
+                totalRowCount,
+                executor);
     }
 }

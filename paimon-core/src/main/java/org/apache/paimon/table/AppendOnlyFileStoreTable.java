@@ -23,6 +23,7 @@ import org.apache.paimon.CoreOptions;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
+import org.apache.paimon.globalindex.DataEvolutionBatchScan;
 import org.apache.paimon.operation.AppendOnlyFileStoreScan;
 import org.apache.paimon.operation.BaseAppendFileStoreWrite;
 import org.apache.paimon.operation.FileStoreScan;
@@ -30,9 +31,12 @@ import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.table.query.LocalTableQuery;
 import org.apache.paimon.table.sink.TableWriteImpl;
+import org.apache.paimon.table.source.AppendBatchTableScan;
 import org.apache.paimon.table.source.AppendOnlySplitGenerator;
 import org.apache.paimon.table.source.AppendTableRead;
 import org.apache.paimon.table.source.DataEvolutionSplitGenerator;
+import org.apache.paimon.table.source.DataEvolutionTableRead;
+import org.apache.paimon.table.source.DataTableScan;
 import org.apache.paimon.table.source.InnerTableRead;
 import org.apache.paimon.table.source.SplitGenerator;
 import org.apache.paimon.table.source.splitread.AppendTableRawFileSplitReadProvider;
@@ -91,8 +95,10 @@ public class AppendOnlyFileStoreTable extends AbstractFileStoreTable {
         CoreOptions options = store().options();
         long targetSplitSize = options.splitTargetSize();
         long openFileCost = options.splitOpenFileCost();
+        boolean blobFileSizeCountInSplitting = options.blobSplitByFileSize();
         return coreOptions().dataEvolutionEnabled()
-                ? new DataEvolutionSplitGenerator(targetSplitSize, openFileCost)
+                ? new DataEvolutionSplitGenerator(
+                        targetSplitSize, openFileCost, blobFileSizeCountInSplitting)
                 : new AppendOnlySplitGenerator(targetSplitSize, openFileCost, bucketMode());
     }
 
@@ -121,7 +127,32 @@ public class AppendOnlyFileStoreTable extends AbstractFileStoreTable {
                             new AppendTableRawFileSplitReadProvider(
                                     () -> store().newRead(), config));
         }
-        return new AppendTableRead(providerFactories, schema());
+        return coreOptions().dataEvolutionEnabled()
+                ? new DataEvolutionTableRead(
+                        providerFactories,
+                        schema(),
+                        coreOptions(),
+                        catalogEnvironment.dependencyReadContext(),
+                        () -> new AppendTableRead(providerFactories, schema()))
+                : new AppendTableRead(providerFactories, schema());
+    }
+
+    @Override
+    public DataTableScan newScan() {
+        return newScan(FileStoreTable::newSnapshotReader);
+    }
+
+    @Override
+    public DataTableScan newScan(SnapshotReaderFactory snapshotReaderFactory) {
+        CoreOptions options = coreOptions();
+        AppendBatchTableScan scan =
+                new AppendBatchTableScan(
+                        schema(),
+                        schemaManager(),
+                        options,
+                        snapshotReaderFactory.create(this),
+                        catalogEnvironment.tableQueryAuth(options));
+        return options.dataEvolutionEnabled() ? new DataEvolutionBatchScan(this, scan) : scan;
     }
 
     @Override

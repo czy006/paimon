@@ -1,0 +1,226 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.predicate;
+
+import org.apache.paimon.data.BinaryString;
+import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.types.DataType;
+import org.apache.paimon.types.DataTypes;
+
+import org.junit.jupiter.api.Test;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+class SubstringTransformTest {
+
+    @Test
+    public void testNullInputs() {
+        List<Object> inputs = new ArrayList<>();
+        inputs.add(BinaryString.fromString(null));
+        inputs.add(1);
+        SubstringTransform transform = new SubstringTransform(inputs);
+        Object result = transform.transform(GenericRow.of());
+        assertThat(result).isEqualTo(null);
+    }
+
+    @Test
+    public void testNormalInputs() {
+        // test substring('hello', 1)
+        List<Object> inputs = new ArrayList<>();
+        inputs.add(BinaryString.fromString("hello"));
+        inputs.add(2);
+        SubstringTransform transform = new SubstringTransform(inputs);
+        Object result = transform.transform(GenericRow.of());
+        assertThat(result).isEqualTo(BinaryString.fromString("ello"));
+
+        // test substring('hello', 1, 3)
+        inputs.add(3);
+        transform = new SubstringTransform(inputs);
+        result = transform.transform(GenericRow.of());
+        assertThat(result).isEqualTo(BinaryString.fromString("ell"));
+
+        // test substring('hello', 1, 100)
+        inputs.remove(2);
+        inputs.add(100);
+        transform = new SubstringTransform(inputs);
+        result = transform.transform(GenericRow.of());
+        assertThat(result).isEqualTo(BinaryString.fromString("ello"));
+
+        // test substring('hello', 5, 1)
+        inputs.clear();
+        inputs.add(BinaryString.fromString("hello"));
+        inputs.add(5);
+        inputs.add(1);
+        transform = new SubstringTransform(inputs);
+        result = transform.transform(GenericRow.of());
+        assertThat(result).isEqualTo(BinaryString.fromString("o"));
+
+        // test substring('hello', 10)
+        inputs.clear();
+        inputs.add(BinaryString.fromString("hello"));
+        inputs.add(10);
+        transform = new SubstringTransform(inputs);
+        result = transform.transform(GenericRow.of());
+        assertThat(result).isEqualTo(BinaryString.fromString(""));
+    }
+
+    @Test
+    public void testSqlPositionSemantics() {
+        List<Object> inputs = new ArrayList<>();
+        inputs.add(BinaryString.fromString("abcdef"));
+        inputs.add(1);
+        inputs.add(2);
+
+        for (Object[] spec :
+                new Object[][] {
+                    {0, 2, "ab"},
+                    {1, 2, "ab"},
+                    {-2, 2, "ef"},
+                    {-2, 9, "ef"},
+                    {-9, 2, ""},
+                    {2, 0, ""},
+                    {2, -1, ""},
+                    {9, 2, ""},
+                    {-9, 5, "ab"}
+                }) {
+            inputs.set(1, spec[0]);
+            inputs.set(2, spec[1]);
+            assertThat(new SubstringTransform(inputs).transform(GenericRow.of()))
+                    .isEqualTo(BinaryString.fromString((String) spec[2]));
+        }
+
+        inputs.remove(2);
+        for (Object[] spec : new Object[][] {{0, "abcdef"}, {-2, "ef"}, {9, ""}, {-9, "abcdef"}}) {
+            inputs.set(1, spec[0]);
+            assertThat(new SubstringTransform(inputs).transform(GenericRow.of()))
+                    .isEqualTo(BinaryString.fromString((String) spec[1]));
+        }
+    }
+
+    @Test
+    public void testSubstringWithSupplementaryCharacter() {
+        SubstringTransform transform =
+                new SubstringTransform(Arrays.asList(BinaryString.fromString("A😀B"), 2, 1));
+
+        assertThat(transform.transform(GenericRow.of())).isEqualTo(BinaryString.fromString("😀"));
+    }
+
+    @Test
+    public void testSubstringRefInputs() {
+        List<Object> inputs = new ArrayList<>();
+        inputs.add(new FieldRef(1, "f1", DataTypes.STRING()));
+        inputs.add(new FieldRef(3, "f3", DataTypes.INT()));
+        inputs.add(new FieldRef(4, "f4", DataTypes.INT()));
+        SubstringTransform transform = new SubstringTransform(inputs);
+        Object result =
+                transform.transform(
+                        GenericRow.of(
+                                BinaryString.fromString(""),
+                                BinaryString.fromString("hello"),
+                                BinaryString.fromString(""),
+                                2,
+                                3));
+        assertThat(result).isEqualTo(BinaryString.fromString("ell"));
+    }
+
+    @Test
+    public void testSubstringRefInputsWithDifferentIntegerTypes() {
+        List<Object> positions = Arrays.asList((byte) 2, (short) 2, 2, 2L);
+        List<DataType> types =
+                Arrays.asList(
+                        DataTypes.TINYINT(),
+                        DataTypes.SMALLINT(),
+                        DataTypes.INT(),
+                        DataTypes.BIGINT());
+
+        for (int i = 0; i < positions.size(); i++) {
+            SubstringTransform transform =
+                    new SubstringTransform(
+                            Arrays.asList(
+                                    new FieldRef(0, "value", DataTypes.STRING()),
+                                    new FieldRef(1, "position", types.get(i)),
+                                    3));
+
+            assertThat(
+                            transform.transform(
+                                    GenericRow.of(
+                                            BinaryString.fromString("hello"), positions.get(i))))
+                    .isEqualTo(BinaryString.fromString("ell"));
+        }
+    }
+
+    @Test
+    public void testNullPositionYieldsNull() {
+        List<Object> literal = new ArrayList<>();
+        literal.add(BinaryString.fromString("123"));
+        literal.add(null);
+        assertThat(new SubstringTransform(literal).transform(GenericRow.of())).isNull();
+
+        literal.set(1, 1);
+        literal.add(null);
+        assertThat(new SubstringTransform(literal).transform(GenericRow.of())).isNull();
+
+        // a null length propagates even when begin is past the end, which on its own
+        // would have yielded an empty string
+        literal.set(1, 99);
+        assertThat(new SubstringTransform(literal).transform(GenericRow.of())).isNull();
+
+        // and it is found before the malformed begin next to it is parsed
+        literal.set(1, BinaryString.fromString("bad"));
+        assertThat(new SubstringTransform(literal).transform(GenericRow.of())).isNull();
+    }
+
+    @Test
+    public void testNullPositionFieldYieldsNull() {
+        List<Object> inputs = new ArrayList<>();
+        inputs.add(new FieldRef(0, "f0", DataTypes.STRING()));
+        inputs.add(new FieldRef(1, "f1", DataTypes.INT()));
+        assertThat(
+                        new SubstringTransform(inputs)
+                                .transform(
+                                        GenericRow.of(
+                                                BinaryString.fromString("123-45-6789"), null)))
+                .isNull();
+
+        inputs.add(new FieldRef(2, "f2", DataTypes.INT()));
+        assertThat(
+                        new SubstringTransform(inputs)
+                                .transform(
+                                        GenericRow.of(
+                                                BinaryString.fromString("123-45-6789"), 8, null)))
+                .isNull();
+    }
+
+    @Test
+    public void testSubstringRefInputUsesSourceFieldNullability() {
+        List<Object> inputs = new ArrayList<>();
+        inputs.add(new FieldRef(1, "f1", DataTypes.STRING()));
+        inputs.add(2);
+        inputs.add(3);
+        SubstringTransform transform = new SubstringTransform(inputs);
+
+        Object result = transform.transform(GenericRow.of(null, BinaryString.fromString("hello")));
+
+        assertThat(result).isEqualTo(BinaryString.fromString("ell"));
+    }
+}

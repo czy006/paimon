@@ -1,30 +1,38 @@
-################################################################################
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-# limitations under the License.
-################################################################################
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
 import os
 import random
+import shutil
 import tempfile
 import unittest
 
 import pandas as pd
 import pyarrow as pa
+import pytest
+import pyarrow.dataset as ds
 
 from pypaimon import CatalogFactory, Schema
-from pypaimon.table.row.generic_row import GenericRowDeserializer
+from pypaimon.common.predicate import Predicate
+from pypaimon.manifest.schema.simple_stats import SimpleStats
+from pypaimon.schema.data_types import DataField
+from pypaimon.table.row.generic_row import GenericRow, GenericRowDeserializer
+from pypaimon.table.row.offset_row import OffsetRow
+from pypaimon.table.row.projected_row import ProjectedRow
 
 
 def _check_filtered_result(read_builder, expected_df):
@@ -41,6 +49,26 @@ def _random_format():
 
 class PredicateTest(unittest.TestCase):
 
+    def test_large_boolean_arrow_expression_is_balanced(self):
+        class Expression:
+            def __init__(self, depth=1):
+                self.depth = depth
+
+            def __or__(self, other):
+                return Expression(max(self.depth, other.depth) + 1)
+
+        predicates = []
+        for _ in range(2000):
+            predicate = Predicate('equal', 0, 'id', [1])
+            predicate.to_arrow = lambda: Expression()
+            predicates.append(predicate)
+
+        expression = Predicate(
+            'or', None, None, predicates,
+        ).to_arrow()
+
+        self.assertLessEqual(expression.depth, 12)
+
     @classmethod
     def setUpClass(cls):
         cls.tempdir = tempfile.mkdtemp()
@@ -52,7 +80,7 @@ class PredicateTest(unittest.TestCase):
             ('f1', pa.string()),
         ])
         cls.catalog.create_table('default.test_append', Schema.from_pyarrow_schema(
-            pa_schema, options={'file.format': _random_format()}), False)
+            pa_schema, options={'file.format': _random_format(), 'metadata.stats-mode': 'full'}), False)
         cls.catalog.create_table('default.test_pk', Schema.from_pyarrow_schema(
             pa_schema, primary_keys=['f0'], options={'bucket': '1', 'file.format': _random_format()}), False)
 
@@ -81,12 +109,27 @@ class PredicateTest(unittest.TestCase):
 
         cls.df = df
 
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tempdir, ignore_errors=True)
+
     def test_wrong_field_name(self):
         table = self.catalog.get_table('default.test_append')
         predicate_builder = table.new_read_builder().new_predicate_builder()
         with self.assertRaises(ValueError) as e:
             predicate_builder.equal('f2', 'a')
         self.assertEqual(str(e.exception), "The field f2 is not in field list ['f0', 'f1'].")
+
+    def test_exclude_predicate_with_fields(self):
+        from pypaimon.read.push_down_utils import exclude_predicate_with_fields
+        pb = self.catalog.get_table('default.test_append').new_read_builder().new_predicate_builder()
+        f0 = pb.is_null('f0')
+        f1 = pb.is_null('f1')
+
+        self.assertIsNone(exclude_predicate_with_fields(f0, {'f0'}))
+        self.assertIs(exclude_predicate_with_fields(f1, {'f0'}), f1)
+        self.assertIs(exclude_predicate_with_fields(pb.and_predicates([f0, f1]), {'f0'}), f1)
+        self.assertIsNone(exclude_predicate_with_fields(pb.or_predicates([f0, f1]), {'f0'}))
 
     def test_append_with_duplicate(self):
         pa_schema = pa.schema([
@@ -326,6 +369,18 @@ class PredicateTest(unittest.TestCase):
         predicate = predicate_builder.is_in('f0', [1, 2])
         _check_filtered_result(table.new_read_builder().with_filter(predicate), self.df.loc[0:1])
 
+    def test_is_in_with_null_literal_append(self):
+        table = self.catalog.get_table('default.test_append')
+        predicate_builder = table.new_read_builder().new_predicate_builder()
+
+        predicate = predicate_builder.is_in('f1', [None])
+        _check_filtered_result(
+            table.new_read_builder().with_filter(predicate), self.df.iloc[0:0])
+
+        predicate = predicate_builder.is_in('f1', ['abc', None])
+        _check_filtered_result(
+            table.new_read_builder().with_filter(predicate), self.df.loc[[0]])
+
     def test_is_in_pk(self):
         table = self.catalog.get_table('default.test_pk')
         predicate_builder = table.new_read_builder().new_predicate_builder()
@@ -338,11 +393,18 @@ class PredicateTest(unittest.TestCase):
         predicate = predicate_builder.is_not_in('f0', [1, 2])
         _check_filtered_result(table.new_read_builder().with_filter(predicate), self.df.loc[2:4])
 
+    def test_is_not_in_with_null_literal_append(self):
+        table = self.catalog.get_table('default.test_append')
+        predicate_builder = table.new_read_builder().new_predicate_builder()
+        predicate = predicate_builder.is_not_in('f1', ['abc', None])
+        _check_filtered_result(
+            table.new_read_builder().with_filter(predicate), self.df.iloc[0:0])
+
     def test_is_not_in_pk(self):
         table = self.catalog.get_table('default.test_pk')
         predicate_builder = table.new_read_builder().new_predicate_builder()
         predicate = predicate_builder.is_not_in('f1', ['abc', 'abbc'])
-        _check_filtered_result(table.new_read_builder().with_filter(predicate), self.df.loc[2:4])
+        _check_filtered_result(table.new_read_builder().with_filter(predicate), self.df.loc[[2, 3]])
 
     def test_between_append(self):
         table = self.catalog.get_table('default.test_append')
@@ -354,6 +416,30 @@ class PredicateTest(unittest.TestCase):
         table = self.catalog.get_table('default.test_pk')
         predicate_builder = table.new_read_builder().new_predicate_builder()
         predicate = predicate_builder.between('f0', 1, 3)
+        _check_filtered_result(table.new_read_builder().with_filter(predicate), self.df.loc[0:2])
+
+    def test_not_between_append(self):
+        table = self.catalog.get_table('default.test_append')
+        predicate_builder = table.new_read_builder().new_predicate_builder()
+        predicate = predicate_builder.not_between('f0', 2, 4)
+        _check_filtered_result(table.new_read_builder().with_filter(predicate), self.df.loc[[0, 4]])
+
+    def test_not_between_pk(self):
+        table = self.catalog.get_table('default.test_pk')
+        predicate_builder = table.new_read_builder().new_predicate_builder()
+        predicate = predicate_builder.not_between('f0', 2, 4)
+        _check_filtered_result(table.new_read_builder().with_filter(predicate), self.df.loc[[0, 4]])
+
+    def test_like_append(self):
+        table = self.catalog.get_table('default.test_append')
+        predicate_builder = table.new_read_builder().new_predicate_builder()
+        predicate = predicate_builder.like('f1', 'ab%')
+        _check_filtered_result(table.new_read_builder().with_filter(predicate), self.df.loc[0:1])
+
+    def test_like_pk(self):
+        table = self.catalog.get_table('default.test_pk')
+        predicate_builder = table.new_read_builder().new_predicate_builder()
+        predicate = predicate_builder.like('f1', '%bc')
         _check_filtered_result(table.new_read_builder().with_filter(predicate), self.df.loc[0:2])
 
     def test_and_predicates(self):
@@ -373,6 +459,172 @@ class PredicateTest(unittest.TestCase):
         _check_filtered_result(table.new_read_builder().with_filter(predicate),
                                self.df.loc[[0, 3, 4]])
 
+    def test_is_null(self):
+        stat_no_count = SimpleStats(
+            min_values=GenericRow([], []),
+            max_values=GenericRow([], []),
+            null_counts=[None],
+        )
+        pred = Predicate(method="isNull", index=0, field="c", literals=None)
+        self.assertTrue(
+            pred.test_by_simple_stats(stat_no_count, 10),
+            "isNull must keep file when null_count is missing",
+        )
+        # null_count == 0 -> can prune
+        stat_zero = SimpleStats(
+            min_values=GenericRow([], []),
+            max_values=GenericRow([], []),
+            null_counts=[0],
+        )
+        self.assertFalse(pred.test_by_simple_stats(stat_zero, 10))
+        # null_count > 0 -> keep
+        stat_positive = SimpleStats(
+            min_values=GenericRow([], []),
+            max_values=GenericRow([], []),
+            null_counts=[3],
+        )
+        self.assertTrue(pred.test_by_simple_stats(stat_positive, 10))
+
+    def test_by_simple_stats_with_incomplete_fields(self):
+        fields = [DataField(0, 'f0', 'INT'), DataField(1, 'f1', 'INT')]
+        predicate = Predicate(method='equal', index=1, field='f1', literals=[15])
+        stats = [
+            SimpleStats(
+                min_values=GenericRow([1], fields[:1]),
+                max_values=GenericRow([10, 20], fields),
+                null_counts=[0, 0],
+            ),
+            SimpleStats(
+                min_values=GenericRow([1, 2], fields),
+                max_values=GenericRow([10], fields[:1]),
+                null_counts=[0, 0],
+            ),
+            SimpleStats(
+                min_values=GenericRow([1], fields[:1]),
+                max_values=GenericRow([10], fields[:1]),
+                null_counts=[0],
+            ),
+        ]
+
+        for stat in stats:
+            with self.subTest(stat=stat):
+                self.assertTrue(predicate.test_by_simple_stats(stat, 10))
+
+    def test_by_simple_stats_without_null_counts(self):
+        fields = [DataField(0, 'f0', 'INT')]
+        predicate = Predicate(method='equal', index=0, field='f0', literals=[20])
+        for null_counts in (None, []):
+            stat = SimpleStats(
+                min_values=GenericRow([1], fields),
+                max_values=GenericRow([10], fields),
+                null_counts=null_counts,
+            )
+            with self.subTest(null_counts=null_counts):
+                self.assertFalse(predicate.test_by_simple_stats(stat, 10))
+
+    def test_by_simple_stats_with_invalid_index(self):
+        fields = [DataField(0, 'f0', 'INT')]
+        stat = SimpleStats(
+            min_values=GenericRow([1], fields),
+            max_values=GenericRow([10], fields),
+            null_counts=[0],
+        )
+        for index in (None, -1):
+            predicate = Predicate(
+                method='equal', index=index, field='_ROW_ID', literals=[5])
+            with self.subTest(index=index):
+                self.assertTrue(predicate.test_by_simple_stats(stat, 10))
+
+    def test_by_simple_stats_null_predicate_without_null_counts(self):
+        fields = [DataField(0, 'f0', 'INT')]
+        stat = SimpleStats(
+            min_values=GenericRow([1], fields),
+            max_values=GenericRow([10], fields),
+            null_counts=None,
+        )
+        for method in ('isNull', 'isNotNull'):
+            predicate = Predicate(method=method, index=0, field='f0')
+            with self.subTest(method=method):
+                self.assertTrue(predicate.test_by_simple_stats(stat, 10))
+
+    def test_by_simple_stats_with_projected_rows(self):
+        fields = [DataField(0, 'f0', 'INT'), DataField(1, 'f1', 'INT')]
+        row = GenericRow([1, 2], fields)
+        min_values = ProjectedRow.from_index_mapping([0]).replace_row(row)
+        max_values = ProjectedRow.from_index_mapping([0]).replace_row(row)
+        stat = SimpleStats(min_values, max_values, [0, 0])
+        predicate = Predicate(method='equal', index=1, field='f1', literals=[2])
+
+        self.assertEqual(len(min_values), 1)
+        self.assertTrue(predicate.test_by_simple_stats(stat, 10))
+
+    def test_filter_with_null_and_or(self):
+        p_gt = Predicate(method='greaterThan', index=1, field='score', literals=[10])
+        p_null = Predicate(method='isNull', index=1, field='score', literals=[])
+        predicate = Predicate(method='or', index=None, field=None, literals=[p_gt, p_null])
+
+        record_null = OffsetRow([1, None], 0, 2)  # id=1, score=None
+        self.assertTrue(predicate.test(record_null))
+
+        record_ok = OffsetRow([1, 15], 0, 2)
+        self.assertTrue(predicate.test(record_ok))
+
+        predicate_safe = Predicate(method='or', index=None, field=None, literals=[p_null, p_gt])
+        self.assertTrue(predicate_safe.test(record_null))
+
+    def test_like_pattern_matching(self):
+        predicate = Predicate(method='like', index=0, field='name', literals=['a%c'])
+        self.assertTrue(predicate.test(OffsetRow(['abc'], 0, 1)))
+        self.assertTrue(predicate.test(OffsetRow(['aXYZc'], 0, 1)))
+        self.assertFalse(predicate.test(OffsetRow(['aXYZd'], 0, 1)))
+
+        underscore_pred = Predicate(method='like', index=0, field='name', literals=['a_c'])
+        self.assertTrue(underscore_pred.test(OffsetRow(['abc'], 0, 1)))
+        self.assertFalse(underscore_pred.test(OffsetRow(['aXYc'], 0, 1)))
+
+    def test_not_between_value(self):
+        predicate = Predicate(method='notBetween', index=0, field='val', literals=[3, 7])
+        self.assertTrue(predicate.test(OffsetRow([1], 0, 1)))
+        self.assertTrue(predicate.test(OffsetRow([10], 0, 1)))
+        self.assertFalse(predicate.test(OffsetRow([5], 0, 1)))
+        self.assertFalse(predicate.test(OffsetRow([3], 0, 1)))
+        self.assertFalse(predicate.test(OffsetRow([None], 0, 1)))
+
+    def test_not_in_arrow_filter_excludes_nulls(self):
+        predicate = Predicate(method='notIn', index=0, field='val', literals=[1, 2])
+        table = pa.table({"val": [None, 1, 3]})
+        scanner = ds.InMemoryDataset(table).scanner(filter=predicate.to_arrow())
+
+        self.assertEqual(scanner.to_table().to_pydict(), {"val": [3]})
+
+    def test_in_and_not_in_null_literal_semantics(self):
+        table = pa.table({"val": [None, 1, 2]})
+
+        in_predicate = Predicate(
+            method='in', index=0, field='val', literals=[1, None])
+        scanner = ds.InMemoryDataset(table).scanner(
+            filter=in_predicate.to_arrow())
+        self.assertEqual(scanner.to_table().to_pydict(), {"val": [1]})
+
+        not_in_predicate = Predicate(
+            method='notIn', index=0, field='val', literals=[1, None])
+        scanner = ds.InMemoryDataset(table).scanner(
+            filter=not_in_predicate.to_arrow())
+        self.assertEqual(scanner.to_table().to_pydict(), {"val": []})
+        self.assertFalse(not_in_predicate.test(OffsetRow([2], 0, 1)))
+
+        fields = [DataField(0, 'val', 'INT')]
+        stats = SimpleStats(
+            min_values=GenericRow([1], fields),
+            max_values=GenericRow([2], fields),
+            null_counts=[0],
+        )
+        self.assertFalse(Predicate(
+            method='in', index=0, field='val', literals=[None]
+        ).test_by_simple_stats(stats, 2))
+        self.assertFalse(not_in_predicate.test_by_simple_stats(stats, 2))
+
+    @pytest.mark.python_plan
     def test_pk_reader_with_filter(self):
         pa_schema = pa.schema([
             pa.field('key1', pa.int32(), nullable=False),

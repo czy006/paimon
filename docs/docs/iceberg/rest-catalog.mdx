@@ -1,0 +1,158 @@
+---
+title: "REST Catalog"
+sidebar_position: 6
+---
+
+import Stable from '@site/src/components/Stable';
+import Unstable from '@site/src/components/Unstable';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# REST Catalog
+
+Use `rest-catalog` to publish the Iceberg representation to an Iceberg REST catalog service.
+Paimon first writes Iceberg metadata to its configured filesystem location, then commits the
+corresponding metadata to the REST catalog.
+
+## Dependencies
+
+The Paimon writer needs the `paimon-iceberg` JAR in addition to its engine connector. The REST
+module requires JDK 11 or later.
+
+<Stable>
+
+Download [paimon-iceberg-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-iceberg/@@VERSION@@/paimon-iceberg-@@VERSION@@.jar).
+
+</Stable>
+<Unstable>
+
+Download the matching [paimon-iceberg snapshot JAR](https://repository.apache.org/snapshots/org/apache/paimon/paimon-iceberg/@@VERSION@@/).
+
+</Unstable>
+
+For Flink, install the JAR on the cluster and SQL client classpaths before starting them.
+For Spark, include it in `--jars` alongside the Paimon Spark JAR. Iceberg readers still need
+their own engine-compatible Iceberg runtime.
+
+To build this module from the repository root with JDK 11 or later, activate its Maven profile:
+
+```bash
+mvn -Ppaimon-iceberg -pl paimon-iceberg -am -DskipTests package
+```
+
+The bundled JAR is written to `paimon-iceberg/target/paimon-iceberg-@@VERSION@@.jar`.
+
+## Configure the Service
+
+Paimon passes table options prefixed with `metadata.iceberg.rest.` to the Iceberg REST client after
+removing the prefix. For example:
+
+| Paimon table option | REST client property |
+| --- | --- |
+| `metadata.iceberg.rest.uri` | `uri` |
+| `metadata.iceberg.rest.warehouse` | `warehouse` |
+| `metadata.iceberg.rest.clients` | `clients` |
+
+Set the endpoint and any warehouse or authentication properties required by your service. Configure
+the reader independently with the corresponding Iceberg catalog properties. Both sides must select
+the same REST warehouse and namespace.
+
+## Publish and Read an Append Table
+
+This Flink example uses an append table so you can verify REST publication without first configuring
+primary key compaction. Replace the placeholders and add the authentication settings your service
+requires to both catalogs.
+
+```sql
+SET 'execution.runtime-mode' = 'batch';
+SET 'table.dml-sync' = 'true';
+
+CREATE CATALOG paimon_catalog WITH (
+    'type' = 'paimon',
+    'warehouse' = '<path-to-paimon-warehouse>'
+);
+
+CREATE DATABASE IF NOT EXISTS paimon_catalog.`default`;
+
+CREATE TABLE paimon_catalog.`default`.cities_rest (
+    country STRING,
+    name STRING
+) WITH (
+    'metadata.iceberg.storage' = 'rest-catalog',
+    'metadata.iceberg.rest.uri' = 'https://<rest-catalog-host>',
+    'metadata.iceberg.rest.warehouse' = '<rest-warehouse>'
+);
+
+INSERT INTO paimon_catalog.`default`.cities_rest VALUES
+    ('germany', 'berlin'), ('germany', 'hamburg');
+
+CREATE CATALOG iceberg_rest WITH (
+    'type' = 'iceberg',
+    'catalog-type' = 'rest',
+    'uri' = 'https://<rest-catalog-host>',
+    'warehouse' = '<rest-warehouse>',
+    'cache-enabled' = 'false'
+);
+
+SELECT country, name FROM iceberg_rest.`default`.cities_rest ORDER BY name;
+```
+
+```text
+country  name
+germany  berlin
+germany  hamburg
+```
+
+For primary key tables, also select a [compaction or deletion-vector mode](./primary-key-table.mdx).
+The REST service does not remove those visibility requirements.
+
+## Publication and Recovery
+
+The local metadata uses the [separate catalog layout](./catalogs.md#metadata-layout) by default.
+REST publication uses Paimon's generated metadata as its source of truth:
+
+| REST table state | Publication behavior |
+| --- | --- |
+| Table is absent | Create or register the table, then publish its state |
+| The same snapshot and commit identity are already published | Treat the retry as complete |
+| Table exists without a snapshot after an incomplete creation | Complete publication without an unnecessary drop/create cycle |
+| Current state matches the expected base | Commit the metadata update |
+| Current state conflicts with the expected base | Rebuild or re-register the Iceberg representation from Paimon's metadata |
+
+Recovery can remove and recreate the REST catalog entry. Removal uses non-purging semantics: it
+does not delete the shared data files. Some v3 recovery paths must register a metadata file directly
+to preserve row IDs; Paimon checks the service's registration support before removing the existing entry.
+
+Keep writes and table maintenance in Paimon. Independent changes through the Iceberg catalog can
+conflict with later publication and be replaced during recovery.
+
+## Schema and Feature Compatibility
+
+Paimon field IDs start at zero, while Iceberg table creation assigns IDs starting at one. Paimon
+handles this difference during REST table creation and schema publication. If the first field is
+also a partition field, creation may require an intermediate unpartitioned schema and partition
+spec evolution. Do not manually renumber the fields in the Iceberg representation.
+
+Tables containing `GEOMETRY` or `GEOGRAPHY` columns cannot use REST publication because the bundled
+REST client cannot parse those Iceberg v3 types. Use Hadoop, Hive, or table-location storage;
+see [data types](./data-types.md).
+
+Paimon tag creation and deletion are not guaranteed to propagate to the REST catalog. See
+[tags and publication limits](./iceberg-tags.md).

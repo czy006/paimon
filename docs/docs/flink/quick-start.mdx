@@ -1,0 +1,156 @@
+---
+title: "Quick Start"
+sidebar_position: 1
+---
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# Quick Start
+
+This tutorial runs a streaming word count on a local Flink cluster, stores the results in Paimon,
+and reads the table in batch and streaming modes.
+
+## Jars
+
+Download and install the matching connector and dependencies using [Installation](./installation).
+The tutorial uses a single-machine warehouse at `file:/tmp/paimon`.
+
+## Start
+
+### 1. Start Flink and the SQL Client
+
+Configure enough slots to run a writer and a reader at the same time. Set the following in
+your Flink configuration file (`conf/config.yaml` or, for older distributions,
+`conf/flink-conf.yaml`):
+
+```yaml
+taskmanager.numberOfTaskSlots: 2
+```
+
+Start the cluster and SQL client:
+
+```bash
+<FLINK_HOME>/bin/start-cluster.sh
+<FLINK_HOME>/bin/sql-client.sh
+```
+
+Check the [Flink dashboard](http://localhost:8081), then set each tutorial job to parallelism 1:
+
+```sql
+SET 'parallelism.default' = '1';
+```
+
+### 2. Create a Catalog and Table
+
+```sql
+CREATE CATALOG my_catalog WITH (
+    'type' = 'paimon',
+    'warehouse' = 'file:/tmp/paimon'
+);
+
+USE CATALOG my_catalog;
+
+CREATE TABLE word_count (
+    word STRING PRIMARY KEY NOT ENFORCED,
+    cnt BIGINT
+);
+```
+
+The primary key lets Paimon update the count for each word. For catalog alternatives, see
+[SQL DDL](./sql-ddl).
+
+### 3. Write a Stream
+
+```sql
+CREATE TEMPORARY TABLE word_table (
+    word STRING
+) WITH (
+    'connector' = 'datagen',
+    'fields.word.length' = '1',
+    'rows-per-second' = '100'
+);
+
+SET 'execution.runtime-mode' = 'streaming';
+SET 'execution.checkpointing.interval' = '10 s';
+SET 'table.dml-sync' = 'false';
+
+INSERT INTO word_count
+SELECT word, COUNT(*) FROM word_table GROUP BY word;
+```
+
+Keep this job running. Wait for its first successful checkpoint in the Flink dashboard before
+querying: streaming writes become visible through committed Paimon snapshots.
+
+### 4. Read the Current Results
+
+```sql
+SET 'sql-client.execution.result-mode' = 'tableau';
+SET 'execution.runtime-mode' = 'batch';
+RESET 'execution.checkpointing.interval';
+
+SELECT * FROM word_count;
+```
+
+Each batch query reads a snapshot and finishes. Repeat it to see updated counts. Switching the
+SQL client's runtime mode does not stop the streaming writer submitted in the previous step.
+
+### 5. Follow Changes
+
+```sql
+SET 'execution.runtime-mode' = 'streaming';
+
+SELECT * FROM word_count;
+```
+
+The streaming query reads the current table and continues following changes. The result is
+unbounded; cancel it with **Ctrl+C** when you finish. See [SQL Query](./sql-query) for startup
+modes, time travel, and incremental reads.
+
+### 6. Clean Up
+
+Cancel the remaining writer in the [Flink dashboard](http://localhost:8081), then exit the SQL client:
+
+```sql
+-- Optional: delete the tutorial table and its files after stopping the jobs.
+-- DROP TABLE word_count;
+EXIT;
+```
+
+```bash
+<FLINK_HOME>/bin/stop-cluster.sh
+```
+
+## Use Flink Managed Memory
+
+For writer memory configuration, see [Runtime Configuration](./configuration#use-flink-managed-memory).
+
+## Setting dynamic options
+
+For SQL hints and session options, see [Runtime Configuration](./configuration#setting-dynamic-options).
+
+## Next Steps
+
+| Task | Guide |
+| --- | --- |
+| Choose keys, partitions, and a catalog | [SQL DDL](./sql-ddl) |
+| Insert, overwrite, update, or delete data | [SQL Write](./sql-write) |
+| Enrich a stream with dimension data | [Lookup Joins](./sql-lookup) |
+| Ingest changes from an external database | [CDC Ingestion](../cdc-ingestion/) |
+| Build a job in Java | [Flink API](../program-api/flink-api) |

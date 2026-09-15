@@ -1,5 +1,4 @@
 # Licensed to the Apache Software Foundation (ASF) under one
-# Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
 # regarding copyright ownership.  The ASF licenses this file
@@ -7,13 +6,14 @@
 # "License"); you may not use this file except in compliance
 # with the License.  You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
 import logging
 import unittest
@@ -31,7 +31,7 @@ from pypaimon.common.identifier import Identifier
 from pypaimon.common.json_util import JSON
 from pypaimon.schema.data_types import (ArrayType, AtomicInteger, AtomicType,
                                         DataField, DataTypeParser, MapType,
-                                        RowType)
+                                        RowType, VectorType)
 from pypaimon.schema.table_schema import TableSchema
 from pypaimon.tests.rest.rest_server import RESTCatalogServer
 
@@ -124,6 +124,17 @@ class ApiTest(unittest.TestCase):
         value_type: RowType = element_type.value
         self.assertEqual(value_type.fields[0].type.type, 'BIGINT')
         self.assertEqual(value_type.fields[1].type.type, 'DOUBLE')
+
+        vector_json = {
+            "type": "VECTOR",
+            "element": "BOOLEAN NOT NULL",
+            "length": 7
+        }
+        vector_type: VectorType = DataTypeParser.parse_data_type(vector_json, field_id)
+        self.assertTrue(vector_type.nullable)
+        self.assertEqual(vector_type.element.type, "BOOLEAN")
+        self.assertFalse(vector_type.element.nullable)
+        self.assertEqual(vector_type.length, 7)
 
     def test_api(self):
         """Example usage of RESTCatalogServer"""
@@ -319,15 +330,207 @@ class ApiTest(unittest.TestCase):
 
         # Test commit_snapshot with None identifier
         with self.assertRaises(ValueError) as context:
-            rest_api.commit_snapshot(None, "uuid", Mock(), [])
+            rest_api.commit_snapshot(None, "uuid", None, Mock(), [])
         self.assertIn("Identifier cannot be None", str(context.exception))
 
         # Test commit_snapshot with None snapshot
         with self.assertRaises(ValueError) as context:
-            rest_api.commit_snapshot(Mock(), "uuid", None, [])
+            rest_api.commit_snapshot(Mock(), "uuid", None, None, [])
         self.assertIn("Snapshot cannot be None", str(context.exception))
 
         # Test commit_snapshot with None statistics
         with self.assertRaises(ValueError) as context:
-            rest_api.commit_snapshot(Mock(), "uuid", Mock(), None)
+            rest_api.commit_snapshot(Mock(), "uuid", None, Mock(), None)
         self.assertIn("Statistics cannot be None", str(context.exception))
+
+    def test_list_tables_paged_with_table_type_param(self):
+        config = ConfigResponse(defaults={"prefix": "mock-test"})
+        token = str(uuid.uuid4())
+        server = RESTCatalogServer(
+            data_path="/tmp/test_warehouse",
+            auth_provider=BearTokenAuthProvider(token),
+            config=config,
+            warehouse="test_warehouse"
+        )
+        try:
+            server.start()
+
+            server.database_store.update({
+                "default": server.mock_database("default", {"env": "test"})
+            })
+
+            data_fields = [
+                DataField(0, "id", AtomicType("INT"), "id"),
+            ]
+            table_schema = TableSchema(
+                TableSchema.CURRENT_VERSION,
+                len(data_fields),
+                data_fields,
+                len(data_fields),
+                [],
+                [],
+                {"type": "table"},
+                "",
+            )
+            format_table_schema = TableSchema(
+                TableSchema.CURRENT_VERSION,
+                len(data_fields),
+                data_fields,
+                len(data_fields),
+                [],
+                [],
+                {"type": "format-table"},
+                "",
+            )
+            iceberg_table_schema = TableSchema(
+                TableSchema.CURRENT_VERSION,
+                len(data_fields),
+                data_fields,
+                len(data_fields),
+                [],
+                [],
+                {"type": "iceberg-table"},
+                "",
+            )
+            server.table_metadata_store.update({
+                "default.normal_table_1": TableMetadata(
+                    uuid=str(uuid.uuid4()),
+                    is_external=True,
+                    schema=table_schema
+                ),
+                "default.format_table_1": TableMetadata(
+                    uuid=str(uuid.uuid4()),
+                    is_external=True,
+                    schema=format_table_schema
+                ),
+                "default.iceberg_table_1": TableMetadata(
+                    uuid=str(uuid.uuid4()),
+                    is_external=True,
+                    schema=iceberg_table_schema
+                ),
+                "default.normal_table_2": TableMetadata(
+                    uuid=str(uuid.uuid4()),
+                    is_external=True,
+                    schema=table_schema
+                ),
+                "default.format_table_2": TableMetadata(
+                    uuid=str(uuid.uuid4()),
+                    is_external=True,
+                    schema=format_table_schema
+                ),
+                "default.iceberg_table_2": TableMetadata(
+                    uuid=str(uuid.uuid4()),
+                    is_external=True,
+                    schema=iceberg_table_schema
+                ),
+            })
+
+            options = {
+                'uri': f"http://localhost:{server.port}",
+                'warehouse': 'test_warehouse',
+                'dlf.region': 'cn-hangzhou',
+                "token.provider": "bear",
+                'token': token
+            }
+            rest_api = RESTApi(options)
+
+            all_result = rest_api.list_tables_paged("default")
+            table_result = rest_api.list_tables_paged("default", table_type="table")
+            format_table_result = rest_api.list_tables_paged("default", table_type="format-table")
+            iceberg_table_result = rest_api.list_tables_paged("default", table_type="iceberg-table")
+
+            self.assertEqual(
+                [
+                    "format_table_1",
+                    "format_table_2",
+                    "iceberg_table_1",
+                    "iceberg_table_2",
+                    "normal_table_1",
+                    "normal_table_2",
+                ],
+                all_result.elements,
+            )
+            self.assertEqual(["normal_table_1", "normal_table_2"], table_result.elements)
+            self.assertEqual(["format_table_1", "format_table_2"], format_table_result.elements)
+            self.assertEqual(["iceberg_table_1", "iceberg_table_2"], iceberg_table_result.elements)
+
+            filtered_with_pattern = rest_api.list_tables_paged(
+                "default", table_type="table", table_name_pattern="%_2"
+            )
+            self.assertEqual(["normal_table_2"], filtered_with_pattern.elements)
+
+            first_page = rest_api.list_tables_paged(
+                "default", max_results=1, table_type="table"
+            )
+            self.assertEqual(["normal_table_1"], first_page.elements)
+            self.assertIsNotNone(first_page.next_page_token)
+
+            second_page = rest_api.list_tables_paged(
+                "default", max_results=1, page_token=first_page.next_page_token, table_type="table"
+            )
+            self.assertEqual(["normal_table_2"], second_page.elements)
+            self.assertEqual("normal_table_2", second_page.next_page_token)
+        finally:
+            server.shutdown()
+
+
+class ConfigResponseTest(unittest.TestCase):
+
+    def test_deserialize_overrides(self):
+        response = JSON.from_json(
+            '{"defaults": {"a": "1"}, "overrides": {"data-token.enabled": "true"}}',
+            ConfigResponse,
+        )
+        self.assertEqual({"a": "1"}, response.defaults)
+        self.assertEqual({"data-token.enabled": "true"}, response.overrides)
+
+    def test_deserialize_without_overrides(self):
+        response = JSON.from_json('{"defaults": {"a": "1"}}', ConfigResponse)
+        self.assertIsNone(response.overrides)
+        self.assertEqual({"a": "1"}, response.merge(Options({})).to_map())
+
+    def test_serialize_skips_absent_overrides(self):
+        self.assertEqual(
+            '{"defaults": {"a": "1"}}',
+            JSON.to_json(ConfigResponse(defaults={"a": "1"})),
+        )
+
+    def test_merge_priority(self):
+        response = ConfigResponse(
+            defaults={"only-default": "d", "shared": "from-defaults", "forced": "from-defaults"},
+            overrides={"forced": "from-overrides", "only-override": "o"},
+        )
+        merged = response.merge(Options({"shared": "from-client", "forced": "from-client"}))
+        self.assertEqual(
+            {
+                "only-default": "d",
+                # client options win over server defaults
+                "shared": "from-client",
+                # server overrides win over client options
+                "forced": "from-overrides",
+                "only-override": "o",
+            },
+            merged.to_map(),
+        )
+
+    def test_merge_does_not_mutate_client_options(self):
+        options = Options({"shared": "from-client"})
+        response = ConfigResponse(defaults={"a": "1"}, overrides={"shared": "from-overrides"})
+        response.merge(options)
+        self.assertEqual({"shared": "from-client"}, options.to_map())
+
+    def test_merge_filters_none_values(self):
+        response = ConfigResponse(
+            defaults={"from-defaults": None, "reset-by-override": "1"},
+            overrides={"from-overrides": None, "reset-by-override": None},
+        )
+        merged = response.merge(Options({"from-client": None, "kept": "v"}))
+        self.assertEqual({"kept": "v"}, merged.to_map())
+
+    def test_merge_enables_data_token_from_overrides(self):
+        response = ConfigResponse(
+            defaults={},
+            overrides={CatalogOptions.DATA_TOKEN_ENABLED.key(): "true"},
+        )
+        merged = response.merge(Options({CatalogOptions.DATA_TOKEN_ENABLED.key(): "false"}))
+        self.assertTrue(merged.get(CatalogOptions.DATA_TOKEN_ENABLED))

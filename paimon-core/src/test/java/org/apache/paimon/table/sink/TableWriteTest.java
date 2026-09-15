@@ -31,8 +31,8 @@ import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.reader.RecordReaderIterator;
+import org.apache.paimon.schema.FileSystemSchemaManager;
 import org.apache.paimon.schema.Schema;
-import org.apache.paimon.schema.SchemaManager;
 import org.apache.paimon.schema.SchemaUtils;
 import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.table.FileStoreTable;
@@ -62,6 +62,7 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Predicate;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests for {@link TableWriteImpl}. */
 public class TableWriteTest {
@@ -297,6 +298,24 @@ public class TableWriteTest {
         commit.close();
     }
 
+    @Test
+    public void testPartitionTimestampValidation() throws Exception {
+        Options conf = new Options();
+        conf.set(CoreOptions.BUCKET, 1);
+        conf.set(CoreOptions.PARTITION_TIMESTAMP_FORMATTER, "yyyyMMdd");
+        conf.set(CoreOptions.PARTITION_TIMESTAMP_FORMAT_STRICT, true);
+        FileStoreTable table = createFileStoreTable(conf);
+
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        // valid partition value: 20260316 matches yyyyMMdd
+        write.write(GenericRow.of(20260316, 1, 1L));
+        // invalid partition value: -100 does not match yyyyMMdd
+        assertThatThrownBy(() -> write.write(GenericRow.of(-100, 1, 1L)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("partition.timestamp-formatter");
+        write.close();
+    }
+
     private BinaryRow partition(int x) {
         BinaryRow partition = new BinaryRow(1);
         BinaryRowWriter writer = new BinaryRowWriter(partition);
@@ -319,7 +338,7 @@ public class TableWriteTest {
     private FileStoreTable createFileStoreTable(Options conf) throws Exception {
         TableSchema tableSchema =
                 SchemaUtils.forceCommit(
-                        new SchemaManager(LocalFileIO.create(), tablePath),
+                        new FileSystemSchemaManager(LocalFileIO.create(), tablePath),
                         new Schema(
                                 ROW_TYPE.getFields(),
                                 Collections.singletonList("pt"),

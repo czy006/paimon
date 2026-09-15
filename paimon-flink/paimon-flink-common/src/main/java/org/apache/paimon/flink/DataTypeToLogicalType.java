@@ -31,6 +31,8 @@ import org.apache.paimon.types.DateType;
 import org.apache.paimon.types.DecimalType;
 import org.apache.paimon.types.DoubleType;
 import org.apache.paimon.types.FloatType;
+import org.apache.paimon.types.GeographyType;
+import org.apache.paimon.types.GeometryType;
 import org.apache.paimon.types.IntType;
 import org.apache.paimon.types.LocalZonedTimestampType;
 import org.apache.paimon.types.MapType;
@@ -43,6 +45,7 @@ import org.apache.paimon.types.TinyIntType;
 import org.apache.paimon.types.VarBinaryType;
 import org.apache.paimon.types.VarCharType;
 import org.apache.paimon.types.VariantType;
+import org.apache.paimon.types.VectorType;
 
 import org.apache.flink.table.types.logical.LogicalType;
 
@@ -150,13 +153,37 @@ public class DataTypeToLogicalType implements DataTypeVisitor<LogicalType> {
     @Override
     public LogicalType visit(BlobType blobType) {
         // TODO introduce blob type in Flink SQL?
-        return new org.apache.flink.table.types.logical.VarBinaryType(BlobType.DEFAULT_SIZE);
+        return new org.apache.flink.table.types.logical.VarBinaryType(
+                org.apache.flink.table.types.logical.VarBinaryType.MAX_LENGTH);
+    }
+
+    @Override
+    public LogicalType visit(GeometryType geometryType) {
+        throw unsupportedGeospatialType(geometryType);
+    }
+
+    @Override
+    public LogicalType visit(GeographyType geographyType) {
+        throw unsupportedGeospatialType(geographyType);
+    }
+
+    private UnsupportedOperationException unsupportedGeospatialType(DataType dataType) {
+        return new UnsupportedOperationException(
+                "Flink SQL does not support Paimon geospatial type "
+                        + dataType.asSQLString()
+                        + ". Exposing it as VARBINARY would lose its CRS and edge algorithm.");
     }
 
     @Override
     public LogicalType visit(ArrayType arrayType) {
         return new org.apache.flink.table.types.logical.ArrayType(
                 arrayType.isNullable(), arrayType.getElementType().accept(this));
+    }
+
+    @Override
+    public LogicalType visit(VectorType vectorType) {
+        return new org.apache.flink.table.types.logical.ArrayType(
+                vectorType.isNullable(), vectorType.getElementType().accept(this));
     }
 
     @Override

@@ -18,23 +18,22 @@
 
 package org.apache.spark.sql.execution.shim
 
-import org.apache.paimon.CoreOptions
-import org.apache.paimon.iceberg.IcebergOptions
+import org.apache.paimon.Snapshot
 import org.apache.paimon.spark.SparkCatalog
-import org.apache.paimon.spark.catalog.FormatTableCatalog
+import org.apache.paimon.spark.write.PaimonWriteOptions
 
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.analysis.ResolvedIdentifier
 import org.apache.spark.sql.catalyst.plans.logical.{CreateTableAsSelect, LogicalPlan, TableSpec}
-import org.apache.spark.sql.connector.catalog.StagingTableCatalog
-import org.apache.spark.sql.execution.{PaimonStrategyHelper, SparkPlan, SparkStrategy}
+import org.apache.spark.sql.execution.{PaimonTableAsSelectHelper, SparkPlan, SparkStrategy}
+import org.apache.spark.sql.execution.PaimonTableAsSelectHelper._
 import org.apache.spark.sql.execution.datasources.v2.CreateTableAsSelectExec
 
 import scala.collection.JavaConverters._
 
 case class PaimonCreateTableAsSelectStrategy(spark: SparkSession)
   extends SparkStrategy
-  with PaimonStrategyHelper {
+  with PaimonTableAsSelectHelper {
 
   import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
 
@@ -47,44 +46,26 @@ case class PaimonCreateTableAsSelectStrategy(spark: SparkSession)
           options,
           ifNotExists,
           true) =>
-      catalog match {
-        case _: StagingTableCatalog =>
-          throw new RuntimeException("Paimon can't extend StagingTableCatalog for now.")
-        case _ =>
-          val coreOptionKeys = CoreOptions.getOptions.asScala.map(_.key()).toSeq
+      val (tableOptions, writeOptions) =
+        splitTableAndWriteOptions(options)
+      val qualifiedSpec = qualifyTableSpec(tableSpec, tableOptions)
 
-          // Include Iceberg compatibility options in table properties (fix for DataFrame writer options)
-          val icebergOptionKeys = IcebergOptions.getOptions.asScala.map(_.key()).toSeq
+      catalog.checkPartitionedFormatTableCtas(
+        ident,
+        qualifiedSpec.provider.orNull,
+        parts.nonEmpty,
+        qualifiedSpec.properties.asJava)
 
-          val allTableOptionKeys = coreOptionKeys ++ icebergOptionKeys
-
-          val (tableOptions, writeOptions) = options.partition {
-            case (key, _) => allTableOptionKeys.contains(key)
-          }
-          val newTableSpec = tableSpec.copy(properties = tableSpec.properties ++ tableOptions)
-
-          val isPartitionedFormatTable = {
-            catalog match {
-              case catalog: FormatTableCatalog =>
-                catalog.isFormatTable(newTableSpec.provider.orNull) && parts.nonEmpty
-              case _ => false
-            }
-          }
-
-          if (isPartitionedFormatTable) {
-            throw new UnsupportedOperationException(
-              "Using CTAS with partitioned format table is not supported yet.")
-          }
-
-          CreateTableAsSelectExec(
-            catalog.asTableCatalog,
-            ident,
-            parts,
-            query,
-            qualifyLocInTableSpec(newTableSpec),
-            writeOptions,
-            ifNotExists) :: Nil
-      }
+      CreateTableAsSelectExec(
+        catalog.asTableCatalog,
+        ident,
+        parts,
+        query,
+        qualifiedSpec,
+        writeOptions +
+          (PaimonWriteOptions.OPERATION_OPTION -> Snapshot.Operation.CREATE_TABLE_AS_SELECT.name()),
+        ifNotExists
+      ) :: Nil
     case _ => Nil
   }
 }

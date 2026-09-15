@@ -29,6 +29,8 @@ import org.apache.paimon.types.DateType;
 import org.apache.paimon.types.DecimalType;
 import org.apache.paimon.types.DoubleType;
 import org.apache.paimon.types.FloatType;
+import org.apache.paimon.types.GeographyType;
+import org.apache.paimon.types.GeometryType;
 import org.apache.paimon.types.IntType;
 import org.apache.paimon.types.LocalZonedTimestampType;
 import org.apache.paimon.types.MapType;
@@ -41,8 +43,10 @@ import org.apache.paimon.types.TinyIntType;
 import org.apache.paimon.types.VarBinaryType;
 import org.apache.paimon.types.VarCharType;
 import org.apache.paimon.types.VariantType;
+import org.apache.paimon.types.VectorType;
 
 import org.apache.arrow.vector.FieldVector;
+import org.apache.arrow.vector.complex.FixedSizeListVector;
 import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.complex.MapVector;
 
@@ -76,6 +80,16 @@ public class ArrowFieldWriterFactoryVisitor implements DataTypeVisitor<ArrowFiel
 
     @Override
     public ArrowFieldWriterFactory visit(VarBinaryType varBinaryType) {
+        return ArrowFieldWriters.BinaryWriter::new;
+    }
+
+    @Override
+    public ArrowFieldWriterFactory visit(GeometryType geometryType) {
+        return ArrowFieldWriters.BinaryWriter::new;
+    }
+
+    @Override
+    public ArrowFieldWriterFactory visit(GeographyType geographyType) {
         return ArrowFieldWriters.BinaryWriter::new;
     }
 
@@ -145,7 +159,8 @@ public class ArrowFieldWriterFactoryVisitor implements DataTypeVisitor<ArrowFiel
 
     @Override
     public ArrowFieldWriterFactory visit(VariantType variantType) {
-        throw new UnsupportedOperationException("Doesn't support VariantType.");
+        return (fieldVector, isNullable) ->
+                new ArrowFieldWriters.VariantWriter(fieldVector, isNullable, null);
     }
 
     @Override
@@ -160,7 +175,21 @@ public class ArrowFieldWriterFactoryVisitor implements DataTypeVisitor<ArrowFiel
                 new ArrowFieldWriters.ArrayWriter(
                         fieldVector,
                         elementWriterFactory.create(
-                                ((ListVector) fieldVector).getDataVector(), isNullable),
+                                ((ListVector) fieldVector).getDataVector(),
+                                arrayType.getElementType().isNullable()),
+                        isNullable);
+    }
+
+    @Override
+    public ArrowFieldWriterFactory visit(VectorType vectorType) {
+        ArrowFieldWriterFactory elementWriterFactory = vectorType.getElementType().accept(this);
+        return (fieldVector, isNullable) ->
+                new ArrowFieldWriters.VectorWriter(
+                        fieldVector,
+                        vectorType.getLength(),
+                        elementWriterFactory.create(
+                                ((FixedSizeListVector) fieldVector).getDataVector(),
+                                vectorType.getElementType().isNullable()),
                         isNullable);
     }
 
@@ -179,8 +208,13 @@ public class ArrowFieldWriterFactoryVisitor implements DataTypeVisitor<ArrowFiel
             List<FieldVector> keyValueVectors = mapVector.getDataVector().getChildrenFromFields();
             return new ArrowFieldWriters.MapWriter(
                     fieldVector,
-                    keyWriterFactory.create(keyValueVectors.get(0), isNullable),
-                    valueWriterFactory.create(keyValueVectors.get(1), isNullable),
+                    // The Arrow map key is always declared NOT NULL by ArrowUtils.toArrowField
+                    // (per the Arrow spec), so the key writer must stay non-nullable regardless of
+                    // the declared key type's nullability. A null key then fails loud instead of
+                    // producing data that conflicts with the schema.
+                    keyWriterFactory.create(keyValueVectors.get(0), false),
+                    valueWriterFactory.create(
+                            keyValueVectors.get(1), mapType.getValueType().isNullable()),
                     isNullable);
         };
     }
@@ -192,7 +226,9 @@ public class ArrowFieldWriterFactoryVisitor implements DataTypeVisitor<ArrowFiel
             ArrowFieldWriter[] fieldWriters = new ArrowFieldWriter[children.size()];
             for (int i = 0; i < children.size(); i++) {
                 fieldWriters[i] =
-                        rowType.getTypeAt(i).accept(this).create(children.get(i), isNullable);
+                        rowType.getTypeAt(i)
+                                .accept(this)
+                                .create(children.get(i), rowType.getTypeAt(i).isNullable());
             }
             return new ArrowFieldWriters.RowWriter(fieldVector, fieldWriters, isNullable);
         };

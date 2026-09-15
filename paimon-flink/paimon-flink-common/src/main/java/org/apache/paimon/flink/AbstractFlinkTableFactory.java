@@ -18,12 +18,15 @@
 
 package org.apache.paimon.flink;
 
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.TableType;
 import org.apache.paimon.annotation.VisibleForTesting;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.CatalogContext;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.flink.sink.FlinkFormatTableSink;
 import org.apache.paimon.flink.sink.FlinkTableSink;
+import org.apache.paimon.flink.source.DataEvolutionDataTableSource;
 import org.apache.paimon.flink.source.DataTableSource;
 import org.apache.paimon.flink.source.SystemTableSource;
 import org.apache.paimon.options.Options;
@@ -35,6 +38,7 @@ import org.apache.paimon.table.FileStoreTableFactory;
 import org.apache.paimon.table.FormatTable;
 import org.apache.paimon.table.Table;
 import org.apache.paimon.utils.Preconditions;
+import org.apache.paimon.utils.SensitiveConfigUtils;
 
 import org.apache.flink.api.common.RuntimeExecutionMode;
 import org.apache.flink.configuration.ConfigOption;
@@ -43,6 +47,7 @@ import org.apache.flink.configuration.ExecutionOptions;
 import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.table.api.TableConfig;
 import org.apache.flink.table.catalog.CatalogTable;
+import org.apache.flink.table.catalog.ObjectIdentifier;
 import org.apache.flink.table.connector.sink.DynamicTableSink;
 import org.apache.flink.table.connector.source.DynamicTableSource;
 import org.apache.flink.table.factories.DynamicTableFactory;
@@ -83,10 +88,7 @@ public abstract class AbstractFlinkTableFactory
     @Override
     public DynamicTableSource createDynamicTableSource(Context context) {
         CatalogTable origin = context.getCatalogTable().getOrigin();
-        Table table =
-                origin instanceof SystemCatalogTable
-                        ? ((SystemCatalogTable) origin).table()
-                        : buildPaimonTable(context);
+        Table table = getPaimonTable(origin, context);
         boolean unbounded =
                 context.getConfiguration().get(ExecutionOptions.RUNTIME_MODE)
                         == RuntimeExecutionMode.STREAMING;
@@ -97,6 +99,9 @@ public abstract class AbstractFlinkTableFactory
         }
         if (origin instanceof SystemCatalogTable) {
             return new SystemTableSource(table, unbounded, context.getObjectIdentifier());
+        } else if (CoreOptions.fromMap(table.options()).dataEvolutionEnabled()) {
+            return new DataEvolutionDataTableSource(
+                    context.getObjectIdentifier(), table, unbounded, context);
         } else {
             return new DataTableSource(context.getObjectIdentifier(), table, unbounded, context);
         }
@@ -130,16 +135,45 @@ public abstract class AbstractFlinkTableFactory
                 Options.fromMap(context.getCatalogTable().getOptions()), new FlinkFileIOLoader());
     }
 
+    Table getPaimonTable(CatalogTable origin, DynamicTableFactory.Context context) {
+        if (origin instanceof SystemCatalogTable) {
+            Map<String, String> dynamicOptions = getDynamicConfigOptions(context);
+            return ((SystemCatalogTable) origin).table().copy(dynamicOptions);
+        } else {
+            return buildPaimonTable(context);
+        }
+    }
+
     Table buildPaimonTable(DynamicTableFactory.Context context) {
         CatalogTable origin = context.getCatalogTable().getOrigin();
+        // matches Flink's schema (asserted below); also lets the preflight treat a
+        // dynamic option that restates a normalized/default value as a no-op
+        Schema schema = FlinkCatalog.fromCatalogTable(context.getCatalogTable());
+
+        // FormatCatalogTable.getOptions() drops 'type'; restore the format table's
+        // effective type so a no-op 'type'='format-table' isn't seen as a change
+        Map<String, String> originOptions = origin.getOptions();
+        if (origin instanceof FormatCatalogTable) {
+            originOptions = new HashMap<>(originOptions);
+            originOptions.putIfAbsent(CoreOptions.TYPE.key(), TableType.FORMAT_TABLE.toString());
+        }
+        Map<String, String> preflightOptions = originOptions;
 
         Map<String, String> dynamicOptions = getDynamicConfigOptions(context);
         dynamicOptions.forEach(
                 (key, newValue) -> {
-                    String oldValue = origin.getOptions().get(key);
-                    if (!Objects.equals(oldValue, newValue)) {
+                    String oldValue = preflightOptions.get(key);
+                    boolean unchanged =
+                            Objects.equals(oldValue, newValue)
+                                    || SchemaManager.isUnchangedNormalizedKey(
+                                            key,
+                                            oldValue,
+                                            newValue,
+                                            schema.primaryKeys(),
+                                            schema.partitionKeys());
+                    if (!unchanged) {
                         SchemaManager.checkAlterTableOption(
-                                origin.getOptions(), key, oldValue, newValue);
+                                preflightOptions, key, oldValue, newValue);
                     }
                 });
         Map<String, String> newOptions = new HashMap<>();
@@ -177,8 +211,6 @@ public abstract class AbstractFlinkTableFactory
             table.fileIO().setRuntimeContext(runtimeContext);
         }
         // notice that the Paimon table schema must be the same with the Flink's
-        Schema schema = FlinkCatalog.fromCatalogTable(context.getCatalogTable());
-
         RowType rowType = toLogicalType(schema.rowType());
         List<String> partitionKeys = schema.partitionKeys();
         List<String> primaryKeys = schema.primaryKeys();
@@ -242,14 +274,18 @@ public abstract class AbstractFlinkTableFactory
      */
     static Map<String, String> getDynamicConfigOptions(DynamicTableFactory.Context context) {
         Map<String, String> conf = getAllOptions(context);
+        ObjectIdentifier identifier = context.getObjectIdentifier();
+        String tableName =
+                new Identifier(identifier.getDatabaseName(), identifier.getObjectName())
+                        .getTableName();
 
         String template =
                 String.format(
                         "(%s)(%s|\\*)\\.(%s|\\*)\\.(%s|\\*)\\.(.+)",
                         FlinkConnectorOptions.TABLE_DYNAMIC_OPTION_PREFIX,
-                        context.getObjectIdentifier().getCatalogName(),
-                        context.getObjectIdentifier().getDatabaseName(),
-                        context.getObjectIdentifier().getObjectName());
+                        identifier.getCatalogName(),
+                        identifier.getDatabaseName(),
+                        tableName);
         Pattern pattern = Pattern.compile(template);
         Map<String, String> optionsFromTableConfig =
                 OptionsUtils.convertToDynamicTableProperties(conf, "", pattern, 5);
@@ -257,8 +293,8 @@ public abstract class AbstractFlinkTableFactory
         if (!optionsFromTableConfig.isEmpty()) {
             LOG.info(
                     "Loading dynamic table options for {} in table config: {}",
-                    context.getObjectIdentifier().getObjectName(),
-                    optionsFromTableConfig);
+                    tableName,
+                    SensitiveConfigUtils.redactMap(optionsFromTableConfig));
         }
         return optionsFromTableConfig;
     }

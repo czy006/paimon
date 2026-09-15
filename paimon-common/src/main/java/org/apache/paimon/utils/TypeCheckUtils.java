@@ -26,6 +26,8 @@ import static org.apache.paimon.types.DataTypeRoot.BIGINT;
 import static org.apache.paimon.types.DataTypeRoot.BLOB;
 import static org.apache.paimon.types.DataTypeRoot.BOOLEAN;
 import static org.apache.paimon.types.DataTypeRoot.DECIMAL;
+import static org.apache.paimon.types.DataTypeRoot.GEOGRAPHY;
+import static org.apache.paimon.types.DataTypeRoot.GEOMETRY;
 import static org.apache.paimon.types.DataTypeRoot.INTEGER;
 import static org.apache.paimon.types.DataTypeRoot.MAP;
 import static org.apache.paimon.types.DataTypeRoot.MULTISET;
@@ -33,6 +35,7 @@ import static org.apache.paimon.types.DataTypeRoot.ROW;
 import static org.apache.paimon.types.DataTypeRoot.TIMESTAMP_WITHOUT_TIME_ZONE;
 import static org.apache.paimon.types.DataTypeRoot.TIMESTAMP_WITH_LOCAL_TIME_ZONE;
 import static org.apache.paimon.types.DataTypeRoot.VARIANT;
+import static org.apache.paimon.types.DataTypeRoot.VECTOR;
 
 /** Utils for type. */
 public class TypeCheckUtils {
@@ -85,6 +88,10 @@ public class TypeCheckUtils {
         return type.getTypeRoot() == ARRAY;
     }
 
+    public static boolean isVector(DataType type) {
+        return type.getTypeRoot() == VECTOR;
+    }
+
     public static boolean isMap(DataType type) {
         return type.getTypeRoot() == MAP;
     }
@@ -105,13 +112,24 @@ public class TypeCheckUtils {
         return type.getTypeRoot() == BLOB;
     }
 
+    public static boolean isGeometry(DataType type) {
+        return type.getTypeRoot() == GEOMETRY;
+    }
+
+    public static boolean isGeography(DataType type) {
+        return type.getTypeRoot() == GEOGRAPHY;
+    }
+
     public static boolean isComparable(DataType type) {
         return !isMap(type)
                 && !isMultiset(type)
                 && !isRow(type)
                 && !isArray(type)
+                && !isVector(type)
                 && !isVariant(type)
-                && !isBlob(type);
+                && !isBlob(type)
+                && !isGeometry(type)
+                && !isGeography(type);
     }
 
     public static boolean isMutable(DataType type) {
@@ -120,6 +138,7 @@ public class TypeCheckUtils {
             case CHAR:
             case VARCHAR: // the internal representation of String is BinaryString which is mutable
             case ARRAY:
+            case VECTOR:
             case MULTISET:
             case MAP:
             case ROW:

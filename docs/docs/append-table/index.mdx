@@ -1,0 +1,128 @@
+---
+title: "Append Table"
+sidebar_position: 3
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# Overview
+
+An append table has no primary key. Each inserted row is stored as a new record, including rows whose values duplicate
+an existing record. Inserts do not perform key-based deduplication or upserts. Use a
+[primary key table](../primary-key-table/) when incoming changelog records should update existing rows by key.
+
+Append tables support batch and streaming workloads, with snapshots, time travel, schema evolution, and file-level
+query optimizations. You can also change stored rows with explicit [row-level operations](./row-level-operations).
+
+## Create an Append Table
+
+The examples below assume that you have configured and selected a Paimon catalog. See the
+[Flink quick start](../flink/quick-start) or [Spark quick start](../spark/quick-start) for catalog setup.
+
+<Tabs groupId="engine">
+<TabItem value="flink" label="Flink">
+
+```sql
+CREATE TABLE my_table (
+    product_id BIGINT,
+    price DOUBLE,
+    sales BIGINT,
+    dt STRING
+) PARTITIONED BY (dt) WITH (
+    'bucket' = '-1'
+);
+
+INSERT INTO my_table VALUES (1, 10.0, 2, '2026-09-10');
+SELECT * FROM my_table WHERE dt = '2026-09-10';
+```
+
+</TabItem>
+<TabItem value="spark" label="Spark">
+
+```sql
+CREATE TABLE my_table (
+    product_id BIGINT,
+    price DOUBLE,
+    sales BIGINT,
+    dt STRING
+) USING paimon
+PARTITIONED BY (dt)
+TBLPROPERTIES (
+    'bucket' = '-1'
+);
+
+INSERT INTO my_table VALUES (1, 10.0, 2, '2026-09-10');
+SELECT * FROM my_table WHERE dt = '2026-09-10';
+```
+
+</TabItem>
+</Tabs>
+
+`bucket = -1` is the default for append tables; it is shown explicitly here to identify the layout. Partitioning is
+optional. File size, format, and compression can be configured with `target-file-size`, `file.format`, and
+`file.compression`; see [Configurations](../maintenance/configurations).
+
+## Choose a Layout
+
+| Layout | Configuration | Use it when | Considerations |
+| --- | --- | --- | --- |
+| Unaware-bucket append | `bucket = -1` (default) | You want flexible ingestion without distributing rows by a bucket key. | No streaming row-order guarantee. Supports row tracking. |
+| [Bucketed append](./bucketed) | Positive `bucket` and a `bucket-key` | Queries filter on bucket keys, joins can reuse the distribution, or streaming consumers need ordering within a bucket. | Ordering is scoped to one partition and bucket, and requires `bucket-append-ordered = true`. |
+
+[Incremental clustering](./incremental-clustering) is a data-layout optimization available for both layouts. On bucketed
+append tables it requires giving up the ordered append guarantee. Bucketing, clustering, and row tracking solve different
+problems; choose them according to your query and ingestion requirements.
+
+## Read and Maintain the Table
+
+Examples named `my_table` use the schema above. Individual guides introduce separate tables when they need a different
+layout or schema.
+
+### Streaming {#append-streaming}
+
+[Streaming](./streaming) covers Flink ingestion, small-file compaction, scan startup modes, and watermarks.
+For ordering requirements, see [Bucketed streaming](./bucketed#bucketed-streaming).
+
+### Query Performance
+
+#### Aggregate Pushdown {#aggregate-push-down}
+
+Some aggregate queries can use metadata instead of reading every data row. See
+[Aggregate pushdown](./query-performance#aggregate-pushdown) for examples and limits.
+
+#### Clustering and File Statistics {#data-skipping-by-order}
+
+Sorting can narrow the value ranges in each file and improve pruning. Start with
+[File statistics and clustering](./query-performance#file-statistics-and-clustering), then configure
+[Incremental clustering](./incremental-clustering) for recurring optimization.
+
+#### File Indexes {#data-skipping-by-file-index}
+
+[File indexes](./query-performance#file-indexes) provide additional filtering for supported predicates, including
+Bloom filter, bitmap, and range bitmap indexes.
+
+### Row-Level Operations {#row-level-operations}
+
+[Row-level operations](./row-level-operations) explains Spark SQL `DELETE`, `UPDATE`, and `MERGE INTO`, including the
+choice between rewriting data files and using deletion vectors. [Row tracking](./row-tracking) adds hidden row IDs
+and row versions for tracking changes across these operations.

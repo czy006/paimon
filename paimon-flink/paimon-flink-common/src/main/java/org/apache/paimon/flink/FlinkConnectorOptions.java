@@ -72,6 +72,28 @@ public class FlinkConnectorOptions {
                                     + "By default, if this option is not defined, the planner will derive the parallelism "
                                     + "for each statement individually by also considering the global configuration.");
 
+    public static final ConfigOption<Boolean> UNAWARE_BUCKET_NO_SHUFFLE =
+            ConfigOptions.key("unaware-bucket.no-shuffle")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "If true, the CDC sync pipeline will skip the network shuffle between "
+                                    + "source and writer operators. This is only supported for "
+                                    + "bucket-unaware (append) tables where each writer subtask "
+                                    + "independently appends data without bucket ownership constraints. "
+                                    + "This eliminates data transfer overhead when the source already "
+                                    + "provides suitable data distribution (e.g., Kafka partitions).");
+
+    public static final ConfigOption<CompactionBucketDistributionStrategy>
+            COMPACTION_BUCKET_DISTRIBUTION_STRATEGY =
+                    ConfigOptions.key("compaction.bucket-distribution-strategy")
+                            .enumType(CompactionBucketDistributionStrategy.class)
+                            .defaultValue(CompactionBucketDistributionStrategy.LINEAR)
+                            .withDescription(
+                                    "Defines how dedicated bucket compaction jobs distribute compact buckets to writers. "
+                                            + "'linear' uses the existing stable partition-plus-bucket mapping. "
+                                            + "'size-aware-batch' assigns bounded full-compaction bucket splits by total data file size and forwards them to writers to reduce compaction long tail.");
+
     public static final ConfigOption<Boolean> INFER_SCAN_PARALLELISM =
             ConfigOptions.key("scan.infer-parallelism")
                     .booleanType()
@@ -202,7 +224,7 @@ public class FlinkConnectorOptions {
                     .memoryType()
                     .defaultValue(MemorySize.ofMebiBytes(256))
                     .withDescription(
-                            "Weight of managed memory for RocksDB in cross-partition update, Flink will compute the memory size "
+                            "Weight of managed memory for the local key-value index in cross-partition update, Flink will compute the memory size "
                                     + "according to the weight, the actual memory used depends on the running environment.");
 
     public static final ConfigOption<Boolean> SOURCE_CHECKPOINT_ALIGN_ENABLED =
@@ -276,6 +298,18 @@ public class FlinkConnectorOptions {
                     .defaultValue(false)
                     .withDescription("Whether to refresh lookup table in an async thread.");
 
+    public static final ConfigOption<Boolean> LOOKUP_DYNAMIC_PARTITION_REFRESH_ASYNC =
+            ConfigOptions.key("lookup.dynamic-partition.refresh.async")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Whether to refresh dynamic partition lookup table asynchronously. "
+                                    + "This option only works for full cache dimension table. "
+                                    + "When enabled, partition changes will be loaded in a background thread "
+                                    + "while the old partition data continues serving queries. "
+                                    + "When disabled (default), partition refresh is synchronous and blocks queries "
+                                    + "until the new partition data is fully loaded.");
+
     public static final ConfigOption<Integer> LOOKUP_REFRESH_ASYNC_PENDING_SNAPSHOT_COUNT =
             ConfigOptions.key("lookup.refresh.async.pending-snapshot-count")
                     .intType()
@@ -291,6 +325,15 @@ public class FlinkConnectorOptions {
                             "The blacklist contains several time periods. During these time periods, the lookup table's "
                                     + "cache refreshing is forbidden. Blacklist format is start1->end1,start2->end2,... , "
                                     + "and the time format is yyyy-MM-dd HH:mm. Only used when lookup table is FULL cache mode.");
+
+    public static final ConfigOption<Integer> LOOKUP_REFRESH_FULL_LOAD_THRESHOLD =
+            ConfigOptions.key("lookup.refresh.full-load-threshold")
+                    .intType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "If the pending snapshot count exceeds this threshold, lookup table will discard incremental updates "
+                                    + "and refresh the entire table from the latest snapshot. This can improve performance when there are many snapshots pending. "
+                                    + "Set to a reasonable value (e.g., 10) to enable this optimization. Default is Integer.MAX_VALUE (disabled). ");
 
     public static final ConfigOption<Boolean> SINK_AUTO_TAG_FOR_SAVEPOINT =
             ConfigOptions.key("sink.savepoint.auto-tag")
@@ -438,13 +481,6 @@ public class FlinkConnectorOptions {
                             "Bounded mode for Paimon consumer. "
                                     + "By default, Paimon automatically selects bounded mode based on the mode of the Flink job.");
 
-    public static final ConfigOption<Integer> POSTPONE_DEFAULT_BUCKET_NUM =
-            key("postpone.default-bucket-num")
-                    .intType()
-                    .defaultValue(1)
-                    .withDescription(
-                            "Bucket number for the partitions compacted for the first time in postpone bucket tables.");
-
     public static final ConfigOption<Boolean> SCAN_DEDICATED_SPLIT_GENERATION =
             key("scan.dedicated-split-generation")
                     .booleanType()
@@ -460,12 +496,37 @@ public class FlinkConnectorOptions {
                             "Commit listener will be called after a successful commit. This option list custom commit "
                                     + "listener identifiers separated by comma.");
 
+    public static final ConfigOption<Boolean> SINK_COORDINATOR_COMMIT_ENABLED =
+            key("sink.coordinator-commit.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "If true, run the Paimon committer inside the Flink JobManager via an "
+                                    + "OperatorCoordinator. This decouples commit from any single TaskManager "
+                                    + "subtask so that region failover does not have to restart the whole pipeline. "
+                                    + "Only supports unaware-bucket append tables in streaming mode with "
+                                    + "checkpointing enabled; unsupported configurations fail during sink planning.");
+
     public static final ConfigOption<Boolean> SINK_WRITER_COORDINATOR_ENABLED =
             key("sink.writer-coordinator.enabled")
                     .booleanType()
                     .defaultValue(false)
                     .withDescription(
                             "Enable sink writer coordinator to plan data files in Job Manager.");
+
+    public static final ConfigOption<Boolean> SINK_KEY_ONLY_DELETES_ENABLED =
+            key("sink.key-only-deletes.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "If true, a primary-key table sink advertises the key-only (partial) "
+                                    + "deletes capability, allowing the Flink planner to drop the "
+                                    + "upstream ChangelogNormalize node when the source produces "
+                                    + "deletes by key. Requires Flink 2.1+; no effect on Flink 1.x or 2.0. "
+                                    + "Does not apply when the table has no primary key, when "
+                                    + "'changelog-producer' is 'input', or when 'merge-engine' is "
+                                    + "'aggregation' or 'partial-update' with aggregation functions; "
+                                    + "in those cases a warning is logged. Disabled by default.");
 
     public static final ConfigOption<MemorySize> SINK_WRITER_COORDINATOR_CACHE_MEMORY =
             key("sink.writer-coordinator.cache-memory")
@@ -474,12 +535,50 @@ public class FlinkConnectorOptions {
                     .withDescription(
                             "Controls the cache memory of writer coordinator to cache manifest files in Job Manager.");
 
+    public static final ConfigOption<Duration> SINK_WRITER_COORDINATOR_CACHE_EXPIRE_AFTER_ACCESS =
+            key("sink.writer-coordinator.cache-expire-after-access")
+                    .durationType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Optional idle TTL for writer coordinator manifest cache entries. "
+                                    + "Disabled by default. When set, an entry that has not been "
+                                    + "accessed within this duration is evicted, releasing its heap. "
+                                    + "The cache stays bounded by 'sink.writer-coordinator.cache-memory' "
+                                    + "regardless of this setting.");
+
+    public static final ConfigOption<Boolean> SINK_WRITER_COORDINATOR_CACHE_SOFT_VALUES =
+            key("sink.writer-coordinator.cache-soft-values")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "If true (default), writer coordinator manifest cache entries are held "
+                                    + "with soft references and may be reclaimed by the GC under "
+                                    + "memory pressure. This can trigger a cache-thrash spiral "
+                                    + "where reclaimed entries are refetched, spiking heap and "
+                                    + "forcing further reclamation. Set to false to hold entries "
+                                    + "with strong references, breaking the spiral; the cache then "
+                                    + "stays bounded by weight up to "
+                                    + "'sink.writer-coordinator.cache-memory' (size the Job Manager "
+                                    + "total heap memory to at least roughly twice that value).");
+
     public static final ConfigOption<MemorySize> SINK_WRITER_COORDINATOR_PAGE_SIZE =
             key("sink.writer-coordinator.page-size")
                     .memoryType()
                     .defaultValue(MemorySize.ofKibiBytes(32))
                     .withDescription(
                             "Controls the page size for one RPC request of writer coordinator.");
+
+    public static final ConfigOption<Boolean> SINK_WRITER_COORDINATOR_PREFETCH_MANIFESTS =
+            key("sink.writer-coordinator.prefetch-manifests")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "If true, the writer coordinator eagerly reads all data manifests of the "
+                                    + "latest snapshot during refresh to warm the in-Job-Manager manifest "
+                                    + "cache. This avoids many concurrent cold manifest reads when "
+                                    + "high-parallelism writers restore at the same time, reducing Job "
+                                    + "Manager heap pressure at the cost of one full manifest read per "
+                                    + "refresh.");
 
     public static final ConfigOption<Boolean> FILESYSTEM_JOB_LEVEL_SETTINGS_ENABLED =
             key("filesystem.job-level-settings.enabled")
@@ -540,6 +639,34 @@ public class FlinkConnectorOptions {
         private final String description;
 
         WatermarkEmitStrategy(String value, String description) {
+            this.value = value;
+            this.description = description;
+        }
+
+        @Override
+        public String toString() {
+            return value;
+        }
+
+        @Override
+        public InlineElement getDescription() {
+            return text(description);
+        }
+    }
+
+    /** Bucket distribution strategy for dedicated compaction jobs. */
+    public enum CompactionBucketDistributionStrategy implements DescribedEnum {
+        LINEAR(
+                "linear",
+                "Distribute compact buckets by the existing stable partition-plus-bucket channel mapping."),
+        SIZE_AWARE_BATCH(
+                "size-aware-batch",
+                "For bounded full compaction, assign compact bucket splits by total data file size and forward them to writers to reduce long-tail compaction tasks.");
+
+        private final String value;
+        private final String description;
+
+        CompactionBucketDistributionStrategy(String value, String description) {
             this.value = value;
             this.description = description;
         }

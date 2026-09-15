@@ -24,7 +24,7 @@ import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.options.Options;
-import org.apache.paimon.schema.SchemaManager;
+import org.apache.paimon.schema.FileSystemSchemaManager;
 import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.utils.ChainTableUtils;
 import org.apache.paimon.utils.StringUtils;
@@ -63,7 +63,7 @@ public class FileStoreTableFactory {
         Path tablePath = CoreOptions.path(options);
         String branchName = CoreOptions.branch(options.toMap());
         TableSchema tableSchema =
-                new SchemaManager(fileIO, tablePath, branchName)
+                new FileSystemSchemaManager(fileIO, tablePath, branchName)
                         .latest()
                         .orElseThrow(
                                 () ->
@@ -99,34 +99,26 @@ public class FileStoreTableFactory {
 
         Options options = new Options(table.options());
         String fallbackBranch = options.get(CoreOptions.SCAN_FALLBACK_BRANCH);
+        String primaryBranch = options.get(CoreOptions.SCAN_PRIMARY_BRANCH);
         if (ChainTableUtils.isChainTable(options.toMap())) {
             table = createChainTable(table, fileIO, tablePath, dynamicOptions, catalogEnvironment);
         } else if (!StringUtils.isNullOrWhitespaceOnly(fallbackBranch)) {
-            Options branchOptions = new Options(dynamicOptions.toMap());
-            branchOptions.set(CoreOptions.BRANCH, fallbackBranch);
-            Optional<TableSchema> schema =
-                    new SchemaManager(fileIO, tablePath, fallbackBranch).latest();
-            if (schema.isPresent()) {
-                Identifier identifier = catalogEnvironment.identifier();
-                CatalogEnvironment fallbackCatalogEnvironment = catalogEnvironment;
-                if (identifier != null) {
-                    fallbackCatalogEnvironment =
-                            catalogEnvironment.copy(
-                                    new Identifier(
-                                            identifier.getDatabaseName(),
-                                            identifier.getObjectName(),
-                                            fallbackBranch));
-                }
-                FileStoreTable fallbackTable =
-                        createWithoutFallbackBranch(
-                                fileIO,
-                                tablePath,
-                                schema.get(),
-                                branchOptions,
-                                fallbackCatalogEnvironment);
-                table = new FallbackReadFileStoreTable(table, fallbackTable);
+            FileStoreTable otherTable =
+                    createOtherBranchTable(
+                            fileIO, tablePath, fallbackBranch, dynamicOptions, catalogEnvironment);
+            if (otherTable != null) {
+                table = new FallbackReadFileStoreTable(table, otherTable, true);
             } else {
                 LOG.error("Fallback branch {} not found for table {}", fallbackBranch, tablePath);
+            }
+        } else if (!StringUtils.isNullOrWhitespaceOnly(primaryBranch)) {
+            FileStoreTable otherTable =
+                    createOtherBranchTable(
+                            fileIO, tablePath, primaryBranch, dynamicOptions, catalogEnvironment);
+            if (otherTable != null) {
+                table = new FallbackReadFileStoreTable(table, otherTable, false);
+            } else {
+                LOG.error("Primary branch {} not found for table {}", primaryBranch, tablePath);
             }
         }
 
@@ -166,7 +158,7 @@ public class FileStoreTableFactory {
         Options snapshotBranchOptions = new Options(dynamicOptions.toMap());
         snapshotBranchOptions.set(CoreOptions.BRANCH, scanFallbackSnapshotBranch);
         Optional<TableSchema> snapshotSchema =
-                new SchemaManager(fileIO, tablePath, scanFallbackSnapshotBranch).latest();
+                new FileSystemSchemaManager(fileIO, tablePath, scanFallbackSnapshotBranch).latest();
         AbstractFileStoreTable snapshotTable =
                 (AbstractFileStoreTable)
                         createWithoutFallbackBranch(
@@ -178,7 +170,7 @@ public class FileStoreTableFactory {
         Options deltaBranchOptions = new Options(dynamicOptions.toMap());
         deltaBranchOptions.set(CoreOptions.BRANCH, scanFallbackDeltaBranch);
         Optional<TableSchema> deltaSchema =
-                new SchemaManager(fileIO, tablePath, scanFallbackDeltaBranch).latest();
+                new FileSystemSchemaManager(fileIO, tablePath, scanFallbackDeltaBranch).latest();
         AbstractFileStoreTable deltaTable =
                 (AbstractFileStoreTable)
                         createWithoutFallbackBranch(
@@ -189,7 +181,34 @@ public class FileStoreTableFactory {
                                 catalogEnvironment);
         FileStoreTable chainGroupFileStoreTable =
                 new ChainGroupReadTable(snapshotTable, deltaTable);
-        return new FallbackReadFileStoreTable(table, chainGroupFileStoreTable);
+        return new ChainTableFileStoreTable(table, chainGroupFileStoreTable);
+    }
+
+    private static FileStoreTable createOtherBranchTable(
+            FileIO fileIO,
+            Path tablePath,
+            String branchName,
+            Options dynamicOptions,
+            CatalogEnvironment catalogEnvironment) {
+        Options branchOptions = new Options(dynamicOptions.toMap());
+        branchOptions.set(CoreOptions.BRANCH, branchName);
+        Optional<TableSchema> schema =
+                new FileSystemSchemaManager(fileIO, tablePath, branchName).latest();
+        if (schema.isPresent()) {
+            Identifier identifier = catalogEnvironment.identifier();
+            CatalogEnvironment branchCatalogEnvironment = catalogEnvironment;
+            if (identifier != null) {
+                branchCatalogEnvironment =
+                        catalogEnvironment.copy(
+                                new Identifier(
+                                        identifier.getDatabaseName(),
+                                        identifier.getObjectName(),
+                                        branchName));
+            }
+            return createWithoutFallbackBranch(
+                    fileIO, tablePath, schema.get(), branchOptions, branchCatalogEnvironment);
+        }
+        return null;
     }
 
     public static FileStoreTable createWithoutFallbackBranch(

@@ -23,7 +23,7 @@ import org.apache.paimon.catalog.CatalogLoader;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.flink.action.cdc.TypeMapping;
 import org.apache.paimon.flink.utils.SingleOutputStreamOperatorUtils;
-import org.apache.paimon.schema.SchemaManager;
+import org.apache.paimon.schema.FileSystemSchemaManager;
 import org.apache.paimon.table.BucketMode;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.Table;
@@ -54,6 +54,7 @@ public class CdcSinkBuilder<T> {
     private TypeMapping typeMapping = null;
 
     @Nullable private Integer parallelism;
+    private boolean noShuffle = false;
 
     public CdcSinkBuilder<T> withInput(DataStream<T> input) {
         this.input = input;
@@ -90,6 +91,11 @@ public class CdcSinkBuilder<T> {
         return this;
     }
 
+    public CdcSinkBuilder<T> withNoShuffle(boolean noShuffle) {
+        this.noShuffle = noShuffle;
+        return this;
+    }
+
     public DataStreamSink<?> build() {
         Preconditions.checkNotNull(input, "Input DataStream can not be null.");
         Preconditions.checkNotNull(parserFactory, "Event ParserFactory can not be null.");
@@ -115,7 +121,8 @@ public class CdcSinkBuilder<T> {
                                 parsed, CdcParsingProcessFunction.SCHEMA_CHANGE_OUTPUT_TAG)
                         .process(
                                 new UpdatedDataFieldsProcessFunction(
-                                        new SchemaManager(dataTable.fileIO(), dataTable.location()),
+                                        new FileSystemSchemaManager(
+                                                dataTable.fileIO(), dataTable.location()),
                                         identifier,
                                         catalogLoader,
                                         typeMapping))
@@ -160,6 +167,9 @@ public class CdcSinkBuilder<T> {
 
     private DataStreamSink<?> buildForUnawareBucket(DataStream<CdcRecord> parsed) {
         FileStoreTable dataTable = (FileStoreTable) table;
+        if (noShuffle) {
+            return new CdcAppendTableSink(dataTable, parallelism, true).sinkFrom(parsed);
+        }
         // rebalance it to make sure schema change work to avoid infinite loop
         return new CdcAppendTableSink(dataTable, parallelism).sinkFrom(parsed.rebalance());
     }

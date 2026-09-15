@@ -39,14 +39,13 @@ public class LikeOptimization {
     /** Accepts simple LIKE patterns like "abc". */
     private static final Pattern NONE_PATTERN = Pattern.compile("[^%]+");
 
-    public static Optional<Pair<NullFalseLeafBinaryFunction, Object>> tryOptimize(
-            Object patternLiteral) {
+    public static Optional<Pair<LeafBinaryFunction, Object>> tryOptimize(Object patternLiteral) {
         if (patternLiteral == null) {
             throw new IllegalArgumentException("Pattern can not be null.");
         }
 
         String pattern = patternLiteral.toString();
-        if (pattern.contains("_")) {
+        if (pattern.indexOf('_') >= 0 || pattern.indexOf('\\') >= 0) {
             return Optional.empty();
         }
 

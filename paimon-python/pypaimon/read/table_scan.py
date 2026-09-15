@@ -1,73 +1,654 @@
-################################################################################
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-# limitations under the License.
-################################################################################
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
-from typing import Optional
+import json as _json
+import logging
+from typing import List, Optional, Tuple
 
+from pypaimon.catalog.catalog_exception import TableNoPermissionException
+from pypaimon.common.identifier import UNKNOWN_DATABASE
 from pypaimon.common.options.core_options import CoreOptions
 from pypaimon.common.predicate import Predicate
-
+from pypaimon.common.predicate_builder import PredicateBuilder
+from pypaimon.manifest.manifest_list_manager import ManifestListManager
 from pypaimon.read.plan import Plan
-from pypaimon.read.scanner.empty_starting_scanner import EmptyStartingScanner
-from pypaimon.read.scanner.full_starting_scanner import FullStartingScanner
-from pypaimon.read.scanner.incremental_starting_scanner import \
-    IncrementalStartingScanner
-from pypaimon.read.scanner.starting_scanner import StartingScanner
-from pypaimon.snapshot.snapshot_manager import SnapshotManager
+from pypaimon.read.query_auth_split import resolve_auth_result, wrap_plan_with_auth
+from pypaimon.read.scan_stats import ScanStats
+from pypaimon.read.scanner.file_scanner import FileScanner
+
+logger = logging.getLogger(__name__)
+
+_NATIVE_FAMILY_SEARCH_MODE_OPTIONS = frozenset({
+    CoreOptions.SCALAR_INDEX_SEARCH_MODE.key(),
+    CoreOptions.VECTOR_INDEX_SEARCH_MODE.key(),
+    CoreOptions.FULL_TEXT_INDEX_SEARCH_MODE.key(),
+})
+_NATIVE_SEARCH_MODE_OPTIONS = _NATIVE_FAMILY_SEARCH_MODE_OPTIONS | {
+    CoreOptions.GLOBAL_INDEX_SEARCH_MODE.key(),
+}
+_NATIVE_FORWARDED_OPTIONS = frozenset({
+    CoreOptions.SCAN_NATIVE_PLAN_ENABLED.key(),
+    CoreOptions.SCAN_MODE.key(),
+    CoreOptions.INCREMENTAL_BETWEEN_TIMESTAMP.key(),
+    CoreOptions.SOURCE_SPLIT_TARGET_SIZE.key(),
+    CoreOptions.SOURCE_SPLIT_OPEN_FILE_COST.key(),
+    CoreOptions.SCAN_SNAPSHOT_ID.key(),
+    CoreOptions.SCAN_TAG_NAME.key(),
+    CoreOptions.SCAN_TIMESTAMP.key(),
+    CoreOptions.SCAN_TIMESTAMP_MILLIS.key(),
+    CoreOptions.SCAN_WATERMARK.key(),
+    CoreOptions.BRANCH.key(),
+}) | _NATIVE_SEARCH_MODE_OPTIONS
+_NATIVE_PLAN_INDEPENDENT_OPTIONS = frozenset({
+    CoreOptions.BLOB_AS_DESCRIPTOR.key(),
+    CoreOptions.READ_BATCH_SIZE.key(),
+    CoreOptions.READ_PARALLELISM.key(),
+})
+_NATIVE_TIME_TRAVEL_OPTIONS = frozenset({
+    CoreOptions.SCAN_SNAPSHOT_ID.key(),
+    CoreOptions.SCAN_TAG_NAME.key(),
+    CoreOptions.SCAN_TIMESTAMP.key(),
+    CoreOptions.SCAN_TIMESTAMP_MILLIS.key(),
+    CoreOptions.SCAN_WATERMARK.key(),
+})
 
 
 class TableScan:
     """Implementation of TableScan for native Python reading."""
 
-    def __init__(self, table, predicate: Optional[Predicate], limit: Optional[int]):
+    def __init__(
+        self,
+        table,
+        predicate: Optional[Predicate],
+        limit: Optional[int],
+        partition_predicate: Optional[Predicate] = None,
+    ):
         from pypaimon.table.file_store_table import FileStoreTable
 
         self.table: FileStoreTable = table
         self.predicate = predicate
         self.limit = limit
-        self.starting_scanner = self._create_starting_scanner()
+        self.partition_predicate = partition_predicate
+        self._read_type = None
+        self._query_auth_fn = self.table.catalog_environment.table_query_auth(
+            self.table.options, self.table.identifier)
+        self.file_scanner = self._create_file_scanner()
 
     def plan(self) -> Plan:
-        return self.starting_scanner.scan()
+        auth_result = self.__auth_query()
+        # The native planner bypasses the auth-aware file scanner. Resolve auth
+        # before selecting a planning backend.
+        if (auth_result is None and self.table.options.native_plan_enabled()
+                and self._native_plan_supported()):
+            native = self._try_native_plan()
+            if native is not None:
+                return native
+        if auth_result is not None:
+            prune_scanner_by_auth(self.table, self.file_scanner, auth_result)
+        plan = self.file_scanner.scan()
+        return wrap_plan_with_auth(auth_result, plan)
 
-    def _create_starting_scanner(self) -> Optional[StartingScanner]:
+    def _native_plan_supported(self) -> bool:
+        # Any probe failure (e.g. a remote schema/metadata read) must fall back, not fail the scan.
+        try:
+            return self._native_plan_supported_impl()
+        except Exception as e:
+            logger.warning("Native-plan capability probe failed, falling back: %s", e)
+            return False
+
+    def _native_plan_supported_impl(self) -> bool:
+        """Fall back to the Python scanner for scans native can't carry:
+        chunk-shuffle, scored or primary-key
+        global-index results, first-row merge-engine (Rust drops L0), deletion
+        vector merge-on-read, postpone bucket,
+        a primary-key table whose trimmed PK is empty (PK equals the partition
+        key; Rust rejects this schema), dynamic
+        bucket / cross-partition PK tables (unconfirmed Rust parity), a stale
+        schema without time travel, removed copy() options which Rust cannot
+        represent, unsupported time travel selectors,
+        query auth, a missing/old
+        pypaimon-rust, or a catalog / identifier Rust cannot reconstruct. Keep
+        this capability gate in sync when adding scan features."""
+        from pypaimon.read.native_plan import (
+            native_method_available, native_runtime_available, native_version_at_least,
+        )
+        if not native_runtime_available():
+            return False
+        fs = self.file_scanner
+        if (getattr(fs, 'chunk_shuffle', None) is not None
+                or not self._native_global_index_result_supported()
+                or getattr(fs, 'only_read_real_buckets', False)):
+            return False
+        # Positional append distribution needs the stable partition/file order
+        # introduced in 0.4. Older bindings can assign different rows per call.
+        if (not self.table.is_primary_key_table and not fs.data_evolution
+                and (fs.idx_of_this_subtask is not None or fs.start_pos_of_this_subtask is not None)
+                and not native_version_at_least(0, 4)):
+            return False
+        if getattr(fs, 'deletion_vectors_enabled', False):
+            # 0.4.0 includes Python-written DV decoding and legacy bucket paths.
+            if not native_version_at_least(0, 4, 0):
+                return False
+            # Python DV scans skip L0; Rust can include L0 when this option is
+            # enabled. Keep that mode on the Python planner until aligned.
+            table_options = self.table.options.options.to_map()
+            merge_on_read = table_options.get(
+                'deletion-vectors.merge-on-read', False)
+            if str(merge_on_read).lower() == 'true':
+                return False
+        if getattr(fs, 'data_evolution', False):
+            if (getattr(fs, 'idx_of_this_subtask', None) is not None
+                    and not native_method_available('TableScan', 'with_row_position_shard')):
+                return False
+            if (getattr(fs, 'start_pos_of_this_subtask', None) is not None
+                    and not native_method_available('TableScan', 'with_row_position_slice')):
+                return False
+        if (getattr(fs, '_row_ranges', None) is not None
+                and not native_method_available('ReadBuilder', 'with_row_ranges')):
+            return False
+        if (self.table.current_branch() != 'main'
+                and not native_method_available('Table', 'branch')):
+            return False
+        loader = getattr(
+            getattr(self.table, 'catalog_environment', None),
+            'catalog_loader',
+            None,
+        )
+        context_fn = getattr(loader, 'context', None)
+        if not callable(context_fn):
+            return False
+        from pypaimon.read.native_plan import _catalog_metastore
+        if _catalog_metastore(loader) is None:
+            return False
+        context = context_fn()
+        catalog_options = getattr(context, 'options', None)
+        if catalog_options is None:
+            return False
+        if any(getattr(context, attr, None) is not None for attr in (
+                'hadoop_conf', 'prefer_io_loader', 'fallback_io_loader')):
+            return False
+        database_name = self.table.identifier.get_database_name()
+        if not database_name or database_name == UNKNOWN_DATABASE or '.' in database_name:
+            return False
+        if self.table.options.query_auth_enabled \
+                or self.table.options.merge_engine() == 'first-row':
+            return False
+        # Rust rejects schemas whose primary keys are all partition keys.
+        if getattr(self.table, 'is_primary_key_table', False) \
+                and not self.table.trimmed_primary_keys:
+            return False
+        # Dynamic-bucket / cross-partition PK: Rust parity unconfirmed -> fall back.
+        from pypaimon.table.bucket_mode import BucketMode
+        if self.table.bucket_mode() in (BucketMode.HASH_DYNAMIC, BucketMode.CROSS_PARTITION):
+            return False
         options = self.table.options.options
-        if options.contains(CoreOptions.INCREMENTAL_BETWEEN_TIMESTAMP):
+        if (options.contains_key(CoreOptions.SCAN_WATERMARK.key())
+                and not native_version_at_least(0, 4)):
+            return False
+        if (any(options.contains_key(key)
+                for key in _NATIVE_FAMILY_SEARCH_MODE_OPTIONS)):
+            from pypaimon.read.native_plan import native_family_search_modes_available
+            if not native_family_search_modes_available():
+                return False
+        supported_time_travel = any(
+            options.contains_key(key) for key in _NATIVE_TIME_TRAVEL_OPTIONS)
+        # Time travel intentionally carries a historical schema; other stale
+        # table objects must still fall back because Rust reloads the latest.
+        latest_schema = self.table.schema_manager.latest()
+        if (not supported_time_travel and latest_schema is not None
+                and latest_schema.id != self.table.table_schema.id):
+            return False
+        # Rust cannot remove an option persisted in the catalog-loaded schema.
+        applied_options = getattr(self.table, '_applied_dynamic_options', {}) or {}
+        allowed_options = (
+            _NATIVE_FORWARDED_OPTIONS | _NATIVE_PLAN_INDEPENDENT_OPTIONS)
+        if (set(applied_options) - allowed_options
+                or any(key in (_NATIVE_TIME_TRAVEL_OPTIONS
+                               | _NATIVE_SEARCH_MODE_OPTIONS) and value is None
+                       for key, value in applied_options.items())):
+            return False
+        from pypaimon.snapshot.time_travel_util import SCAN_KEYS
+        unsupported_scan_keys = set(SCAN_KEYS) - _NATIVE_TIME_TRAVEL_OPTIONS
+        if any(options.contains_key(k) for k in unsupported_scan_keys) \
+                or options.contains_key('scan.version'):
+            return False
+        return (not options.contains(CoreOptions.INCREMENTAL_BETWEEN_TIMESTAMP)
+                or native_method_available('ReadBuilder', 'new_incremental_scan'))
+
+    def _native_global_index_result_supported(self) -> bool:
+        result = self.file_scanner._global_index_result
+        if result is None:
+            return True
+        if (self.table.is_primary_key_table
+                or not self.file_scanner.data_evolution):
+            return False
+        from pypaimon.globalindex.global_index_result import GlobalIndexResult
+        from pypaimon.globalindex.vector_search_result import ScoredGlobalIndexResult
+        return (isinstance(result, GlobalIndexResult)
+                and not isinstance(result, ScoredGlobalIndexResult))
+
+    def _native_row_ranges(self) -> Optional[List[Tuple[int, int]]]:
+        row_ranges = getattr(self.file_scanner, '_row_ranges', None)
+        if row_ranges is not None:
+            return [(range_.from_, range_.to) for range_ in row_ranges]
+        result = self.file_scanner._global_index_result
+        if result is None:
+            return None
+        return [(range_.from_, range_.to)
+                for range_ in result.results().to_range_list()]
+
+    def _try_native_plan(self) -> Optional[Plan]:
+        """Plan via pypaimon_rust, then drop partitions the predicate rejects.
+
+        Predicate and limit are pushed into Rust planning and are still enforced
+        by the reader. Snapshot metadata is preserved even when pruning removes
+        every split.
+        """
+        from pypaimon.read.native_plan import native_plan
+
+        try:
+            fs = self.file_scanner
+            has_distribution = (fs.idx_of_this_subtask is not None
+                                or fs.start_pos_of_this_subtask is not None)
+            extra_options = {}
+            if self.table.options.options.contains(CoreOptions.INCREMENTAL_BETWEEN_TIMESTAMP):
+                if self._incremental_snapshot_range is None:
+                    return Plan([])
+                extra_options['incremental_range'] = self._incremental_snapshot_range
+            if has_distribution and fs.data_evolution:
+                if fs.idx_of_this_subtask is not None:
+                    extra_options['row_position_shard'] = (
+                        fs.idx_of_this_subtask, fs.number_of_para_subtasks)
+                else:
+                    extra_options['row_position_slice'] = (
+                        fs.start_pos_of_this_subtask, fs.end_pos_of_this_subtask)
+            row_ranges = self._native_row_ranges()
+            native_predicate = self.predicate
+            if self.partition_predicate is not None:
+                native_predicate = PredicateBuilder.and_predicates([
+                    predicate for predicate in (
+                        native_predicate,
+                        self.file_scanner.partition_key_predicate,
+                    ) if predicate is not None
+                ])
+            plan = native_plan(
+                self.table,
+                predicate=native_predicate,
+                limit=None if has_distribution else self.limit,
+                projection=(
+                    [field.name for field in self._read_type]
+                    if self._read_type is not None else None),
+                row_ranges=row_ranges,
+                **extra_options,
+            )
+            splits = plan.splits()
+            partition_predicate = self.file_scanner.partition_key_predicate
+            if partition_predicate is not None:
+                splits = [s for s in splits
+                          if getattr(s, 'partition', None) is None
+                          or partition_predicate.test(s.partition)]
+            if has_distribution:
+                if self.table.is_primary_key_table:
+                    splits = [s for s in splits
+                              if s.bucket % fs.number_of_para_subtasks == fs.idx_of_this_subtask]
+                elif not fs.data_evolution:
+                    from pypaimon.read.scan_distribution import shard_range, slice_append_splits
+                    if fs.idx_of_this_subtask is not None:
+                        start, end = shard_range(
+                            sum(s.row_count for s in splits),
+                            fs.idx_of_this_subtask, fs.number_of_para_subtasks)
+                    else:
+                        start, end = fs.start_pos_of_this_subtask, fs.end_pos_of_this_subtask
+                    splits = slice_append_splits(splits, start, end)
+                splits = fs._apply_push_down_limit(splits)
+            return Plan(splits, snapshot_id=plan.snapshot_id)
+        except Exception as e:
+            # Any native construction/planning/pruning failure -> fall back.
+            logger.warning(
+                "Native plan failed, falling back to the Python scanner: %s", e)
+            return None
+
+    def plan_for_write(self) -> Plan:
+        if self.__auth_query() is not None:
+            raise TableNoPermissionException(self.table.identifier)
+        return self.file_scanner.scan()
+
+    def __auth_query(self):
+        return resolve_auth_result(self._query_auth_fn, self._read_type)
+
+    def scan_with_stats(self) -> Tuple[Plan, Optional[ScanStats]]:
+        """Run :meth:`plan` while recording manifest / pruning counters.
+
+        Only used by :meth:`ReadBuilder.explain`; the regular read path
+        keeps going through :meth:`plan`. Native plans return stats=None;
+        explain reports their split metadata without pruning counters.
+        """
+        auth_result = self.__auth_query()
+        if (auth_result is None and self.table.options.native_plan_enabled()
+                and self._native_plan_supported()):
+            native = self._try_native_plan()
+            if native is not None:
+                return native, None
+        if auth_result is not None:
+            prune_scanner_by_auth(self.table, self.file_scanner, auth_result)
+        plan, stats = self.file_scanner.scan_with_stats()
+        return wrap_plan_with_auth(auth_result, plan), stats
+
+    def _create_file_scanner(self) -> FileScanner:
+        self._incremental_snapshot_range = None
+        options = self.table.options.options
+        snapshot_manager = self.table.snapshot_manager()
+        manifest_list_manager = ManifestListManager(self.table)
+
+        self._validate_scan_mode()
+
+        from pypaimon.snapshot.time_travel_util import TimeTravelUtil, SCAN_KEYS
+        has_time_travel = any(options.contains_key(key) for key in SCAN_KEYS)
+        has_incremental = options.contains(CoreOptions.INCREMENTAL_BETWEEN_TIMESTAMP)
+
+        if has_incremental and has_time_travel:
+            raise ValueError(
+                "incremental-between-timestamp cannot be used together with "
+                "point-in-time scan options: %s" % SCAN_KEYS
+            )
+
+        if has_incremental:
             ts = options.get(CoreOptions.INCREMENTAL_BETWEEN_TIMESTAMP).split(",")
             if len(ts) != 2:
                 raise ValueError(
                     "The incremental-between-timestamp must specific start(exclusive) and end timestamp. But is: " +
                     options.get(CoreOptions.INCREMENTAL_BETWEEN_TIMESTAMP))
-            earliest_snapshot = SnapshotManager(self.table).try_get_earliest_snapshot()
-            latest_snapshot = SnapshotManager(self.table).get_latest_snapshot()
-            if earliest_snapshot is None or latest_snapshot is None:
-                return EmptyStartingScanner()
             start_timestamp = int(ts[0])
             end_timestamp = int(ts[1])
             if start_timestamp >= end_timestamp:
                 raise ValueError(
-                    "Ending timestamp %s should be >= starting timestamp %s." % (end_timestamp, start_timestamp))
-            if (start_timestamp == end_timestamp or start_timestamp > latest_snapshot.time_millis
+                    "Ending timestamp %s must be greater than starting timestamp %s."
+                    % (end_timestamp, start_timestamp))
+            earliest_snapshot = snapshot_manager.try_get_earliest_snapshot()
+            latest_snapshot = snapshot_manager.get_latest_snapshot()
+            if earliest_snapshot is None or latest_snapshot is None:
+                return FileScanner(
+                    self.table,
+                    lambda: ([], None),
+                    partition_predicate=self.partition_predicate,
+                )
+            if (start_timestamp > latest_snapshot.time_millis
                     or end_timestamp < earliest_snapshot.time_millis):
-                return EmptyStartingScanner()
-            return IncrementalStartingScanner.between_timestamps(self.table, self.predicate, self.limit,
-                                                                 start_timestamp, end_timestamp)
-        return FullStartingScanner(self.table, self.predicate, self.limit)
+                return FileScanner(
+                    self.table,
+                    lambda: ([], None),
+                    partition_predicate=self.partition_predicate,
+                )
+
+            starting_snapshot = snapshot_manager.earlier_or_equal_time_mills(start_timestamp)
+            earliest_snapshot = snapshot_manager.try_get_earliest_snapshot()
+
+            # If earliest_snapshot.time_millis > start_timestamp we should include the earliest_snapshot
+            if starting_snapshot is None or (earliest_snapshot and earliest_snapshot.time_millis > start_timestamp):
+                start_id = earliest_snapshot.id - 1 if earliest_snapshot else -1
+            else:
+                start_id = starting_snapshot.id
+
+            end_snapshot = snapshot_manager.earlier_or_equal_time_mills(end_timestamp)
+            latest_snapshot = snapshot_manager.get_latest_snapshot()
+            end_id = end_snapshot.id if end_snapshot else (latest_snapshot.id if latest_snapshot else -1)
+            self._incremental_snapshot_range = (start_id, end_id)
+
+            def incremental_manifest():
+                snapshots_in_range = []
+                end_snapshot = snapshot_manager.get_snapshot_by_id(end_id) if end_id >= 1 else None
+                for snapshot_id in range(start_id + 1, end_id + 1):
+                    snapshot = snapshot_manager.get_snapshot_by_id(snapshot_id)
+                    end_snapshot = snapshot
+                    if snapshot.commit_kind == "APPEND":
+                        snapshots_in_range.append(snapshot)
+
+                manifests = []
+
+                for snapshot in snapshots_in_range:
+                    manifest_files = manifest_list_manager.read_delta(snapshot)
+                    manifests.extend(manifest_files)
+                return manifests, end_snapshot
+
+            return FileScanner(
+                self.table,
+                incremental_manifest,
+                self.predicate,
+                self.limit,
+                partition_predicate=self.partition_predicate,
+            )
+
+        if has_time_travel:
+            def time_travel_manifest_scanner():
+                snapshot = TimeTravelUtil.try_travel_to_snapshot(
+                    options, self.table.tag_manager(), snapshot_manager
+                )
+                if snapshot is None:
+                    raise ValueError(
+                        "Could not resolve time travel snapshot from scan options."
+                    )
+                return manifest_list_manager.read_all(snapshot), snapshot
+
+            return FileScanner(
+                self.table,
+                time_travel_manifest_scanner,
+                self.predicate,
+                self.limit,
+                partition_predicate=self.partition_predicate,
+            )
+
+        def all_manifests():
+            snapshot = snapshot_manager.get_latest_snapshot()
+            return manifest_list_manager.read_all(snapshot), snapshot
+
+        return FileScanner(
+            self.table,
+            all_manifests,
+            self.predicate,
+            self.limit,
+            partition_predicate=self.partition_predicate,
+        )
 
     def with_shard(self, idx_of_this_subtask, number_of_para_subtasks) -> 'TableScan':
-        self.starting_scanner.with_shard(idx_of_this_subtask, number_of_para_subtasks)
+        self.file_scanner.with_shard(idx_of_this_subtask, number_of_para_subtasks)
         return self
+
+    def with_slice(self, start_pos, end_pos) -> 'TableScan':
+        self.file_scanner.with_slice(start_pos, end_pos)
+        return self
+
+    def with_global_index_result(self, result) -> 'TableScan':
+        self.file_scanner.with_global_index_result(result)
+        return self
+
+    def with_row_ranges(self, row_ranges) -> 'TableScan':
+        self.file_scanner.with_row_ranges(row_ranges)
+        return self
+
+    def with_chunk_shuffle(self, seed: int, chunk_size: int) -> 'TableScan':
+        self.file_scanner.with_chunk_shuffle(seed, chunk_size)
+        return self
+
+    def _validate_scan_mode(self):
+        """Validate scan.mode against companion options using a whitelist approach.
+
+        Each StartupMode declares exactly which scan keys are allowed. Any
+        scan key present but not in the whitelist for the resolved mode is
+        rejected. This matches Java's SchemaValidation mutual-exclusion matrix.
+        """
+        from pypaimon.common.options.core_options import StartupMode
+
+        core_options = self.table.options
+        mode = core_options.startup_mode()
+        options = core_options.options
+
+        has_snapshot_id = options.contains(CoreOptions.SCAN_SNAPSHOT_ID)
+        has_tag_name = options.contains(CoreOptions.SCAN_TAG_NAME)
+        has_watermark = options.contains(CoreOptions.SCAN_WATERMARK)
+        has_timestamp_millis = options.contains(CoreOptions.SCAN_TIMESTAMP_MILLIS)
+        has_timestamp = options.contains(CoreOptions.SCAN_TIMESTAMP)
+        has_incremental = options.contains(CoreOptions.INCREMENTAL_BETWEEN_TIMESTAMP)
+        has_file_creation_time = options.contains(CoreOptions.SCAN_FILE_CREATION_TIME_MILLIS)
+        has_creation_time = options.contains(CoreOptions.SCAN_CREATION_TIME_MILLIS)
+
+        present_keys = []
+        if has_snapshot_id:
+            present_keys.append(CoreOptions.SCAN_SNAPSHOT_ID.key())
+        if has_tag_name:
+            present_keys.append(CoreOptions.SCAN_TAG_NAME.key())
+        if has_watermark:
+            present_keys.append(CoreOptions.SCAN_WATERMARK.key())
+        if has_timestamp_millis:
+            present_keys.append(CoreOptions.SCAN_TIMESTAMP_MILLIS.key())
+        if has_timestamp:
+            present_keys.append(CoreOptions.SCAN_TIMESTAMP.key())
+        if has_incremental:
+            present_keys.append(CoreOptions.INCREMENTAL_BETWEEN_TIMESTAMP.key())
+        if has_file_creation_time:
+            present_keys.append(CoreOptions.SCAN_FILE_CREATION_TIME_MILLIS.key())
+        if has_creation_time:
+            present_keys.append(CoreOptions.SCAN_CREATION_TIME_MILLIS.key())
+
+        # scan.timestamp-millis and scan.timestamp are mutually exclusive
+        if has_timestamp_millis and has_timestamp:
+            raise ValueError(
+                "scan.timestamp-millis and scan.timestamp cannot both be set."
+            )
+
+        # Define allowed companion keys per mode
+        if mode == StartupMode.FROM_TIMESTAMP:
+            allowed = {
+                CoreOptions.SCAN_TIMESTAMP_MILLIS.key(),
+                CoreOptions.SCAN_TIMESTAMP.key(),
+            }
+            if not (has_timestamp_millis or has_timestamp):
+                raise ValueError(
+                    "scan.mode is 'from-timestamp' but neither "
+                    "scan.timestamp-millis nor scan.timestamp is set."
+                )
+        elif mode == StartupMode.FROM_SNAPSHOT_FULL:
+            allowed = {CoreOptions.SCAN_SNAPSHOT_ID.key()}
+            if not has_snapshot_id:
+                raise ValueError(
+                    "scan.mode is 'from-snapshot-full' but scan.snapshot-id is not set."
+                )
+        elif mode == StartupMode.FROM_SNAPSHOT:
+            allowed = {
+                CoreOptions.SCAN_SNAPSHOT_ID.key(),
+                CoreOptions.SCAN_TAG_NAME.key(),
+                CoreOptions.SCAN_WATERMARK.key(),
+            }
+            if not (has_snapshot_id or has_tag_name or has_watermark):
+                raise ValueError(
+                    "scan.mode is 'from-snapshot' but none of "
+                    "scan.snapshot-id, scan.tag-name, or scan.watermark is set."
+                )
+        elif mode == StartupMode.INCREMENTAL:
+            allowed = {CoreOptions.INCREMENTAL_BETWEEN_TIMESTAMP.key()}
+            if not has_incremental:
+                raise ValueError(
+                    "scan.mode is 'incremental' but "
+                    "incremental-between-timestamp is not set."
+                )
+        elif mode in (StartupMode.LATEST_FULL, StartupMode.LATEST):
+            allowed = set()
+        elif mode in (StartupMode.COMPACTED_FULL,
+                      StartupMode.FROM_CREATION_TIMESTAMP,
+                      StartupMode.FROM_FILE_CREATION_TIME):
+            raise ValueError(
+                f"scan.mode '{mode.value}' is not yet supported in pypaimon."
+            )
+        else:
+            allowed = set()
+
+        # Reject any scan key that's not in the whitelist for this mode
+        disallowed = [k for k in present_keys if k not in allowed]
+        if disallowed:
+            raise ValueError(
+                f"scan.mode '{mode.value}' conflicts with: {disallowed}. "
+                f"Only {sorted(allowed) if allowed else 'no scan keys'} "
+                f"are allowed for this mode."
+            )
+
+
+def prune_scanner_by_auth(table, scanner, auth_result):
+    if not auth_result.filter:
+        return
+    partition_preds, has_non_partition = __split_auth_filter(table, auth_result)
+    if partition_preds:
+        combined = PredicateBuilder.and_predicates(partition_preds)
+        scanner.auth_partition_predicate = combined
+    if has_non_partition:
+        scanner.auth_has_non_partition_filter = True
+
+
+def __split_auth_filter(table, auth_result):
+    partition_keys = list(table.partition_keys or [])
+    if not partition_keys:
+        return [], bool(auth_result.filter)
+
+    partition_preds = []
+    has_non_partition = False
+    partition_key_set = set(partition_keys)
+    partition_index_map = {name: i for i, name in enumerate(partition_keys)}
+
+    for json_str in (auth_result.filter or []):
+        pred = __try_parse_partition_predicate(table, json_str, partition_key_set, partition_index_map)
+        if pred is not None:
+            partition_preds.append(pred)
+        else:
+            has_non_partition = True
+    return partition_preds, has_non_partition
+
+
+def __try_parse_partition_predicate(table, json_str, partition_keys, partition_index_map):
+    data = _json.loads(json_str)
+    if data is None or data.get("kind") != "LEAF":
+        return None
+    transform = data.get("transform", {})
+    if transform.get("name") != "FIELD_REF":
+        return None
+    field_name = transform.get("fieldRef", {}).get("name")
+    if field_name is None or field_name not in partition_keys:
+        return None
+    field_index = partition_index_map.get(field_name)
+    if field_index is None:
+        return None
+
+    partition_field_type = None
+    for f in table.fields:
+        if f.name == field_name:
+            partition_field_type = getattr(f.type, 'type', '')
+            break
+    base_type = partition_field_type.split('(')[0] if partition_field_type else ''
+    safe_types = {'INT', 'BIGINT', 'SMALLINT', 'TINYINT', 'STRING', 'VARCHAR', 'CHAR'}
+    if base_type not in safe_types:
+        return None
+
+    function = data.get("function", "")
+    literals = data.get("literals", [])
+    method_map = {
+        "EQUAL": "equal", "NOT_EQUAL": "notEqual",
+        "LESS_THAN": "lessThan", "LESS_OR_EQUAL": "lessOrEqual",
+        "GREATER_THAN": "greaterThan", "GREATER_OR_EQUAL": "greaterOrEqual",
+        "IS_NULL": "isNull", "IS_NOT_NULL": "isNotNull",
+        "IN": "in", "NOT_IN": "notIn",
+    }
+    method = method_map.get(function)
+    if method is None:
+        return None
+    return Predicate(method=method, index=field_index, field=field_name, literals=literals)

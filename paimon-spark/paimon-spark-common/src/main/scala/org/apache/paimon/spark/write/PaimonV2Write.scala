@@ -18,10 +18,13 @@
 
 package org.apache.paimon.spark.write
 
+import org.apache.paimon.CoreOptions.ChangelogProducer
+import org.apache.paimon.Snapshot
 import org.apache.paimon.options.Options
 import org.apache.paimon.spark._
-import org.apache.paimon.spark.commands.SchemaHelper
+import org.apache.paimon.spark.commands.SchemaEvolutionHelper
 import org.apache.paimon.spark.rowops.PaimonCopyOnWriteScan
+import org.apache.paimon.table.BucketMode.BUCKET_UNAWARE
 import org.apache.paimon.table.FileStoreTable
 
 import org.apache.spark.internal.Logging
@@ -29,20 +32,23 @@ import org.apache.spark.sql.connector.distributions.Distribution
 import org.apache.spark.sql.connector.expressions.SortOrder
 import org.apache.spark.sql.connector.metric.CustomMetric
 import org.apache.spark.sql.connector.write._
+import org.apache.spark.sql.paimon.shims.SparkShimLoader
 import org.apache.spark.sql.types.StructType
+
+import scala.collection.mutable
 
 class PaimonV2Write(
     override val originTable: FileStoreTable,
     overwritePartitions: Option[Map[String, String]],
     copyOnWriteScan: Option[PaimonCopyOnWriteScan],
     dataSchema: StructType,
-    options: Options
+    options: Options,
+    operationType: Option[Snapshot.Operation] = None
 ) extends Write
   with RequiresDistributionAndOrdering
-  with SchemaHelper
+  with SchemaEvolutionHelper
   with Logging {
 
-  private val writeSchema = mergeSchema(dataSchema, options)
   private val writeRequirement = PaimonWriteRequirement(table)
 
   override def requiredDistribution(): Distribution = {
@@ -58,21 +64,47 @@ class PaimonV2Write(
   }
 
   override def toBatch: BatchWrite = {
-    PaimonBatchWrite(table, writeSchema, dataSchema, overwritePartitions, copyOnWriteScan)
+    // Commit the evolved schema at execution (not at planning), then write to the evolved table.
+    val writeSchema = mergeSchema(dataSchema, options)
+    SparkShimLoader.shim.createPaimonBatchWrite(
+      table,
+      writeSchema,
+      dataSchema,
+      overwritePartitions,
+      copyOnWriteScan,
+      operationType)
   }
 
   override def supportedCustomMetrics(): Array[CustomMetric] = {
-    Array(
+    val buffer = mutable.ArrayBuffer[CustomMetric](
       // write metrics
       PaimonNumWritersMetric(),
       // commit metrics
       PaimonCommitDurationMetric(),
-      PaimonAppendedTableFilesMetric(),
-      PaimonAppendedRecordsMetric(),
-      PaimonAppendedChangelogFilesMetric(),
-      PaimonPartitionsWrittenMetric(),
-      PaimonBucketsWrittenMetric()
+      PaimonAddedTableFilesMetric()
     )
+    if (copyOnWriteScan.isEmpty) {
+      buffer += PaimonInsertedRecordsMetric()
+    }
+    if (copyOnWriteScan.nonEmpty) {
+      buffer += PaimonDeletedTableFilesMetric()
+      // For DELETE, the number of deleted records is exactly the row count difference between
+      // the removed files and the rewritten files. For UPDATE and MERGE, the rewritten files
+      // mix copied rows with modified rows, so record metrics cannot be derived from file stats.
+      if (operationType.contains(Snapshot.Operation.DELETE)) {
+        buffer += PaimonDeletedRecordsMetric()
+      }
+    }
+    if (!coreOptions.changelogProducer().equals(ChangelogProducer.NONE)) {
+      buffer += PaimonAppendedChangelogFilesMetric()
+    }
+    if (!table.partitionKeys().isEmpty) {
+      buffer += PaimonPartitionsWrittenMetric()
+    }
+    if (!table.bucketMode().equals(BUCKET_UNAWARE)) {
+      buffer += PaimonBucketsWrittenMetric()
+    }
+    buffer.toArray
   }
 
   override def toString: String = {

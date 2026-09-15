@@ -32,7 +32,6 @@ import org.apache.paimon.disk.FileChannelUtil;
 import org.apache.paimon.disk.FileIOChannel;
 import org.apache.paimon.disk.IOManager;
 import org.apache.paimon.memory.HeapMemorySegmentPool;
-import org.apache.paimon.memory.MemorySegmentPool;
 import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.MutableObjectIterator;
@@ -60,7 +59,7 @@ public class BinaryExternalSortBuffer implements SortBuffer {
     private final List<ChannelWithMeta> spillChannelIDs;
     private final MemorySize maxDiskSize;
 
-    private int numRecords = 0;
+    private long numRecords = 0;
 
     public BinaryExternalSortBuffer(
             BinaryRowSerializer serializer,
@@ -101,30 +100,9 @@ public class BinaryExternalSortBuffer implements SortBuffer {
             int pageSize,
             int maxNumFileHandles,
             CompressOptions compression,
-            MemorySize maxDiskSize,
-            boolean sequenceOrder) {
-        return create(
-                ioManager,
-                rowType,
-                keyFields,
-                new HeapMemorySegmentPool(bufferSize, pageSize),
-                maxNumFileHandles,
-                compression,
-                maxDiskSize,
-                sequenceOrder);
-    }
-
-    public static BinaryExternalSortBuffer create(
-            IOManager ioManager,
-            RowType rowType,
-            int[] keyFields,
-            MemorySegmentPool pool,
-            int maxNumFileHandles,
-            CompressOptions compression,
-            MemorySize maxDiskSize,
-            boolean sequenceOrder) {
-        RecordComparator comparator =
-                newRecordComparator(rowType.getFieldTypes(), keyFields, sequenceOrder);
+            MemorySize maxDiskSize) {
+        RecordComparator comparator = newRecordComparator(rowType.getFieldTypes(), keyFields);
+        HeapMemorySegmentPool pool = new HeapMemorySegmentPool(bufferSize, pageSize);
         BinaryInMemorySortBuffer sortBuffer =
                 BinaryInMemorySortBuffer.createBuffer(
                         newNormalizedKeyComputer(rowType.getFieldTypes(), keyFields),
@@ -144,7 +122,18 @@ public class BinaryExternalSortBuffer implements SortBuffer {
 
     @Override
     public int size() {
-        return numRecords;
+        if (numRecords > Integer.MAX_VALUE) {
+            throw new RuntimeException(
+                    "numRecords "
+                            + numRecords
+                            + " exceeds Integer.MAX_VALUE, use isEmpty() instead of size().");
+        }
+        return (int) numRecords;
+    }
+
+    @Override
+    public boolean isEmpty() {
+        return numRecords == 0;
     }
 
     @Override
@@ -200,15 +189,13 @@ public class BinaryExternalSortBuffer implements SortBuffer {
             }
             if (inMemorySortBuffer.isEmpty()) {
                 // did not fit in a fresh buffer, must be large...
-                throw new IOException("The record exceeds the maximum size of a sort buffer.");
+                throw new IOException(
+                        "The record exceeds the maximum size of a Paimon write sort buffer. "
+                                + "A single serialized record cannot fit into an empty write buffer. "
+                                + "Please check whether the input contains an oversized row, "
+                                + "or increase the table option 'write-buffer-size'.");
             } else {
                 spill();
-
-                if (spillChannelIDs.size() >= maxNumFileHandles) {
-                    List<ChannelWithMeta> merged = merger.mergeChannelList(spillChannelIDs);
-                    spillChannelIDs.clear();
-                    spillChannelIDs.addAll(merged);
-                }
             }
         }
     }
@@ -223,6 +210,19 @@ public class BinaryExternalSortBuffer implements SortBuffer {
 
     private MutableObjectIterator<BinaryRow> spilledIterator() throws IOException {
         spill();
+
+        // Merge the spilled sorted runs until the number of file handles fits within the
+        // fan-in limit. This is performed once here, after spilling is finished, instead of
+        // incrementally during write(). Doing it during write() would re-add the merged output
+        // to the spill list and re-merge it together with subsequently spilled files, causing
+        // cascading re-merge and degrading the merge IO from O(N*log N) to O(N^2).
+        // This mirrors Flink's SpillingThread#mergeOnDisk: while (channels > maxFanIn)
+        // channels = mergeChannelList(channels).
+        while (spillChannelIDs.size() > maxNumFileHandles) {
+            List<ChannelWithMeta> merged = merger.mergeChannelList(spillChannelIDs);
+            spillChannelIDs.clear();
+            spillChannelIDs.addAll(merged);
+        }
 
         List<FileIOChannel> openChannels = new ArrayList<>();
         BinaryMergeIterator<BinaryRow> iterator =

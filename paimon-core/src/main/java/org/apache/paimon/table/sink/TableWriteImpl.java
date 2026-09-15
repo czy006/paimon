@@ -21,17 +21,18 @@ package org.apache.paimon.table.sink;
 import org.apache.paimon.FileStore;
 import org.apache.paimon.casting.DefaultValueRow;
 import org.apache.paimon.data.BinaryRow;
+import org.apache.paimon.data.BlobConsumer;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.disk.IOManager;
 import org.apache.paimon.io.BundleRecords;
 import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.memory.MemoryPoolFactory;
+import org.apache.paimon.mergetree.compact.CompactRewriterFactory;
 import org.apache.paimon.metrics.MetricRegistry;
 import org.apache.paimon.operation.BundleFileStoreWriter;
 import org.apache.paimon.operation.FileStoreWrite;
 import org.apache.paimon.operation.FileStoreWrite.State;
 import org.apache.paimon.operation.WriteRestore;
-import org.apache.paimon.table.BucketMode;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.RowKind;
 import org.apache.paimon.types.RowType;
@@ -60,7 +61,6 @@ public class TableWriteImpl<T> implements InnerTableWrite, Restorable<List<State
     @Nullable private final RowKindFilter rowKindFilter;
 
     private boolean batchCommitted = false;
-    private BucketMode bucketMode;
     private RowType writeType;
     private int[] notNullFieldIndex;
 
@@ -130,13 +130,20 @@ public class TableWriteImpl<T> implements InnerTableWrite, Restorable<List<State
         return this;
     }
 
-    public TableWriteImpl<T> withCompactExecutor(ExecutorService compactExecutor) {
-        write.withCompactExecutor(compactExecutor);
+    @Override
+    public TableWrite withBlobConsumer(BlobConsumer blobConsumer) {
+        write.withBlobConsumer(blobConsumer);
         return this;
     }
 
-    public TableWriteImpl<T> withBucketMode(BucketMode bucketMode) {
-        this.bucketMode = bucketMode;
+    @Override
+    public TableWriteImpl<T> withCompactRewriterFactory(CompactRewriterFactory factory) {
+        write.withCompactRewriterFactory(factory);
+        return this;
+    }
+
+    public TableWriteImpl<T> withCompactExecutor(ExecutorService compactExecutor) {
+        write.withCompactExecutor(compactExecutor);
         return this;
     }
 
@@ -181,6 +188,21 @@ public class TableWriteImpl<T> implements InnerTableWrite, Restorable<List<State
 
     @Nullable
     public SinkRecord writeAndReturn(InternalRow row, int bucket) throws Exception {
+        return writeAndReturn(row, bucket, null);
+    }
+
+    /**
+     * Write a row to a bucket whose partition-level total bucket count is determined at runtime.
+     */
+    @Nullable
+    public SinkRecord writeAndReturn(InternalRow row, int bucket, int totalBuckets)
+            throws Exception {
+        return writeAndReturn(row, bucket, Integer.valueOf(totalBuckets));
+    }
+
+    @Nullable
+    private SinkRecord writeAndReturn(InternalRow row, int bucket, @Nullable Integer totalBuckets)
+            throws Exception {
         checkNullability(row);
         row = wrapDefaultValue(row);
         RowKind rowKind = RowKindGenerator.getRowKind(rowKindGenerator, row);
@@ -188,7 +210,12 @@ public class TableWriteImpl<T> implements InnerTableWrite, Restorable<List<State
             return null;
         }
         SinkRecord record = bucket == -1 ? toSinkRecord(row) : toSinkRecord(row, bucket);
-        write.write(record.partition(), record.bucket(), recordExtractor.extract(record, rowKind));
+        T extracted = recordExtractor.extract(record, rowKind);
+        if (totalBuckets == null) {
+            write.write(record.partition(), record.bucket(), extracted);
+        } else {
+            write.write(record.partition(), record.bucket(), totalBuckets, extracted);
+        }
         return record;
     }
 

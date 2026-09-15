@@ -21,10 +21,12 @@ package org.apache.paimon.data;
 import org.apache.paimon.data.serializer.InternalArraySerializer;
 import org.apache.paimon.data.serializer.InternalMapSerializer;
 import org.apache.paimon.data.serializer.InternalRowSerializer;
+import org.apache.paimon.data.serializer.InternalVectorSerializer;
 import org.apache.paimon.data.variant.Variant;
 import org.apache.paimon.memory.MemorySegment;
 import org.apache.paimon.memory.MemorySegmentUtils;
 
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 
@@ -89,6 +91,12 @@ abstract class AbstractBinaryWriter implements BinaryWriter {
         BinaryArray binary = serializer.toBinaryArray(input);
         writeSegmentsToVarLenPart(
                 pos, binary.getSegments(), binary.getOffset(), binary.getSizeInBytes());
+    }
+
+    @Override
+    public void writeVector(int pos, InternalVector input, InternalVectorSerializer serializer) {
+        BinaryVector binary = serializer.toBinaryVector(input);
+        writeVectorToVarLenPart(pos, binary);
     }
 
     @Override
@@ -179,16 +187,18 @@ abstract class AbstractBinaryWriter implements BinaryWriter {
 
     @Override
     public void writeVariant(int pos, Variant variant) {
-        byte[] value = variant.value();
-        byte[] metadata = variant.metadata();
-        int totalSize = 4 + value.length + metadata.length;
+        ByteBuffer value = variant.valueBuffer();
+        ByteBuffer metadata = variant.metadataBuffer();
+        int valueSize = value.remaining();
+        int metadataSize = metadata.remaining();
+        int totalSize = 4 + valueSize + metadataSize;
         final int roundedSize = roundNumberOfBytesToNearestWord(totalSize);
         ensureCapacity(roundedSize);
         zeroOutPaddingBytes(totalSize);
 
-        segment.putInt(cursor, value.length);
-        segment.put(cursor + 4, value, 0, value.length);
-        segment.put(cursor + 4 + value.length, metadata, 0, metadata.length);
+        segment.putInt(cursor, valueSize);
+        segment.put(cursor + 4, value, valueSize);
+        segment.put(cursor + 4 + valueSize, metadata, metadataSize);
 
         setOffsetAndSize(pos, cursor, totalSize);
         cursor += roundedSize;
@@ -196,7 +206,12 @@ abstract class AbstractBinaryWriter implements BinaryWriter {
 
     @Override
     public void writeBlob(int pos, Blob blob) {
-        byte[] bytes = blob.toData();
+        byte[] bytes;
+        if (blob instanceof BlobData) {
+            bytes = blob.toData();
+        } else {
+            bytes = Blob.serializeBlob(blob);
+        }
         writeBinary(pos, bytes, 0, bytes.length);
     }
 
@@ -268,6 +283,35 @@ abstract class AbstractBinaryWriter implements BinaryWriter {
 
         // move the cursor forward.
         cursor += roundedSize;
+    }
+
+    private void writeVectorToVarLenPart(int pos, BinaryVector vector) {
+        // Memory layout: [numElements][segments]
+        final int numElementsWidth = 4;
+        final int size = vector.getSizeInBytes();
+
+        final int roundedSize = roundNumberOfBytesToNearestWord(size + numElementsWidth);
+
+        // grow the global buffer before writing data.
+        ensureCapacity(roundedSize);
+
+        zeroOutPaddingBytes(size + numElementsWidth);
+
+        // write numElements value first
+        segment.putInt(cursor, vector.size());
+        cursor += numElementsWidth;
+
+        // then vector values
+        if (vector.getSegments().length == 1) {
+            vector.getSegments()[0].copyTo(vector.getOffset(), segment, cursor, size);
+        } else {
+            writeMultiSegmentsToVarLenPart(vector.getSegments(), vector.getOffset(), size);
+        }
+
+        setOffsetAndSize(pos, cursor - numElementsWidth, size + numElementsWidth);
+
+        // move the cursor forward.
+        cursor += (roundedSize - numElementsWidth);
     }
 
     /** Increases the capacity to ensure that it can hold at least the minimum capacity argument. */

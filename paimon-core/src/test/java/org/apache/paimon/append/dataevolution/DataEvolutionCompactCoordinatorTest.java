@@ -18,26 +18,157 @@
 
 package org.apache.paimon.append.dataevolution;
 
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.FileStore;
+import org.apache.paimon.Snapshot;
 import org.apache.paimon.data.BinaryRow;
+import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.Timestamp;
 import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.io.ProjectedDataFileMeta;
 import org.apache.paimon.manifest.FileKind;
 import org.apache.paimon.manifest.FileSource;
 import org.apache.paimon.manifest.ManifestEntry;
+import org.apache.paimon.manifest.ManifestFile;
+import org.apache.paimon.manifest.ManifestFileMeta;
+import org.apache.paimon.manifest.ProjectedManifestEntry;
+import org.apache.paimon.operation.FileStoreScan;
+import org.apache.paimon.operation.ManifestsReader;
+import org.apache.paimon.options.Options;
+import org.apache.paimon.partition.PartitionPredicate;
 import org.apache.paimon.stats.StatsTestUtils;
+import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.source.DeletionFile;
+import org.apache.paimon.table.source.ScanMode;
+import org.apache.paimon.table.source.snapshot.SnapshotReader;
+import org.apache.paimon.types.DataField;
+import org.apache.paimon.types.DataTypes;
+import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.CloseableIterator;
+import org.apache.paimon.utils.Range;
+import org.apache.paimon.utils.SnapshotManager;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.LongFunction;
+import java.util.stream.Collectors;
 
+import static org.apache.paimon.append.dataevolution.DataEvolutionCompactCoordinator.largeFileThreshold;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 /** Tests for {@link DataEvolutionCompactCoordinator.CompactPlanner}. */
 public class DataEvolutionCompactCoordinatorTest {
+
+    @Test
+    public void testRejectsRewriteRowIdsOption() {
+        FileStoreTable table = mock(FileStoreTable.class);
+        Options options = new Options();
+        options.set(CoreOptions.DATA_EVOLUTION_COMPACTION_REWRITE_ROW_IDS, true);
+        when(table.coreOptions()).thenReturn(new CoreOptions(options));
+
+        assertThatThrownBy(
+                        () ->
+                                new DataEvolutionCompactCoordinator(
+                                        table, false, false, mock(Snapshot.class)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(CoreOptions.DATA_EVOLUTION_COMPACTION_REWRITE_ROW_IDS.key())
+                .hasMessageContaining("materialize_deletion_vectors");
+    }
+
+    @Test
+    public void testLargeFileRatioOptions() {
+        assertThat(new CoreOptions(new Options()).dataEvolutionCompactionLargeFileRatio())
+                .isEqualTo(2.0d);
+        for (double ratio : new double[] {1.0d, 1.15d, Double.MAX_VALUE}) {
+            Options options = new Options();
+            options.set(CoreOptions.DATA_EVOLUTION_COMPACTION_LARGE_FILE_RATIO, ratio);
+            assertThat(new CoreOptions(options).dataEvolutionCompactionLargeFileRatio())
+                    .isEqualTo(ratio);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(
+            doubles = {
+                0.0d,
+                0.99d,
+                -1.0d,
+                Double.NaN,
+                Double.NEGATIVE_INFINITY,
+                Double.POSITIVE_INFINITY
+            })
+    public void testRejectsInvalidLargeFileRatio(double ratio) {
+        Options options = new Options();
+        options.set(CoreOptions.DATA_EVOLUTION_COMPACTION_LARGE_FILE_RATIO, ratio);
+        assertThatThrownBy(() -> new CoreOptions(options).dataEvolutionCompactionLargeFileRatio())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(CoreOptions.DATA_EVOLUTION_COMPACTION_LARGE_FILE_RATIO.key());
+    }
+
+    @Test
+    public void testLargeFileThresholdPreservesByteBoundaries() {
+        // Direct double multiplication rounds 100 * 1.15 below 115.
+        assertThat(largeFileThreshold(100L, 1.15d)).isEqualTo(115L);
+        assertThat(largeFileThreshold(3L, 1.5d)).isEqualTo(4L);
+        assertThat(largeFileThreshold((1L << 53) + 1, 1.0d)).isEqualTo((1L << 53) + 1);
+        assertThat(largeFileThreshold(Long.MAX_VALUE / 2, 2.0d)).isEqualTo(Long.MAX_VALUE - 1);
+        assertThat(largeFileThreshold(Long.MAX_VALUE / 2 + 1, 2.0d)).isEqualTo(Long.MAX_VALUE);
+        assertThat(largeFileThreshold(Long.MAX_VALUE, 1.0d)).isEqualTo(Long.MAX_VALUE);
+        assertThat(largeFileThreshold(100L, Double.MAX_VALUE)).isEqualTo(Long.MAX_VALUE);
+    }
+
+    @ParameterizedTest
+    @CsvSource({"1.0,100", "1.15,115", "1.5,150", "3.0,300"})
+    public void testCustomLargeFileRatioUsesIndividualPhysicalFileSize(
+            double ratio, long threshold) {
+        long versionSize = threshold * 3 / 4;
+        List<ManifestEntry> entries =
+                Arrays.asList(
+                        makeEntryWithSize("below.parquet", 0L, 10L, 0, threshold - 1),
+                        makeEntryWithSize("boundary.parquet", 10L, 10L, 0, threshold),
+                        makeEntryWithSize("base.parquet", 20L, 10L, 0, 10L),
+                        makeEntryWithSize("large-update.parquet", 20L, 10L, 1, threshold + 1),
+                        makeEntryWithSize("version1.parquet", 30L, 10L, 0, versionSize),
+                        makeEntryWithSize("version2.parquet", 30L, 10L, 1, versionSize),
+                        makeBlobEntry("large.blob", 0L, 10L, 1000L),
+                        makeVectorStoreEntry("large.vector.lance", 10L, 10L, 1000L));
+        DataEvolutionCompactCoordinator.CompactPlanner planner =
+                new DataEvolutionCompactCoordinator.CompactPlanner(
+                        false,
+                        false,
+                        largeFileThreshold(100L, ratio),
+                        100L,
+                        100L,
+                        1000L,
+                        10L,
+                        schemaId -> null,
+                        null);
+
+        List<DataEvolutionCompactTask> tasks = planner.compactPlan(entries);
+
+        assertThat(tasks).hasSize(1);
+        assertThat(tasks.get(0).compactBefore())
+                .containsExactly(entries.get(2).file(), entries.get(3).file());
+    }
 
     @Test
     public void testCompactPlannerSingleFile() {
@@ -47,11 +178,79 @@ public class DataEvolutionCompactCoordinatorTest {
 
         DataEvolutionCompactCoordinator.CompactPlanner planner =
                 new DataEvolutionCompactCoordinator.CompactPlanner(
-                        false, 128 * 1024 * 1024, 4 * 1024 * 1024, 2);
+                        false, false, 128 * 1024 * 1024, 4 * 1024 * 1024, 2);
 
         List<DataEvolutionCompactTask> tasks = planner.compactPlan(entries);
 
         assertThat(tasks).isEmpty();
+    }
+
+    @Test
+    public void testSplitLargeFilesUsesPhysicalSizeAndIncludesColumnUpdates() {
+        List<ManifestEntry> entries =
+                Arrays.asList(
+                        makeEntryWithSize("below.parquet", 0L, 10L, 0, 199L),
+                        makeEntryWithSize("boundary.parquet", 10L, 10L, 0, 200L),
+                        makeEntryWithSize("large.parquet", 20L, 10L, 0, 201L),
+                        makeEntryWithSize("update.parquet", 20L, 10L, 1, 10L));
+        for (boolean enabled : new boolean[] {false, true}) {
+            DataEvolutionCompactCoordinator.CompactPlanner planner =
+                    new DataEvolutionCompactCoordinator.CompactPlanner(
+                            false,
+                            false,
+                            enabled ? 200L : Long.MAX_VALUE,
+                            100L,
+                            100L,
+                            1000L,
+                            10L,
+                            schemaId -> null,
+                            null);
+            List<DataEvolutionCompactTask> tasks = planner.compactPlan(entries);
+            if (enabled) {
+                assertThat(tasks).hasSize(1);
+                assertThat(tasks.get(0).compactBefore())
+                        .containsExactly(entries.get(2).file(), entries.get(3).file());
+            } else {
+                assertThat(tasks).isEmpty();
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    public void testDoNotSplitInsideDedicatedFile(boolean vector) {
+        List<ManifestEntry> entries =
+                Arrays.asList(
+                        makeEntryWithSize("large.parquet", 0L, 10L, 0, 1000L),
+                        vector
+                                ? makeVectorStoreEntry("whole.vector.lance", 0L, 10L, 10L)
+                                : makeBlobEntry("whole.blob", 0L, 10L, 10L));
+        DataEvolutionCompactCoordinator.CompactPlanner planner =
+                new DataEvolutionCompactCoordinator.CompactPlanner(
+                        false, false, 200L, 100L, 100L, 1L, 2L, schemaId -> null, null);
+
+        assertThat(planner.compactPlan(entries)).isEmpty();
+    }
+
+    @Test
+    public void testSplitLargeFilesAndMergeSmallFilesKeepDedicatedFiles() {
+        List<ManifestEntry> entries =
+                Arrays.asList(
+                        makeEntryWithSize("large.parquet", 0L, 10L, 0, 201L),
+                        makeEntryWithSize("small1.parquet", 10L, 10L, 0, 20L),
+                        makeEntryWithSize("small2.parquet", 20L, 10L, 0, 20L),
+                        makeBlobEntry("original.blob", 0L, 5L, 1000L),
+                        makeVectorStoreEntry("original.vector.lance", 5L, 5L, 1000L));
+        DataEvolutionCompactCoordinator.CompactPlanner planner =
+                new DataEvolutionCompactCoordinator.CompactPlanner(
+                        false, false, 200L, 100L, 100L, 1L, 2L, schemaId -> null, null);
+
+        List<DataEvolutionCompactTask> tasks = planner.compactPlan(entries);
+
+        assertThat(tasks).hasSize(2);
+        assertThat(tasks.get(0).compactBefore()).containsExactly(entries.get(0).file());
+        assertThat(tasks.get(1).compactBefore())
+                .containsExactly(entries.get(1).file(), entries.get(2).file());
     }
 
     @Test
@@ -64,7 +263,7 @@ public class DataEvolutionCompactCoordinatorTest {
 
         // Use small target file size to trigger compaction
         DataEvolutionCompactCoordinator.CompactPlanner planner =
-                new DataEvolutionCompactCoordinator.CompactPlanner(false, 199, 1, 2);
+                new DataEvolutionCompactCoordinator.CompactPlanner(false, false, 199, 1, 2);
 
         List<DataEvolutionCompactTask> tasks = planner.compactPlan(entries);
 
@@ -72,7 +271,7 @@ public class DataEvolutionCompactCoordinatorTest {
         assertThat(tasks.get(0).compactBefore())
                 .containsExactly(entries.get(0).file(), entries.get(1).file());
 
-        planner = new DataEvolutionCompactCoordinator.CompactPlanner(false, 200, 1, 2);
+        planner = new DataEvolutionCompactCoordinator.CompactPlanner(false, false, 200, 1, 2);
         tasks = planner.compactPlan(entries);
         assertThat(tasks).isNotEmpty();
         assertThat(tasks.get(0).compactBefore())
@@ -93,7 +292,7 @@ public class DataEvolutionCompactCoordinatorTest {
         // Use large target file size so compaction is triggered by gap, not size
         DataEvolutionCompactCoordinator.CompactPlanner planner =
                 new DataEvolutionCompactCoordinator.CompactPlanner(
-                        false, 128 * 1024 * 1024, 4 * 1024 * 1024, 2);
+                        false, false, 128 * 1024 * 1024, 4 * 1024 * 1024, 2);
 
         List<DataEvolutionCompactTask> tasks = planner.compactPlan(entries);
 
@@ -123,7 +322,7 @@ public class DataEvolutionCompactCoordinatorTest {
 
         DataEvolutionCompactCoordinator.CompactPlanner planner =
                 new DataEvolutionCompactCoordinator.CompactPlanner(
-                        false, 100 * 1024 * 1024, 4 * 1024 * 1024, 2);
+                        false, false, 100 * 1024 * 1024, 4 * 1024 * 1024, 2);
 
         List<DataEvolutionCompactTask> tasks = planner.compactPlan(entries);
 
@@ -143,19 +342,20 @@ public class DataEvolutionCompactCoordinatorTest {
         // Test blob file compaction when enabled
         List<ManifestEntry> entries = new ArrayList<>();
         entries.add(makeEntry("file1.parquet", 0L, 100L, 100));
-        entries.add(makeBlobEntry("file1.blob", 0L, 100L, 100));
-        entries.add(makeBlobEntry("file1b.blob", 0L, 100L, 100));
+        entries.add(makeBlobEntry("file1.blob", 0L, 50L, 100, "pic"));
+        entries.add(makeBlobEntry("file1b.blob", 50L, 50L, 100, "pic"));
         entries.add(makeEntry("file2.parquet", 100L, 100L, 100));
-        entries.add(makeBlobEntry("file2.blob", 100L, 100L, 100));
-        entries.add(makeBlobEntry("file2b.blob", 100L, 100L, 100));
+        entries.add(makeBlobEntry("file2.blob", 100L, 50L, 100, "pic"));
+        entries.add(makeBlobEntry("file2b.blob", 150L, 50L, 100, "pic"));
 
         // Use small target to trigger compaction, with blob compaction enabled
         DataEvolutionCompactCoordinator.CompactPlanner planner =
-                new DataEvolutionCompactCoordinator.CompactPlanner(true, 1024, 1024, 2);
+                blobPlanner(1024, 1024, 2, rowType(new DataField(1, "pic", DataTypes.BLOB())));
 
         List<DataEvolutionCompactTask> tasks = planner.compactPlan(entries);
 
-        // Should have compaction tasks for both data files and blob files
+        // Should have compaction tasks for data files and blob files within the data compaction
+        // range.
         assertThat(tasks.size()).isEqualTo(2);
 
         assertThat(tasks.get(0).compactBefore())
@@ -168,10 +368,528 @@ public class DataEvolutionCompactCoordinatorTest {
                         entries.get(5).file());
     }
 
+    @Test
+    public void testCompactPlannerWithUpdatedBlobFiles() {
+        List<ManifestEntry> entries = new ArrayList<>();
+        entries.add(makeEntry("file1.parquet", 0L, 3L, 100));
+        entries.add(makeBlobEntry("old.blob", 0L, 3L, 100, 0, "pic"));
+        entries.add(makeBlobEntry("updated.blob", 0L, 3L, 100, 1, "pic"));
+
+        DataEvolutionCompactCoordinator.CompactPlanner planner =
+                blobPlanner(1024, 1, 2, rowType(new DataField(1, "pic", DataTypes.BLOB())));
+
+        List<DataEvolutionCompactTask> tasks = planner.compactPlan(entries);
+
+        assertThat(tasks).hasSize(1);
+        assertThat(tasks.get(0).type()).isEqualTo(DataEvolutionCompactTask.TaskType.BLOB);
+        assertThat(tasks.get(0).compactBefore())
+                .containsExactly(entries.get(1).file(), entries.get(2).file());
+    }
+
+    @Test
+    public void testCompactPlannerWithUpdatedBlobFilesSpanningAdjacentDataFiles() {
+        List<ManifestEntry> entries = new ArrayList<>();
+        entries.add(makeEntry("file1.parquet", 0L, 10L, 200));
+        entries.add(makeEntry("file2.parquet", 10L, 10L, 200));
+        entries.add(makeBlobEntry("old.blob", 5L, 10L, 40, 0, "pic"));
+        entries.add(makeBlobEntry("updated.blob", 5L, 10L, 40, 1, "pic"));
+
+        DataEvolutionCompactCoordinator.CompactPlanner planner =
+                blobPlanner(100, 100, 2, rowType(new DataField(1, "pic", DataTypes.BLOB())));
+
+        List<DataEvolutionCompactTask> tasks = planner.compactPlan(entries);
+
+        assertThat(tasks).hasSize(1);
+        assertThat(tasks.get(0).type()).isEqualTo(DataEvolutionCompactTask.TaskType.BLOB);
+        assertThat(tasks.get(0).compactBefore())
+                .containsExactly(entries.get(2).file(), entries.get(3).file());
+    }
+
+    @Test
+    public void testSpanningBlobFilesDoNotReconnectDisjointNormalRanges() {
+        List<ManifestEntry> entries = new ArrayList<>();
+        entries.add(makeEntry("prefix-0.parquet", 0L, 5L, 20));
+        entries.add(makeEntry("prefix-1.parquet", 0L, 5L, 20));
+        entries.add(makeBlobEntry("old.blob", 0L, 13L, 40, 0, "pic"));
+        entries.add(makeBlobEntry("updated.blob", 0L, 13L, 40, 1, "pic"));
+        // The oversized normal file covering [5, 9] is not part of the candidate scan.
+        entries.add(makeEntry("suffix-0.parquet", 10L, 2L, 20));
+        entries.add(makeEntry("suffix-1.parquet", 12L, 2L, 20));
+        entries.add(makeEntry("suffix-2.parquet", 14L, 2L, 20));
+        entries.add(makeEntry("suffix-3.parquet", 16L, 4L, 20));
+
+        DataEvolutionCompactCoordinator.CompactPlanner planner =
+                blobPlanner(100, 1, 2, rowType(new DataField(1, "pic", DataTypes.BLOB())));
+
+        List<DataEvolutionCompactTask> normalTasks =
+                planner.compactPlan(entries).stream()
+                        .filter(task -> task.type() == DataEvolutionCompactTask.TaskType.NORMAL)
+                        .collect(Collectors.toList());
+
+        assertThat(normalTasks).hasSize(2);
+        assertThat(normalTasks.get(0).compactBefore())
+                .containsExactly(entries.get(0).file(), entries.get(1).file());
+        assertThat(normalTasks.get(1).compactBefore())
+                .containsExactly(
+                        entries.get(4).file(),
+                        entries.get(5).file(),
+                        entries.get(6).file(),
+                        entries.get(7).file());
+    }
+
+    @Test
+    public void testCompactPlannerMergesAdjacentOverlappingBlobGroups() {
+        List<ManifestEntry> entries = new ArrayList<>();
+        entries.add(makeEntry("file1.parquet", 0L, 2L, 100));
+        entries.add(makeBlobEntry("old-prefix.blob", 0L, 1L, 100, 0, "pic"));
+        entries.add(makeBlobEntry("updated-prefix.blob", 0L, 1L, 100, 1, "pic"));
+        entries.add(makeBlobEntry("old-suffix.blob", 1L, 1L, 100, 0, "pic"));
+        entries.add(makeBlobEntry("updated-suffix.blob", 1L, 1L, 100, 1, "pic"));
+
+        DataEvolutionCompactCoordinator.CompactPlanner planner =
+                blobPlanner(250, 1, 2, rowType(new DataField(1, "pic", DataTypes.BLOB())));
+
+        List<DataEvolutionCompactTask> tasks = planner.compactPlan(entries);
+
+        assertThat(tasks).hasSize(1);
+        assertThat(tasks.get(0).type()).isEqualTo(DataEvolutionCompactTask.TaskType.BLOB);
+        assertThat(tasks.get(0).compactBefore())
+                .containsExactly(
+                        entries.get(1).file(),
+                        entries.get(2).file(),
+                        entries.get(3).file(),
+                        entries.get(4).file());
+    }
+
+    @Test
+    public void testCompactPlannerUsesMergedOverlappingBlobRangeBoundary() {
+        List<ManifestEntry> entries = new ArrayList<>();
+        entries.add(makeEntry("file1.parquet", 0L, 11L, 100));
+        entries.add(makeBlobEntry("prefix.blob", 0L, 5L, 100, 0, "pic"));
+        entries.add(makeBlobEntry("overlap.blob", 3L, 7L, 100, 1, "pic"));
+        entries.add(makeBlobEntry("suffix.blob", 10L, 1L, 100, 0, "pic"));
+
+        DataEvolutionCompactCoordinator.CompactPlanner planner =
+                blobPlanner(1024, 1, 2, rowType(new DataField(1, "pic", DataTypes.BLOB())));
+
+        List<DataEvolutionCompactTask> tasks = planner.compactPlan(entries);
+
+        assertThat(tasks).hasSize(1);
+        assertThat(tasks.get(0).type()).isEqualTo(DataEvolutionCompactTask.TaskType.BLOB);
+        assertThat(tasks.get(0).compactBefore())
+                .containsExactly(
+                        entries.get(1).file(), entries.get(2).file(), entries.get(3).file());
+    }
+
+    @Test
+    public void testCompactPlannerDoesNotCompactBlobFilesAcrossDataFiles() {
+        List<ManifestEntry> entries = new ArrayList<>();
+        entries.add(makeEntry("file1.parquet", 0L, 100L, 100));
+        entries.add(makeBlobEntry("file1.blob", 0L, 100L, 100, "pic"));
+        entries.add(makeEntry("file2.parquet", 100L, 100L, 100));
+        entries.add(makeBlobEntry("file2.blob", 100L, 100L, 100, "pic"));
+
+        DataEvolutionCompactCoordinator.CompactPlanner planner =
+                blobPlanner(1024, 1024, 100, rowType(new DataField(1, "pic", DataTypes.BLOB())));
+
+        List<DataEvolutionCompactTask> tasks = planner.compactPlan(entries);
+
+        assertThat(tasks).isEmpty();
+
+        planner = blobPlanner(1024, 1024, 2, rowType(new DataField(1, "pic", DataTypes.BLOB())));
+        tasks = planner.compactPlan(entries);
+
+        assertThat(tasks).hasSize(2);
+        assertThat(tasks.get(0).compactBefore())
+                .containsExactly(entries.get(0).file(), entries.get(2).file());
+        assertThat(tasks.get(1).compactBefore())
+                .containsExactly(entries.get(1).file(), entries.get(3).file());
+    }
+
+    @Test
+    public void testCompactPlannerDoesNotCompactVectorStoreFilesAcrossDataFiles() {
+        List<ManifestEntry> entries = new ArrayList<>();
+        entries.add(makeEntry("file1.parquet", 0L, 100L, 100));
+        entries.add(makeVectorStoreEntry("file1.vector.json", 0L, 100L, 100));
+        entries.add(makeEntry("file2.parquet", 100L, 100L, 100));
+        entries.add(makeVectorStoreEntry("file2.vector.json", 100L, 100L, 100));
+
+        DataEvolutionCompactCoordinator.CompactPlanner planner =
+                vectorStorePlanner(1024, 1024, 100);
+
+        List<DataEvolutionCompactTask> tasks = planner.compactPlan(entries);
+
+        assertThat(tasks).isEmpty();
+
+        planner = vectorStorePlanner(1024, 1024, 2);
+        tasks = planner.compactPlan(entries);
+
+        assertThat(tasks).hasSize(2);
+        assertThat(tasks.get(0).compactBefore())
+                .containsExactly(entries.get(0).file(), entries.get(2).file());
+        assertThat(tasks.get(1).compactBefore())
+                .containsExactly(entries.get(1).file(), entries.get(3).file());
+    }
+
+    @Test
+    public void testCompactPlannerSkipsSingleFilePerBlobField() {
+        List<ManifestEntry> entries = new ArrayList<>();
+        entries.add(makeEntry("file1.parquet", 0L, 100L, 100));
+        entries.add(makeBlobEntry("pic1.blob", 0L, 100L, 100, "pic1"));
+        entries.add(makeBlobEntry("pic2.blob", 0L, 100L, 100, "pic2"));
+
+        DataEvolutionCompactCoordinator.CompactPlanner planner =
+                blobPlanner(
+                        1024,
+                        1024,
+                        2,
+                        rowType(
+                                new DataField(1, "pic1", DataTypes.BLOB()),
+                                new DataField(2, "pic2", DataTypes.BLOB())));
+
+        List<DataEvolutionCompactTask> tasks = planner.compactPlan(entries);
+
+        assertThat(tasks).isEmpty();
+    }
+
+    @Test
+    public void testCompactPlannerCreatesOneBlobTaskPerField() {
+        List<ManifestEntry> entries = new ArrayList<>();
+        entries.add(makeEntry("file1.parquet", 0L, 100L, 100));
+        entries.add(makeBlobEntry("a1-1.blob", 0L, 50L, 100, "a1"));
+        entries.add(makeBlobEntry("a1-2.blob", 50L, 50L, 100, "a1"));
+        entries.add(makeBlobEntry("a2-1.blob", 0L, 30L, 100, "a2"));
+        entries.add(makeBlobEntry("a2-2.blob", 30L, 30L, 100, "a2"));
+        entries.add(makeBlobEntry("a2-3.blob", 60L, 40L, 100, "a2"));
+
+        DataEvolutionCompactCoordinator.CompactPlanner planner =
+                blobPlanner(
+                        1024,
+                        1024,
+                        2,
+                        rowType(
+                                new DataField(1, "a1", DataTypes.BLOB()),
+                                new DataField(2, "a2", DataTypes.BLOB())));
+
+        List<DataEvolutionCompactTask> tasks = planner.compactPlan(entries);
+
+        assertThat(tasks).hasSize(2);
+        assertThat(tasks).allMatch(task -> task.type() == DataEvolutionCompactTask.TaskType.BLOB);
+        assertThat(tasks.get(0).compactBefore())
+                .containsExactly(entries.get(1).file(), entries.get(2).file());
+        assertThat(tasks.get(1).compactBefore())
+                .containsExactly(
+                        entries.get(3).file(), entries.get(4).file(), entries.get(5).file());
+    }
+
+    @Test
+    public void testCompactPlannerSplitsBlobFilesByTargetSizeAndRowId() {
+        List<ManifestEntry> entries = new ArrayList<>();
+        entries.add(makeEntry("file1.parquet", 0L, 70L, 100));
+        entries.add(makeBlobEntry("a.blob", 0L, 10L, 400, "pic"));
+        entries.add(makeBlobEntry("b.blob", 10L, 10L, 400, "pic"));
+        entries.add(makeBlobEntry("c.blob", 20L, 10L, 1024, "pic"));
+        entries.add(makeBlobEntry("d.blob", 30L, 10L, 600, "pic"));
+        entries.add(makeBlobEntry("e.blob", 40L, 10L, 600, "pic"));
+        entries.add(makeBlobEntry("f.blob", 50L, 10L, 400, "pic"));
+        entries.add(makeBlobEntry("g.blob", 60L, 10L, 500, "pic"));
+
+        DataEvolutionCompactCoordinator.CompactPlanner planner =
+                blobPlanner(1024, 1, 2, rowType(new DataField(1, "pic", DataTypes.BLOB())));
+
+        List<DataEvolutionCompactTask> tasks = planner.compactPlan(entries);
+
+        assertThat(tasks).hasSize(3);
+        assertThat(tasks).allMatch(task -> task.type() == DataEvolutionCompactTask.TaskType.BLOB);
+        assertThat(tasks.get(0).compactBefore())
+                .containsExactly(entries.get(1).file(), entries.get(2).file());
+        assertThat(tasks.get(1).compactBefore())
+                .containsExactly(entries.get(4).file(), entries.get(5).file());
+        assertThat(tasks.get(2).compactBefore())
+                .containsExactly(entries.get(6).file(), entries.get(7).file());
+    }
+
+    @Test
+    public void testCompactPlannerSkipsBlobGroupsWithTooFewSmallFiles() {
+        List<ManifestEntry> entries = new ArrayList<>();
+        entries.add(makeEntry("file1.parquet", 0L, 200L, 100));
+        entries.add(makeBlobEntry("large-pic.blob", 0L, 100L, 1024, "pic"));
+        entries.add(makeBlobEntry("small-pic.blob", 100L, 100L, 100, "pic"));
+
+        DataEvolutionCompactCoordinator.CompactPlanner planner =
+                blobPlanner(1024, 1, 2, rowType(new DataField(1, "pic", DataTypes.BLOB())));
+
+        List<DataEvolutionCompactTask> tasks = planner.compactPlan(entries);
+
+        assertThat(tasks).isEmpty();
+    }
+
+    @Test
+    public void testCompactPlannerGroupsBlobFilesByFieldId() {
+        List<ManifestEntry> entries = new ArrayList<>();
+        entries.add(makeEntry("file1.parquet", 0L, 200L, 100));
+        entries.add(makeBlobEntry("old-pic.blob", 0L, 100L, 100, 0, "old_pic"));
+        entries.add(makeBlobEntry("new-pic.blob", 100L, 100L, 100, 1, "new_pic"));
+
+        Map<Long, RowType> schemas = new HashMap<>();
+        schemas.put(0L, rowType(new DataField(1, "old_pic", DataTypes.BLOB())));
+        schemas.put(1L, rowType(new DataField(1, "new_pic", DataTypes.BLOB())));
+        DataEvolutionCompactCoordinator.CompactPlanner planner =
+                blobPlanner(
+                        1024,
+                        1024,
+                        2,
+                        schemaId -> schemas.get(schemaId),
+                        rowType(new DataField(1, "new_pic", DataTypes.BLOB())));
+
+        List<DataEvolutionCompactTask> tasks = planner.compactPlan(entries);
+
+        assertThat(tasks).hasSize(1);
+        assertThat(tasks.get(0).type()).isEqualTo(DataEvolutionCompactTask.TaskType.BLOB);
+        assertThat(tasks.get(0).compactBefore())
+                .containsExactly(entries.get(1).file(), entries.get(2).file());
+    }
+
+    @Test
+    public void testCompactPlannerSeparatesBlobFilesByFieldIdWhenNameReused() {
+        List<ManifestEntry> entries = new ArrayList<>();
+        entries.add(makeEntry("file1.parquet", 0L, 100L, 100));
+        entries.add(makeBlobEntry("old-pic.blob", 0L, 100L, 100, 0, "pic"));
+        entries.add(makeBlobEntry("new-pic.blob", 0L, 100L, 100, 1, "pic"));
+
+        Map<Long, RowType> schemas = new HashMap<>();
+        schemas.put(0L, rowType(new DataField(1, "pic", DataTypes.BLOB())));
+        schemas.put(1L, rowType(new DataField(2, "pic", DataTypes.BLOB())));
+        DataEvolutionCompactCoordinator.CompactPlanner planner =
+                blobPlanner(
+                        1024,
+                        1024,
+                        2,
+                        schemaId -> schemas.get(schemaId),
+                        rowType(new DataField(2, "pic", DataTypes.BLOB())));
+
+        List<DataEvolutionCompactTask> tasks = planner.compactPlan(entries);
+
+        assertThat(tasks).isEmpty();
+    }
+
+    @Test
+    public void testPlanWithNullManifestRowId() {
+        FileStoreTable table = mock(FileStoreTable.class);
+        SnapshotReader snapshotReader = mock(SnapshotReader.class);
+        SnapshotManager snapshotManager = mock(SnapshotManager.class);
+        Snapshot snapshot = mock(Snapshot.class);
+        ManifestsReader manifestsReader = mock(ManifestsReader.class);
+        FileStore fileStore = mock(FileStore.class);
+        FileStoreScan scan = mock(FileStoreScan.class);
+        ManifestFile.Factory manifestFileFactory = mock(ManifestFile.Factory.class);
+        ManifestFile manifestFile = mock(ManifestFile.class);
+
+        Options options = new Options();
+        options.set("target-file-size", "1 kb");
+        options.set("source.split.open-file-cost", "1 b");
+        options.set("compaction.min.file-num", "2");
+        when(table.coreOptions()).thenReturn(new CoreOptions(options));
+        when(table.newSnapshotReader()).thenReturn(snapshotReader);
+        when(snapshotReader.withPartitionFilter((PartitionPredicate) null))
+                .thenReturn(snapshotReader);
+        when(snapshotReader.snapshotManager()).thenReturn(snapshotManager);
+        when(snapshotManager.latestSnapshot()).thenReturn(snapshot);
+        when(snapshotReader.manifestsReader()).thenReturn(manifestsReader);
+        when(table.store()).thenReturn(fileStore);
+        when(fileStore.newScan()).thenReturn(scan);
+        when(fileStore.manifestFileFactory()).thenReturn(manifestFileFactory);
+        when(manifestFileFactory.create()).thenReturn(manifestFile);
+        when(scan.withPartitionFilter((PartitionPredicate) null)).thenReturn(scan);
+        when(scan.dropStats()).thenReturn(scan);
+        when(scan.withRowRanges(any())).thenReturn(scan);
+
+        ManifestFileMeta metaWithNullRowId =
+                new ManifestFileMeta(
+                        "manifest-1",
+                        1L,
+                        1L,
+                        0L,
+                        StatsTestUtils.newEmptySimpleStats(),
+                        0L,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null);
+        ManifestFileMeta metaWithRowId =
+                new ManifestFileMeta(
+                        "manifest-2",
+                        1L,
+                        1L,
+                        0L,
+                        StatsTestUtils.newEmptySimpleStats(),
+                        0L,
+                        null,
+                        null,
+                        null,
+                        null,
+                        0L,
+                        199L,
+                        null,
+                        null);
+        List<ManifestFileMeta> metas = Arrays.asList(metaWithNullRowId, metaWithRowId);
+        when(manifestsReader.read(snapshot, ScanMode.ALL))
+                .thenReturn(new ManifestsReader.Result(snapshot, metas, metas));
+
+        ManifestEntry entry1 = makeEntry("file1.parquet", 0L, 100L, 600);
+        ManifestEntry entry2 = makeEntry("file2.parquet", 100L, 100L, 600);
+        ProjectedManifestEntry projectedEntry1 = mockProjectedAdd(entry1);
+        ProjectedManifestEntry projectedEntry2 = mockProjectedAdd(entry2);
+        when(manifestFile.scan(eq(metaWithNullRowId.fileName()), any()))
+                .thenReturn(
+                        CloseableIterator.ofElement(
+                                projectedEntry1, ProjectedManifestEntry::clear));
+        when(manifestFile.scan(eq(metaWithRowId.fileName()), any()))
+                .thenReturn(
+                        CloseableIterator.ofElement(
+                                projectedEntry2, ProjectedManifestEntry::clear));
+        when(scan.readFileIterator(Arrays.asList(metaWithNullRowId, metaWithRowId)))
+                .thenReturn(Arrays.asList(entry1, entry2).iterator());
+
+        DataEvolutionCompactCoordinator coordinator =
+                new DataEvolutionCompactCoordinator(table, false, false, snapshot);
+        List<DataEvolutionCompactTask> tasks = coordinator.plan();
+
+        assertThat(tasks).hasSize(1);
+        assertThat(tasks.get(0).compactBefore().stream().map(DataFileMeta::fileName))
+                .containsExactly(entry1.file().fileName(), entry2.file().fileName());
+        verify(manifestFile)
+                .scan(
+                        eq(metaWithNullRowId.fileName()),
+                        any(ProjectedManifestEntry.Projection.class));
+        verify(manifestFile)
+                .scan(eq(metaWithRowId.fileName()), any(ProjectedManifestEntry.Projection.class));
+        verify(scan).withRowRanges(any());
+    }
+
+    @Test
+    public void testPlanWithPartitionFilterDoesNotCompactOtherPartitions() {
+        FileStoreTable table = mock(FileStoreTable.class);
+        SnapshotReader snapshotReader = mock(SnapshotReader.class);
+        SnapshotManager snapshotManager = mock(SnapshotManager.class);
+        Snapshot snapshot = mock(Snapshot.class);
+        ManifestsReader manifestsReader = mock(ManifestsReader.class);
+        FileStore fileStore = mock(FileStore.class);
+        FileStoreScan scan = mock(FileStoreScan.class);
+        ManifestFile.Factory manifestFileFactory = mock(ManifestFile.Factory.class);
+        ManifestFile manifestFile = mock(ManifestFile.class);
+        PartitionPredicate partitionPredicate = mock(PartitionPredicate.class);
+        AtomicBoolean entryPartitionFilterApplied = new AtomicBoolean(false);
+
+        Options options = new Options();
+        options.set("target-file-size", "1 kb");
+        options.set("source.split.open-file-cost", "1 b");
+        options.set("compaction.min.file-num", "2");
+        when(table.coreOptions()).thenReturn(new CoreOptions(options));
+        when(table.newSnapshotReader()).thenReturn(snapshotReader);
+        when(snapshotReader.withPartitionFilter(partitionPredicate)).thenReturn(snapshotReader);
+        when(snapshotReader.snapshotManager()).thenReturn(snapshotManager);
+        when(snapshotManager.latestSnapshot()).thenReturn(snapshot);
+        when(snapshotReader.manifestsReader()).thenReturn(manifestsReader);
+        when(manifestsReader.partitionFilter()).thenReturn(partitionPredicate);
+        when(table.store()).thenReturn(fileStore);
+        when(fileStore.newScan()).thenReturn(scan);
+        when(fileStore.manifestFileFactory()).thenReturn(manifestFileFactory);
+        when(manifestFileFactory.create()).thenReturn(manifestFile);
+        when(scan.withPartitionFilter(partitionPredicate))
+                .thenAnswer(
+                        invocation -> {
+                            entryPartitionFilterApplied.set(true);
+                            return scan;
+                        });
+        when(scan.dropStats()).thenReturn(scan);
+        when(scan.withRowRanges(any())).thenReturn(scan);
+
+        ManifestFileMeta sharedManifest =
+                new ManifestFileMeta(
+                        "shared-manifest",
+                        1L,
+                        4L,
+                        0L,
+                        StatsTestUtils.newEmptySimpleStats(),
+                        0L,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null);
+        when(manifestsReader.read(snapshot, ScanMode.ALL))
+                .thenReturn(
+                        new ManifestsReader.Result(
+                                snapshot,
+                                Collections.singletonList(sharedManifest),
+                                Collections.singletonList(sharedManifest)));
+
+        BinaryRow partitionA = BinaryRow.singleColumn(0);
+        BinaryRow partitionB = BinaryRow.singleColumn(1);
+        ManifestEntry a1 = makeEntry(partitionA, "a-1.parquet", 0L, 100L, 600);
+        ManifestEntry a2 = makeEntry(partitionA, "a-2.parquet", 100L, 100L, 600);
+        ManifestEntry b1 = makeEntry(partitionB, "b-1.parquet", 0L, 100L, 600);
+        ManifestEntry b2 = makeEntry(partitionB, "b-2.parquet", 100L, 100L, 600);
+        List<ProjectedManifestEntry> projectedEntries =
+                Arrays.asList(
+                        mockProjectedAdd(a1),
+                        mockProjectedAdd(a2),
+                        mockProjectedAdd(b1),
+                        mockProjectedAdd(b2));
+        when(manifestFile.scan(eq(sharedManifest.fileName()), any()))
+                .thenReturn(
+                        CloseableIterator.fromList(
+                                projectedEntries, ProjectedManifestEntry::clear));
+        when(scan.readFileIterator(Collections.singletonList(sharedManifest)))
+                .thenAnswer(
+                        invocation ->
+                                Arrays.asList(a1, a2, b1, b2).stream()
+                                        .filter(
+                                                entry ->
+                                                        !entryPartitionFilterApplied.get()
+                                                                || partitionPredicate.test(
+                                                                        entry.partition()))
+                                        .iterator());
+        when(partitionPredicate.test(partitionA)).thenReturn(false);
+        when(partitionPredicate.test(partitionB)).thenReturn(true);
+
+        DataEvolutionCompactCoordinator coordinator =
+                new DataEvolutionCompactCoordinator(
+                        table, partitionPredicate, false, false, snapshot);
+        List<DataEvolutionCompactTask> tasks = coordinator.plan();
+
+        assertThat(tasks).hasSize(1);
+        assertThat(tasks.get(0).partition()).isEqualTo(partitionB);
+        assertThat(tasks.get(0).compactBefore().stream().map(DataFileMeta::fileName))
+                .containsExactly(b1.file().fileName(), b2.file().fileName());
+    }
+
     private ManifestEntry makeEntry(
             String fileName, long firstRowId, long rowCount, long fileSize) {
         return makeEntryWithSize(
                 BinaryRow.EMPTY_ROW, fileName, firstRowId, rowCount, fileSize, fileSize);
+    }
+
+    private ProjectedManifestEntry mockProjectedAdd(ManifestEntry entry) {
+        ProjectedManifestEntry projected = mock(ProjectedManifestEntry.class);
+        ProjectedDataFileMeta file = mock(ProjectedDataFileMeta.class);
+        when(projected.isAdd()).thenReturn(true);
+        when(projected.partition()).thenReturn(entry.partition());
+        when(projected.file()).thenReturn(file);
+        when(file.hasFirstRowId()).thenReturn(true);
+        when(file.nonNullFirstRowId()).thenReturn(entry.file().nonNullFirstRowId());
+        when(file.rowCount()).thenReturn(entry.file().rowCount());
+        when(file.fileSize()).thenReturn(entry.file().fileSize());
+        when(file.fileNameBinary()).thenReturn(BinaryString.fromString(entry.file().fileName()));
+        return projected;
     }
 
     private ManifestEntry makeEntry(
@@ -202,6 +920,21 @@ public class DataEvolutionCompactCoordinatorTest {
 
     private ManifestEntry makeBlobEntry(
             String fileName, long firstRowId, long rowCount, long fileSize) {
+        return makeBlobEntry(fileName, firstRowId, rowCount, fileSize, null);
+    }
+
+    private ManifestEntry makeBlobEntry(
+            String fileName, long firstRowId, long rowCount, long fileSize, String writeCol) {
+        return makeBlobEntry(fileName, firstRowId, rowCount, fileSize, 0, writeCol);
+    }
+
+    private ManifestEntry makeBlobEntry(
+            String fileName,
+            long firstRowId,
+            long rowCount,
+            long fileSize,
+            long schemaId,
+            String writeCol) {
         // Blob files have .blob extension
         String blobFileName = fileName.endsWith(".blob") ? fileName : fileName + ".blob";
         return ManifestEntry.create(
@@ -209,11 +942,56 @@ public class DataEvolutionCompactCoordinatorTest {
                 BinaryRow.EMPTY_ROW,
                 0,
                 0,
-                createDataFileMeta(blobFileName, firstRowId, rowCount, 0, fileSize));
+                createDataFileMeta(
+                        blobFileName,
+                        firstRowId,
+                        rowCount,
+                        0,
+                        fileSize,
+                        schemaId,
+                        writeCol == null ? null : Collections.singletonList(writeCol)));
+    }
+
+    private ManifestEntry makeVectorStoreEntry(
+            String fileName, long firstRowId, long rowCount, long fileSize) {
+        return ManifestEntry.create(
+                FileKind.ADD,
+                BinaryRow.EMPTY_ROW,
+                0,
+                0,
+                createDataFileMeta(
+                        fileName,
+                        firstRowId,
+                        rowCount,
+                        0,
+                        fileSize,
+                        0,
+                        Collections.singletonList("vec")));
     }
 
     private DataFileMeta createDataFileMeta(
             String fileName, long firstRowId, long rowCount, long maxSeq, long fileSize) {
+        return createDataFileMeta(fileName, firstRowId, rowCount, maxSeq, fileSize, 0, null);
+    }
+
+    private DataFileMeta createDataFileMeta(
+            String fileName,
+            long firstRowId,
+            long rowCount,
+            long maxSeq,
+            long fileSize,
+            List<String> writeCols) {
+        return createDataFileMeta(fileName, firstRowId, rowCount, maxSeq, fileSize, 0, writeCols);
+    }
+
+    private DataFileMeta createDataFileMeta(
+            String fileName,
+            long firstRowId,
+            long rowCount,
+            long maxSeq,
+            long fileSize,
+            long schemaId,
+            List<String> writeCols) {
         return DataFileMeta.create(
                 fileName,
                 fileSize,
@@ -224,7 +1002,7 @@ public class DataEvolutionCompactCoordinatorTest {
                 StatsTestUtils.newEmptySimpleStats(),
                 0,
                 maxSeq,
-                0,
+                schemaId,
                 0,
                 Collections.emptyList(),
                 Timestamp.fromEpochMillis(System.currentTimeMillis()),
@@ -234,7 +1012,50 @@ public class DataEvolutionCompactCoordinatorTest {
                 null,
                 null,
                 firstRowId,
+                writeCols,
                 null);
+    }
+
+    private DataEvolutionCompactCoordinator.CompactPlanner blobPlanner(
+            long targetFileSize, long openFileCost, long compactMinFileNum, RowType rowType) {
+        return blobPlanner(
+                targetFileSize, openFileCost, compactMinFileNum, schemaId -> rowType, rowType);
+    }
+
+    private DataEvolutionCompactCoordinator.CompactPlanner blobPlanner(
+            long targetFileSize,
+            long openFileCost,
+            long compactMinFileNum,
+            LongFunction<RowType> schemaFetcher,
+            RowType currentRowType) {
+        return new DataEvolutionCompactCoordinator.CompactPlanner(
+                true,
+                false,
+                Long.MAX_VALUE,
+                targetFileSize,
+                targetFileSize,
+                openFileCost,
+                compactMinFileNum,
+                schemaFetcher,
+                fieldIds(currentRowType));
+    }
+
+    private DataEvolutionCompactCoordinator.CompactPlanner vectorStorePlanner(
+            long targetFileSize, long openFileCost, long compactMinFileNum) {
+        return new DataEvolutionCompactCoordinator.CompactPlanner(
+                false, true, targetFileSize, openFileCost, compactMinFileNum);
+    }
+
+    private RowType rowType(DataField... fields) {
+        return new RowType(Arrays.asList(fields));
+    }
+
+    private Set<Integer> fieldIds(RowType rowType) {
+        Set<Integer> fieldIds = new HashSet<>();
+        for (DataField field : rowType.getFields()) {
+            fieldIds.add(field.id());
+        }
+        return fieldIds;
     }
 
     @Test
@@ -247,7 +1068,11 @@ public class DataEvolutionCompactCoordinatorTest {
                         createDataFileMeta("file2.parquet", 100L, 100L, 0, 1024));
 
         DataEvolutionCompactTask task =
-                new DataEvolutionCompactTask(BinaryRow.EMPTY_ROW, files, false);
+                new DataEvolutionNormalCompactTask(
+                        BinaryRow.EMPTY_ROW,
+                        files,
+                        Arrays.asList(
+                                new Range(0L, 49L), new Range(50L, 149L), new Range(150L, 199L)));
 
         byte[] bytes = serializer.serialize(task);
         DataEvolutionCompactTask deserialized =
@@ -266,14 +1091,14 @@ public class DataEvolutionCompactCoordinatorTest {
                         createDataFileMeta("file2.blob", 0L, 100L, 0, 1024));
 
         DataEvolutionCompactTask task =
-                new DataEvolutionCompactTask(BinaryRow.EMPTY_ROW, files, true);
+                new DataEvolutionBlobCompactTask(BinaryRow.EMPTY_ROW, files);
 
         byte[] bytes = serializer.serialize(task);
         DataEvolutionCompactTask deserialized =
                 serializer.deserialize(serializer.getVersion(), bytes);
 
         assertThat(deserialized).isEqualTo(task);
-        assertThat(deserialized.isBlobTask()).isTrue();
+        assertThat(deserialized.type()).isEqualTo(DataEvolutionCompactTask.TaskType.BLOB);
     }
 
     @Test
@@ -286,7 +1111,7 @@ public class DataEvolutionCompactCoordinatorTest {
                         createDataFileMeta("file2.parquet", 100L, 100L, 0, 1024));
 
         BinaryRow partition = BinaryRow.singleColumn(42);
-        DataEvolutionCompactTask task = new DataEvolutionCompactTask(partition, files, false);
+        DataEvolutionCompactTask task = new DataEvolutionNormalCompactTask(partition, files);
 
         byte[] bytes = serializer.serialize(task);
         DataEvolutionCompactTask deserialized =
@@ -294,5 +1119,113 @@ public class DataEvolutionCompactCoordinatorTest {
 
         assertThat(deserialized).isEqualTo(task);
         assertThat(deserialized.partition()).isEqualTo(partition);
+    }
+
+    @Test
+    public void testNormalCompactTaskRejectsDisjointRowRanges() {
+        List<DataFileMeta> files =
+                Arrays.asList(
+                        createDataFileMeta("file1.parquet", 0L, 10L, 0, 1024),
+                        createDataFileMeta("file2.parquet", 20L, 10L, 0, 1024));
+
+        assertThatThrownBy(() -> new DataEvolutionNormalCompactTask(BinaryRow.EMPTY_ROW, files))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("contiguous row range");
+    }
+
+    @Test
+    public void testPlanNormalOutputRangesAtDedicatedBoundaries() {
+        List<DataFileMeta> files =
+                Collections.singletonList(createDataFileMeta("file.parquet", 100, 10, 0, 1000));
+        DataEvolutionNormalCompactTask task =
+                new DataEvolutionNormalCompactTask(BinaryRow.EMPTY_ROW, files);
+        assertThat(task.planOutputRanges(400))
+                .containsExactly(new Range(100, 103), new Range(104, 107), new Range(108, 109));
+
+        task =
+                new DataEvolutionNormalCompactTask(
+                        BinaryRow.EMPTY_ROW,
+                        files,
+                        Arrays.asList(
+                                new Range(105, 107), new Range(103, 106), new Range(108, 109)));
+        // A cut after 103 lies inside overlapping dedicated files and moves to 107.
+        // The adjacent dedicated file starting at 108 must not prevent this boundary.
+        assertThat(task.planOutputRanges(400))
+                .containsExactly(new Range(100, 107), new Range(108, 109));
+        // A cut immediately before a dedicated file is also safe.
+        assertThat(task.planOutputRanges(300))
+                .containsExactly(new Range(100, 102), new Range(103, 107), new Range(108, 109));
+    }
+
+    @Test
+    public void testPlanNormalOutputRangesUsesLogicalRowCountAcrossVersions() {
+        DataEvolutionNormalCompactTask task =
+                new DataEvolutionNormalCompactTask(
+                        BinaryRow.EMPTY_ROW,
+                        Arrays.asList(
+                                createDataFileMeta("base.parquet", 100, 10, 0, 400),
+                                createDataFileMeta("update.parquet", 100, 10, 1, 600)));
+        assertThat(task.planOutputRanges(500))
+                .containsExactly(new Range(100, 104), new Range(105, 109));
+    }
+
+    @Test
+    public void testPlanNormalOutputRangesAvoidsSizeAndRowIdOverflow() {
+        DataEvolutionNormalCompactTask task =
+                new DataEvolutionNormalCompactTask(
+                        BinaryRow.EMPTY_ROW,
+                        Arrays.asList(
+                                createDataFileMeta(
+                                        "base.parquet", Long.MAX_VALUE - 10, 10, 0, Long.MAX_VALUE),
+                                createDataFileMeta(
+                                        "update.parquet",
+                                        Long.MAX_VALUE - 10,
+                                        10,
+                                        1,
+                                        Long.MAX_VALUE)));
+        assertThat(task.planOutputRanges(Long.MAX_VALUE))
+                .containsExactly(
+                        new Range(Long.MAX_VALUE - 10, Long.MAX_VALUE - 6),
+                        new Range(Long.MAX_VALUE - 5, Long.MAX_VALUE - 1));
+        task =
+                new DataEvolutionNormalCompactTask(
+                        BinaryRow.EMPTY_ROW,
+                        Collections.singletonList(
+                                createDataFileMeta(
+                                        "last.parquet",
+                                        Long.MAX_VALUE - 9,
+                                        10,
+                                        0,
+                                        Long.MAX_VALUE)));
+        assertThat(task.planOutputRanges(Long.MAX_VALUE / 2))
+                .containsExactly(
+                        new Range(Long.MAX_VALUE - 9, Long.MAX_VALUE - 5),
+                        new Range(Long.MAX_VALUE - 4, Long.MAX_VALUE));
+    }
+
+    @Test
+    public void testSerializerMaterializeDeletionTask() throws IOException {
+        DataEvolutionCompactTaskSerializer serializer = new DataEvolutionCompactTaskSerializer();
+
+        List<DataFileMeta> files =
+                Arrays.asList(
+                        createDataFileMeta("file1.parquet", 0L, 100L, 0, 1024),
+                        createDataFileMeta("file2.parquet", 100L, 100L, 0, 1024));
+        List<DeletionFile> deletionFiles =
+                Arrays.asList(new DeletionFile("/tmp/dv", 1, 2, 3L), null);
+
+        DataEvolutionCompactTask task =
+                new DataEvolutionMaterializeDeletionCompactTask(
+                        BinaryRow.EMPTY_ROW, files, deletionFiles);
+
+        byte[] bytes = serializer.serialize(task);
+        DataEvolutionCompactTask deserialized =
+                serializer.deserialize(serializer.getVersion(), bytes);
+
+        assertThat(deserialized).isEqualTo(task);
+        assertThat(deserialized.type())
+                .isEqualTo(DataEvolutionCompactTask.TaskType.MATERIALIZE_DELETION);
+        assertThat(((DataEvolutionMaterializeDeletionCompactTask) deserialized).deletionFiles())
+                .isEqualTo(deletionFiles);
     }
 }

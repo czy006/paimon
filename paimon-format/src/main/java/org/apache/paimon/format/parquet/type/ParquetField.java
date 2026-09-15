@@ -18,14 +18,9 @@
 
 package org.apache.paimon.format.parquet.type;
 
-import org.apache.paimon.data.variant.VariantAccessInfo;
 import org.apache.paimon.types.DataType;
 
-import javax.annotation.Nullable;
-
 import java.util.Arrays;
-import java.util.List;
-import java.util.Optional;
 
 /** Field that represent parquet's field type. */
 public abstract class ParquetField {
@@ -35,11 +30,6 @@ public abstract class ParquetField {
     private final int definitionLevel;
     private final boolean required;
     private final String[] path;
-    // When `variantFileType` has value, the parquet field should produce a variant type, and
-    // `variantFileType` describes the file schema of the Parquet variant field.
-    @Nullable private final ParquetField variantFileType;
-    // Represent the required variant fields.
-    @Nullable List<VariantAccessInfo.VariantField> variantFields;
 
     public ParquetField(
             DataType type,
@@ -47,24 +37,11 @@ public abstract class ParquetField {
             int definitionLevel,
             boolean required,
             String[] path) {
-        this(type, repetitionLevel, definitionLevel, required, path, null, null);
-    }
-
-    public ParquetField(
-            DataType type,
-            int repetitionLevel,
-            int definitionLevel,
-            boolean required,
-            String[] path,
-            @Nullable ParquetField variantFileType,
-            @Nullable List<VariantAccessInfo.VariantField> variantFields) {
         this.type = type;
         this.repetitionLevel = repetitionLevel;
         this.definitionLevel = definitionLevel;
         this.required = required;
         this.path = path;
-        this.variantFileType = variantFileType;
-        this.variantFields = variantFields;
     }
 
     public DataType getType() {
@@ -87,15 +64,6 @@ public abstract class ParquetField {
         return path;
     }
 
-    public Optional<ParquetField> variantFileType() {
-        return Optional.ofNullable(variantFileType);
-    }
-
-    @Nullable
-    public List<VariantAccessInfo.VariantField> variantFields() {
-        return variantFields;
-    }
-
     public abstract boolean isPrimitive();
 
     @Override
@@ -111,10 +79,6 @@ public abstract class ParquetField {
                 + required
                 + ", path="
                 + Arrays.toString(path)
-                + ", variantFileType="
-                + variantFileType
-                + ", variantFields="
-                + variantFields
                 + '}';
     }
 }

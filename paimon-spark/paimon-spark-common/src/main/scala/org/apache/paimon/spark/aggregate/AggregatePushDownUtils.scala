@@ -19,8 +19,8 @@
 package org.apache.paimon.spark.aggregate
 
 import org.apache.paimon.table.FileStoreTable
-import org.apache.paimon.table.source.{DataSplit, ReadBuilder}
-import org.apache.paimon.table.source.PushDownUtils.minmaxAvailable
+import org.apache.paimon.table.source.{DataSplit, ReadBuilder, Split}
+import org.apache.paimon.table.source.PushDownUtils.{minmaxAvailable, tightBoundsAvailable}
 import org.apache.paimon.types._
 
 import org.apache.spark.sql.connector.expressions.Expression
@@ -29,6 +29,7 @@ import org.apache.spark.sql.execution.datasources.v2.V2ColumnUtils.extractV2Colu
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
+import scala.language.postfixOps
 
 object AggregatePushDownUtils {
 
@@ -36,7 +37,6 @@ object AggregatePushDownUtils {
       table: FileStoreTable,
       aggregation: Aggregation,
       readBuilder: ReadBuilder): Option[LocalAggregator] = {
-    val options = table.coreOptions()
     val rowType = table.rowType
     val partitionKeys = table.partitionKeys()
 
@@ -52,11 +52,14 @@ object AggregatePushDownUtils {
         if (columns.isEmpty) {
           generateSplits(readBuilder.dropStats())
         } else {
-          if (options.deletionVectorsEnabled() || !table.primaryKeys().isEmpty) {
+          if (!table.primaryKeys().isEmpty) {
             return None
           }
           val splits = generateSplits(readBuilder)
           if (!splits.forall(minmaxAvailable(_, columns.asJava))) {
+            return None
+          }
+          if (!splits.forall(tightBoundsAvailable)) {
             return None
           }
           splits
@@ -64,18 +67,23 @@ object AggregatePushDownUtils {
       case None => return None
     }
 
-    if (!splits.forall(_.mergedRowCountAvailable())) {
+    if (!splits.forall(_.isInstanceOf[DataSplit])) {
+      return None
+    }
+    val dataSplits = splits.map(_.asInstanceOf[DataSplit])
+
+    if (!dataSplits.forall(_.mergedRowCount().isPresent)) {
       return None
     }
 
     val aggregator = new LocalAggregator(table)
     aggregator.initialize(aggregation)
-    splits.foreach(aggregator.update)
+    dataSplits.foreach(aggregator.update)
     Option(aggregator)
   }
 
-  private def generateSplits(readBuilder: ReadBuilder): mutable.Seq[DataSplit] = {
-    readBuilder.newScan().plan().splits().asScala.map(_.asInstanceOf[DataSplit])
+  private def generateSplits(readBuilder: ReadBuilder): mutable.Seq[Split] = {
+    readBuilder.newScan().plan().splits().asScala
   }
 
   private def extractMinMaxColumns(
@@ -105,6 +113,9 @@ object AggregatePushDownUtils {
     }
 
     val columnName = extractColumn.get
+    if (rowType.notContainsField(columnName)) {
+      return None
+    }
     val dataType = rowType.getField(columnName).`type`()
     if (minmaxAvailable(dataType)) {
       Option(columnName)

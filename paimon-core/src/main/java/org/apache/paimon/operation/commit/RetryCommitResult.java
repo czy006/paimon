@@ -19,26 +19,81 @@
 package org.apache.paimon.operation.commit;
 
 import org.apache.paimon.Snapshot;
+import org.apache.paimon.manifest.ManifestFileMeta;
 import org.apache.paimon.manifest.SimpleFileEntry;
 
+import javax.annotation.Nullable;
+
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 /** Need to retry commit of {@link CommitResult}. */
-public class RetryCommitResult implements CommitResult {
+public abstract class RetryCommitResult implements CommitResult {
 
-    public final Snapshot latestSnapshot;
-    public final List<SimpleFileEntry> baseDataFiles;
     public final Exception exception;
 
-    public RetryCommitResult(
-            Snapshot latestSnapshot, List<SimpleFileEntry> baseDataFiles, Exception exception) {
-        this.latestSnapshot = latestSnapshot;
-        this.baseDataFiles = baseDataFiles;
+    private RetryCommitResult(Exception exception) {
         this.exception = exception;
+    }
+
+    public static RetryCommitResult forCommitFail(
+            Snapshot snapshot,
+            List<SimpleFileEntry> baseDataFiles,
+            Exception exception,
+            @Nullable ManifestMergeResult manifestMergeResult) {
+        return new CommitFailRetryResult(snapshot, baseDataFiles, exception, manifestMergeResult);
+    }
+
+    public static RetryCommitResult forRollback(Exception exception) {
+        return new RollbackRetryResult(exception);
     }
 
     @Override
     public boolean isSuccess() {
         return false;
+    }
+
+    /** Retry result for commit failing. */
+    public static class CommitFailRetryResult extends RetryCommitResult {
+
+        public final @Nullable Snapshot latestSnapshot;
+        public final @Nullable List<SimpleFileEntry> baseDataFiles;
+        public final @Nullable ManifestMergeResult manifestMergeResult;
+
+        private CommitFailRetryResult(
+                @Nullable Snapshot latestSnapshot,
+                @Nullable List<SimpleFileEntry> baseDataFiles,
+                Exception exception,
+                @Nullable ManifestMergeResult manifestMergeResult) {
+            super(exception);
+            this.latestSnapshot = latestSnapshot;
+            this.baseDataFiles = baseDataFiles;
+            this.manifestMergeResult = manifestMergeResult;
+        }
+    }
+
+    /** Manifest merge result which can be reused by commit retry. */
+    public static class ManifestMergeResult {
+
+        public final List<ManifestFileMeta> mergeBeforeManifests;
+        public final List<ManifestFileMeta> mergeAfterManifests;
+
+        public ManifestMergeResult(
+                List<ManifestFileMeta> mergeBeforeManifests,
+                List<ManifestFileMeta> mergeAfterManifests) {
+            this.mergeBeforeManifests =
+                    Collections.unmodifiableList(new ArrayList<>(mergeBeforeManifests));
+            this.mergeAfterManifests =
+                    Collections.unmodifiableList(new ArrayList<>(mergeAfterManifests));
+        }
+    }
+
+    /** Retry result for rollback. */
+    public static class RollbackRetryResult extends RetryCommitResult {
+
+        private RollbackRetryResult(Exception exception) {
+            super(exception);
+        }
     }
 }

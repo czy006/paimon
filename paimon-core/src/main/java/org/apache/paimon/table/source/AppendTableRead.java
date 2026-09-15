@@ -19,11 +19,11 @@
 package org.apache.paimon.table.source;
 
 import org.apache.paimon.data.InternalRow;
-import org.apache.paimon.data.variant.VariantAccessInfo;
 import org.apache.paimon.operation.MergeFileSplitRead;
 import org.apache.paimon.operation.SplitRead;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.predicate.TopN;
+import org.apache.paimon.reader.ReadBatchSizer;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.table.source.splitread.SplitReadConfig;
@@ -41,15 +41,15 @@ import java.util.stream.Collectors;
 /**
  * An abstraction layer above {@link MergeFileSplitRead} to provide reading of {@link InternalRow}.
  */
-public final class AppendTableRead extends AbstractDataTableRead {
+public class AppendTableRead extends AbstractDataTableRead {
 
     private final List<SplitReadProvider> readProviders;
 
     @Nullable private RowType readType = null;
     private Predicate predicate = null;
-    private TopN topN = null;
-    private Integer limit = null;
-    @Nullable private VariantAccessInfo[] variantAccess;
+    protected TopN topN = null;
+    protected Integer limit = null;
+    @Nullable private ReadBatchSizer readBatchSizer;
 
     public AppendTableRead(
             List<Function<SplitReadConfig, SplitReadProvider>> providerFactories,
@@ -78,19 +78,15 @@ public final class AppendTableRead extends AbstractDataTableRead {
         read.withFilter(predicate);
         read.withTopN(topN);
         read.withLimit(limit);
-        read.withVariantAccess(variantAccess);
+        if (readBatchSizer != null) {
+            read.withReadBatchSizer(readBatchSizer);
+        }
     }
 
     @Override
     public void applyReadType(RowType readType) {
         initialized().forEach(r -> r.withReadType(readType));
         this.readType = readType;
-    }
-
-    @Override
-    public void applyVariantAccess(VariantAccessInfo[] variantAccess) {
-        initialized().forEach(r -> r.withVariantAccess(variantAccess));
-        this.variantAccess = variantAccess;
     }
 
     @Override
@@ -115,6 +111,18 @@ public final class AppendTableRead extends AbstractDataTableRead {
     }
 
     @Override
+    public InnerTableRead withReadBatchSizer(ReadBatchSizer sizer) {
+        initialized().forEach(r -> r.withReadBatchSizer(sizer));
+        this.readBatchSizer = sizer;
+        return this;
+    }
+
+    @Nullable
+    protected ReadBatchSizer readBatchSizer() {
+        return readBatchSizer;
+    }
+
+    @Override
     public RecordReader<InternalRow> reader(Split split) throws IOException {
         for (SplitReadProvider readProvider : readProviders) {
             if (readProvider.match(split, new SplitReadProvider.Context(false))) {
@@ -122,6 +130,6 @@ public final class AppendTableRead extends AbstractDataTableRead {
             }
         }
 
-        throw new RuntimeException("Should not happen.");
+        throw new RuntimeException("Unsupported split: " + split.getClass());
     }
 }

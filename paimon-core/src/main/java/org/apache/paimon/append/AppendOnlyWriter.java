@@ -38,6 +38,7 @@ import org.apache.paimon.io.RowDataRollingFileWriter;
 import org.apache.paimon.manifest.FileSource;
 import org.apache.paimon.memory.MemoryOwner;
 import org.apache.paimon.memory.MemorySegmentPool;
+import org.apache.paimon.operation.BlobFileContext;
 import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.reader.RecordReaderIterator;
 import org.apache.paimon.types.RowType;
@@ -59,8 +60,9 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
+import java.util.function.Supplier;
 
-import static org.apache.paimon.types.DataTypeRoot.BLOB;
+import static org.apache.paimon.types.VectorType.fieldsInVectorFile;
 
 /**
  * A {@link RecordWriter} implementation that only accepts records which are always insert
@@ -71,8 +73,11 @@ public class AppendOnlyWriter implements BatchRecordWriter, MemoryOwner {
     private final FileIO fileIO;
     private final long schemaId;
     private final FileFormat fileFormat;
+    private final @Nullable FileFormat vectorFileFormat;
     private final long targetFileSize;
     private final long blobTargetFileSize;
+    private final long vectorTargetFileSize;
+    private final long targetFileRowNum;
     private final RowType writeSchema;
     @Nullable private final List<String> writeCols;
     private final DataFilePathFactory pathFactory;
@@ -81,11 +86,15 @@ public class AppendOnlyWriter implements BatchRecordWriter, MemoryOwner {
     private final boolean forceCompact;
     private final boolean asyncFileWrite;
     private final boolean statsDenseStore;
+    private final FileSource fileSource;
+    @Nullable private final FileFormat rowSidecarFileFormat;
+    @Nullable private final BlobFileContext blobContext;
+    private final boolean omitAllNonDedicatedWriteCols;
     private final List<DataFileMeta> newFiles;
     private final List<DataFileMeta> deletedFiles;
     private final List<DataFileMeta> compactBefore;
     private final List<DataFileMeta> compactAfter;
-    private final LongCounter seqNumCounter;
+    private final Supplier<LongCounter> seqNumCounterProvider;
     private final String fileCompression;
     private final CompressOptions spillCompression;
     private final StatsCollectorFactories statsCollectorFactories;
@@ -102,8 +111,11 @@ public class AppendOnlyWriter implements BatchRecordWriter, MemoryOwner {
             @Nullable IOManager ioManager,
             long schemaId,
             FileFormat fileFormat,
+            @Nullable FileFormat vectorFileFormat,
             long targetFileSize,
             long blobTargetFileSize,
+            long vectorTargetFileSize,
+            long targetFileRowNum,
             RowType writeSchema,
             @Nullable List<String> writeCols,
             long maxSequenceNumber,
@@ -120,12 +132,20 @@ public class AppendOnlyWriter implements BatchRecordWriter, MemoryOwner {
             MemorySize maxDiskSize,
             FileIndexOptions fileIndexOptions,
             boolean asyncFileWrite,
-            boolean statsDenseStore) {
+            boolean statsDenseStore,
+            boolean dataEvolutionEnabled,
+            @Nullable FileFormat rowSidecarFileFormat,
+            @Nullable BlobFileContext blobContext,
+            FileSource fileSource,
+            boolean omitAllNonDedicatedWriteCols) {
         this.fileIO = fileIO;
         this.schemaId = schemaId;
         this.fileFormat = fileFormat;
+        this.vectorFileFormat = vectorFileFormat;
         this.targetFileSize = targetFileSize;
         this.blobTargetFileSize = blobTargetFileSize;
+        this.vectorTargetFileSize = vectorTargetFileSize;
+        this.targetFileRowNum = targetFileRowNum;
         this.writeSchema = writeSchema;
         this.writeCols = writeCols;
         this.pathFactory = pathFactory;
@@ -134,11 +154,17 @@ public class AppendOnlyWriter implements BatchRecordWriter, MemoryOwner {
         this.forceCompact = forceCompact;
         this.asyncFileWrite = asyncFileWrite;
         this.statsDenseStore = statsDenseStore;
+        this.fileSource = fileSource;
+        this.rowSidecarFileFormat = dataEvolutionEnabled ? rowSidecarFileFormat : null;
+        this.blobContext = blobContext;
+        this.omitAllNonDedicatedWriteCols = omitAllNonDedicatedWriteCols;
         this.newFiles = new ArrayList<>();
         this.deletedFiles = new ArrayList<>();
         this.compactBefore = new ArrayList<>();
         this.compactAfter = new ArrayList<>();
-        this.seqNumCounter = new LongCounter(maxSequenceNumber + 1);
+        final LongCounter seqNumCounter = new LongCounter(maxSequenceNumber + 1);
+        this.seqNumCounterProvider =
+                dataEvolutionEnabled ? () -> new LongCounter(0) : () -> seqNumCounter;
         this.fileCompression = fileCompression;
         this.spillCompression = spillCompression;
         this.ioManager = ioManager;
@@ -220,7 +246,7 @@ public class AppendOnlyWriter implements BatchRecordWriter, MemoryOwner {
 
     @Override
     public long maxSequenceNumber() {
-        return seqNumCounter.getValue() - 1;
+        return seqNumCounterProvider.get().getValue() - 1;
     }
 
     @Override
@@ -262,7 +288,7 @@ public class AppendOnlyWriter implements BatchRecordWriter, MemoryOwner {
         for (DataFileMeta file : compactAfter) {
             // appendOnlyCompactManager will rewrite the file and no file upgrade will occur, so we
             // can directly delete the file in compactAfter.
-            fileIO.deleteQuietly(pathFactory.toPath(file));
+            file.collectFiles(pathFactory).forEach(fileIO::deleteQuietly);
         }
 
         sinkWriter.close();
@@ -289,29 +315,36 @@ public class AppendOnlyWriter implements BatchRecordWriter, MemoryOwner {
             } finally {
                 // remove small files
                 for (DataFileMeta file : files) {
-                    fileIO.deleteQuietly(pathFactory.toPath(file));
+                    file.collectFiles(pathFactory).forEach(fileIO::deleteQuietly);
                 }
             }
         }
     }
 
     private RollingFileWriter<InternalRow, DataFileMeta> createRollingRowWriter() {
-        if (writeSchema.getFieldTypes().stream().anyMatch(t -> t.is(BLOB))) {
-            return new RollingBlobFileWriter(
+        boolean hasDedicatedFields =
+                blobContext != null
+                        || !fieldsInVectorFile(writeSchema, vectorFileFormat != null).isEmpty();
+        if (hasDedicatedFields) {
+            return new DedicatedFormatRollingFileWriter(
                     fileIO,
                     schemaId,
                     fileFormat,
+                    vectorFileFormat,
                     targetFileSize,
                     blobTargetFileSize,
+                    vectorTargetFileSize,
+                    targetFileRowNum,
                     writeSchema,
                     pathFactory,
-                    seqNumCounter,
+                    seqNumCounterProvider,
                     fileCompression,
                     statsCollectorFactories,
                     fileIndexOptions,
-                    FileSource.APPEND,
-                    asyncFileWrite,
-                    statsDenseStore);
+                    fileSource,
+                    statsDenseStore,
+                    blobContext,
+                    omitAllNonDedicatedWriteCols);
         }
         return new RowDataRollingFileWriter(
                 fileIO,
@@ -320,14 +353,16 @@ public class AppendOnlyWriter implements BatchRecordWriter, MemoryOwner {
                 targetFileSize,
                 writeSchema,
                 pathFactory,
-                seqNumCounter,
+                seqNumCounterProvider,
                 fileCompression,
                 statsCollectorFactories.statsCollectors(writeSchema.getFieldNames()),
                 fileIndexOptions,
-                FileSource.APPEND,
+                fileSource,
                 asyncFileWrite,
                 statsDenseStore,
-                writeCols);
+                writeCols,
+                rowSidecarFileFormat,
+                targetFileRowNum);
     }
 
     private void trySyncLatestCompaction(boolean blocking)

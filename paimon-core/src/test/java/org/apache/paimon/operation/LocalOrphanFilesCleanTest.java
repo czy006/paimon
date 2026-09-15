@@ -22,6 +22,7 @@ import org.apache.paimon.Changelog;
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.CoreOptions.ExternalPathStrategy;
 import org.apache.paimon.Snapshot;
+import org.apache.paimon.blob.ManagedBlobReferenceFile;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.DataFormatTestUtil;
 import org.apache.paimon.data.GenericRow;
@@ -30,14 +31,15 @@ import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.FileStatus;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.local.LocalFileIO;
+import org.apache.paimon.manifest.ManifestFileMeta;
 import org.apache.paimon.manifest.ManifestList;
 import org.apache.paimon.mergetree.compact.ConcatRecordReader;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.reader.ReaderSupplier;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.reader.RecordReaderIterator;
+import org.apache.paimon.schema.FileSystemSchemaManager;
 import org.apache.paimon.schema.Schema;
-import org.apache.paimon.schema.SchemaManager;
 import org.apache.paimon.schema.SchemaUtils;
 import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.table.FileStoreTable;
@@ -51,9 +53,13 @@ import org.apache.paimon.types.DataTypes;
 import org.apache.paimon.types.RowKind;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.FileStorePathFactory;
+import org.apache.paimon.utils.JsonSerdeUtil;
+import org.apache.paimon.utils.Pair;
 import org.apache.paimon.utils.Preconditions;
 import org.apache.paimon.utils.SnapshotManager;
 import org.apache.paimon.utils.StringUtils;
+
+import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.databind.node.ObjectNode;
 
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.AfterEach;
@@ -64,6 +70,8 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.attribute.FileTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -148,6 +156,29 @@ public class LocalOrphanFilesCleanTest {
     @Test
     public void testNormallyRemoving() throws Throwable {
         normallyRemoving(tablePath);
+    }
+
+    @Test
+    public void testKeepManagedBlobPack() throws Exception {
+        commit(Collections.singletonList(TestPojo.next()));
+
+        Path part1 = listSubDirs(tablePath, p -> p.getName().contains("=")).get(0);
+        Path part2 = listSubDirs(part1, p -> p.getName().contains("=")).get(0);
+        Path bucket = listSubDirs(part2, p -> p.getName().startsWith(BUCKET_PATH_PREFIX)).get(0);
+        Path managedBlob =
+                new Path(bucket, "orphan" + ManagedBlobReferenceFile.MANAGED_BLOB_SUFFIX);
+        Path ordinaryOrphan = new Path(bucket, "orphan.avro");
+        fileIO.newOutputStream(managedBlob, false).close();
+        fileIO.newOutputStream(ordinaryOrphan, false).close();
+
+        LocalOrphanFilesClean cleaner =
+                new LocalOrphanFilesClean(
+                        table, System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(2));
+        List<Path> deleted = cleaner.clean().getDeletedFilesPath();
+
+        assertThat(fileIO.exists(managedBlob)).isTrue();
+        assertThat(fileIO.exists(ordinaryOrphan)).isFalse();
+        assertThat(deleted).doesNotContain(managedBlob);
     }
 
     public void normallyRemoving(Path dataPath) throws Throwable {
@@ -515,6 +546,57 @@ public class LocalOrphanFilesCleanTest {
         validate(deleted, snapshotData, changelogData);
     }
 
+    @Test
+    public void testPreservesManifestExtraFiles() throws Exception {
+        commit(generateData());
+        SnapshotManager snapshotManager = table.snapshotManager();
+        Snapshot snapshot = snapshotManager.latestSnapshot();
+        ManifestList manifestList = table.store().manifestListFactory().create();
+        List<ManifestFileMeta> manifests = manifestList.read(snapshot.deltaManifestList());
+        ManifestFileMeta meta = manifests.get(0);
+        String extraFile = "manifest-extra";
+        manifests.set(
+                0,
+                new ManifestFileMeta(
+                        meta.fileName(),
+                        meta.fileSize(),
+                        meta.numAddedFiles(),
+                        meta.numDeletedFiles(),
+                        meta.partitionStats(),
+                        meta.schemaId(),
+                        meta.minBucket(),
+                        meta.maxBucket(),
+                        meta.minLevel(),
+                        meta.maxLevel(),
+                        meta.minRowId(),
+                        meta.maxRowId(),
+                        null,
+                        Collections.singletonList(extraFile)));
+        Pair<String, Long> newManifestList = manifestList.write(manifests);
+        ObjectNode node =
+                (ObjectNode) JsonSerdeUtil.OBJECT_MAPPER_INSTANCE.readTree(snapshot.toJson());
+        node.put("deltaManifestList", newManifestList.getKey());
+        node.put("deltaManifestListSize", newManifestList.getValue());
+        fileIO.overwriteFileUtf8(snapshotManager.snapshotPath(snapshot.id()), node.toString());
+        snapshotManager.invalidateCache();
+
+        Path extraPath = new Path(manifestDir, extraFile);
+        Path orphanPath = new Path(manifestDir, "orphan-extra");
+        fileIO.writeFile(extraPath, "extra file, not an Avro manifest", true);
+        fileIO.writeFile(orphanPath, "orphan", true);
+
+        LocalOrphanFilesClean cleaner =
+                new LocalOrphanFilesClean(
+                        table, System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(2));
+        List<Path> deleted = cleaner.clean().getDeletedFilesPath();
+        assertThat(deleted)
+                .extracting(Path::getName)
+                .contains(orphanPath.getName())
+                .doesNotContain(extraFile);
+        assertThat(fileIO.exists(extraPath)).isTrue();
+        assertThat(fileIO.exists(orphanPath)).isFalse();
+    }
+
     /** Manually make a FileNotFoundException to simulate snapshot expire while clean. */
     @Test
     public void testAbnormallyRemoving() throws Exception {
@@ -558,12 +640,124 @@ public class LocalOrphanFilesCleanTest {
         assertThat(fileIO.exists(emptyDirectory1)).isTrue();
         assertThat(fileIO.exists(emptyDirectory2)).isTrue();
 
+        Files.setLastModifiedTime(
+                tempDir.resolve("part1=1/part2=2/bucket-0"),
+                FileTime.fromMillis(System.currentTimeMillis() - TimeUnit.DAYS.toMillis(2)));
+        Files.setLastModifiedTime(
+                tempDir.resolve("part1=1/part2=2/bucket-1"),
+                FileTime.fromMillis(System.currentTimeMillis() - TimeUnit.DAYS.toMillis(2)));
+
         LocalOrphanFilesClean orphanFilesClean = new LocalOrphanFilesClean(table);
         List<Path> deleted = orphanFilesClean.clean().getDeletedFilesPath();
         assertThat(fileIO.exists(emptyDirectory1)).isFalse();
         assertThat(fileIO.exists(emptyDirectory2)).isFalse();
 
         validate(deleted, snapshotData, new HashMap<>());
+    }
+
+    @Test
+    void testEmptyPartitionDirectories() throws Exception {
+        commit(Collections.singletonList(new TestPojo(1, 0, "a", "v1")));
+        commit(Collections.singletonList(new TestPojo(2, 0, "b", "v2")));
+
+        Path partitionPath1 = new Path(tablePath, "part1=0/part2=a");
+        Path partitionPath2 = new Path(tablePath, "part1=0/part2=b");
+        assertThat(fileIO.exists(partitionPath1)).isTrue();
+        assertThat(fileIO.exists(partitionPath2)).isTrue();
+
+        FileStatus[] partition2Files = fileIO.listStatus(partitionPath2);
+        assertThat(partition2Files).isNotEmpty();
+        for (FileStatus file : partition2Files) {
+            if (file.isDir() && file.getPath().getName().startsWith("bucket-")) {
+                FileStatus[] bucketFiles = fileIO.listStatus(file.getPath());
+                for (FileStatus bucketFile : bucketFiles) {
+                    fileIO.deleteQuietly(bucketFile.getPath());
+                }
+                fileIO.deleteQuietly(file.getPath());
+            }
+        }
+        assertThat(fileIO.listStatus(partitionPath2)).isEmpty();
+        assertThat(fileIO.exists(partitionPath2)).isTrue();
+
+        Path emptyNonLeafPartitionPath = new Path(tablePath, "part1=1");
+        fileIO.mkdirs(emptyNonLeafPartitionPath);
+
+        long oldTime = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(2);
+        Files.setLastModifiedTime(tempDir.resolve("part1=0/part2=b"), FileTime.fromMillis(oldTime));
+        Files.setLastModifiedTime(tempDir.resolve("part1=1"), FileTime.fromMillis(oldTime));
+
+        LocalOrphanFilesClean orphanFilesClean = new LocalOrphanFilesClean(table);
+        orphanFilesClean.clean();
+
+        assertThat(fileIO.exists(partitionPath2))
+                .as("Empty partition (no bucket subdirs) is cleaned by orphan files clean.")
+                .isFalse();
+        assertThat(fileIO.exists(emptyNonLeafPartitionPath))
+                .as(
+                        "Empty non-leaf partition dir (e.g. part1=1 with no part2) is cleaned by orphan files clean.")
+                .isFalse();
+        assertThat(fileIO.exists(partitionPath1)).isTrue();
+
+        Path recentEmptyPath = new Path(tablePath, "part1=2");
+        fileIO.mkdirs(recentEmptyPath);
+        long cutoffMs = System.currentTimeMillis() - TimeUnit.MINUTES.toMillis(2);
+        LocalOrphanFilesClean cleanRecent = new LocalOrphanFilesClean(table, cutoffMs, false);
+        cleanRecent.clean();
+        assertThat(fileIO.exists(recentEmptyPath))
+                .as("Recent empty partition dir must not be deleted (age safeguard).")
+                .isTrue();
+    }
+
+    @Test
+    void testDirectoriesNotTreatedAsOrphanCandidates() throws Exception {
+        commit(Collections.singletonList(new TestPojo(1, 0, "a", "v1")));
+
+        Path partitionPath = new Path(tablePath, "part1=0/part2=a");
+        Path bucketPath =
+                listSubDirs(partitionPath, p -> p.getName().startsWith(BUCKET_PATH_PREFIX)).get(0);
+        assertThat(fileIO.listStatus(bucketPath)).isNotEmpty();
+
+        Path subdirInBucket = new Path(bucketPath, "orphan-subdir");
+        fileIO.mkdirs(subdirInBucket);
+        fileIO.tryToWriteAtomic(new Path(subdirInBucket, "stale-file.tmp"), "data");
+
+        String bucketName = bucketPath.getName();
+        long oldTime = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(2);
+        Files.setLastModifiedTime(
+                tempDir.resolve("part1=0/part2=a/" + bucketName + "/orphan-subdir"),
+                FileTime.fromMillis(oldTime));
+
+        LocalOrphanFilesClean orphanFilesClean =
+                new LocalOrphanFilesClean(table, System.currentTimeMillis());
+        CleanOrphanFilesResult result = orphanFilesClean.clean();
+
+        assertThat(result.getDeletedFilesPath())
+                .noneMatch(p -> p.toString().contains("orphan-subdir"));
+        assertThat(fileIO.exists(bucketPath)).isTrue();
+        assertThat(fileIO.listStatus(bucketPath).length).isGreaterThanOrEqualTo(1);
+    }
+
+    @Test
+    void testDirectoryInSnapshotDirNotTreatedAsCandidate() throws Exception {
+        commit(Collections.singletonList(new TestPojo(1, 0, "a", "v1")));
+
+        Path snapshotDir = new Path(tablePath, "snapshot");
+        assertThat(fileIO.exists(snapshotDir)).isTrue();
+
+        Path unknownDir = new Path(snapshotDir, "UNKNOWN-stale-dir");
+        fileIO.mkdirs(unknownDir);
+
+        long oldTime = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(2);
+        Files.setLastModifiedTime(
+                tempDir.resolve("snapshot/UNKNOWN-stale-dir"), FileTime.fromMillis(oldTime));
+
+        LocalOrphanFilesClean orphanFilesClean =
+                new LocalOrphanFilesClean(table, System.currentTimeMillis());
+        CleanOrphanFilesResult result = orphanFilesClean.clean();
+
+        assertThat(result.getDeletedFilesPath())
+                .noneMatch(p -> p.toString().contains("UNKNOWN-stale-dir"));
+        assertThat(fileIO.exists(unknownDir)).isTrue();
     }
 
     private void writeData(
@@ -762,11 +956,7 @@ public class LocalOrphanFilesCleanTest {
             String fileName =
                     fileNamePrefix.get(RANDOM.nextInt(fileNamePrefix.size())) + UUID.randomUUID();
             Path file = new Path(dir, fileName);
-            if (RANDOM.nextBoolean()) {
-                fileIO.tryToWriteAtomic(file, "");
-            } else {
-                fileIO.mkdirs(file);
-            }
+            fileIO.tryToWriteAtomic(file, "");
             manuallyAddedFiles.add(file);
         }
     }
@@ -860,7 +1050,7 @@ public class LocalOrphanFilesCleanTest {
         conf.set(CoreOptions.BUCKET, RANDOM.nextInt(3) + 1);
         TableSchema tableSchema =
                 SchemaUtils.forceCommit(
-                        new SchemaManager(fileIO, tablePath),
+                        new FileSystemSchemaManager(fileIO, tablePath),
                         new Schema(
                                 rowType.getFields(),
                                 Arrays.asList("part1", "part2"),

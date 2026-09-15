@@ -48,8 +48,10 @@ import org.apache.paimon.types.TinyIntType;
 import org.apache.paimon.types.VarBinaryType;
 import org.apache.paimon.types.VarCharType;
 import org.apache.paimon.types.VariantType;
+import org.apache.paimon.types.VectorType;
 
 import java.io.Serializable;
+import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.LinkedHashSet;
@@ -75,7 +77,7 @@ public class ZIndexer implements Serializable {
     public ZIndexer(RowType rowType, List<String> orderColumns, int varTypeSize) {
         List<String> fields = rowType.getFieldNames();
         fieldsIndex = new int[orderColumns.size()];
-        int varTypeCount = 0;
+        int total = 0;
         for (int i = 0; i < fieldsIndex.length; i++) {
             int index = fields.indexOf(orderColumns.get(i));
             if (index == -1) {
@@ -86,15 +88,10 @@ public class ZIndexer implements Serializable {
                                 + fields);
             }
             fieldsIndex[i] = index;
-
-            if (isVarType(rowType.getFieldTypes().get(index))) {
-                varTypeCount++;
-            }
+            total += zBytes(rowType.getFieldTypes().get(index), varTypeSize);
         }
         this.functionSet = constructFunctionMap(rowType.getFields(), varTypeSize);
-        this.totalBytes =
-                PRIMITIVE_BUFFER_SIZE * (this.fieldsIndex.length - varTypeCount)
-                        + varTypeSize * varTypeCount;
+        this.totalBytes = total;
     }
 
     private static boolean isVarType(DataType dataType) {
@@ -102,6 +99,26 @@ public class ZIndexer implements Serializable {
                 || dataType instanceof VarCharType
                 || dataType instanceof BinaryType
                 || dataType instanceof VarBinaryType;
+    }
+
+    /**
+     * Bytes the z-value reserves for a column. A DECIMAL gets a width that holds any unscaled value
+     * of its precision, so it keeps full ordering resolution; 8 bytes cannot, and projecting into
+     * them collapses ordinary wide-decimal values to one key.
+     */
+    private static int zBytes(DataType type, int varTypeSize) {
+        if (isVarType(type)) {
+            return varTypeSize;
+        }
+        if (type instanceof DecimalType) {
+            return decimalBytes(((DecimalType) type).getPrecision());
+        }
+        return PRIMITIVE_BUFFER_SIZE;
+    }
+
+    /** Two's-complement byte width that holds any unscaled value with {@code precision} digits. */
+    private static int decimalBytes(int precision) {
+        return BigInteger.TEN.pow(precision).bitLength() / 8 + 1;
     }
 
     public void open() {
@@ -137,8 +154,7 @@ public class ZIndexer implements Serializable {
     public static RowProcessor zmapColumnToCalculator(DataField field, int index, int varTypeSize) {
         DataType type = field.type();
         return new RowProcessor(
-                type.accept(new TypeVisitor(index, varTypeSize)),
-                isVarType(type) ? varTypeSize : PRIMITIVE_BUFFER_SIZE);
+                type.accept(new TypeVisitor(index, varTypeSize)), zBytes(type, varTypeSize));
     }
 
     /** Type Visitor to generate function map from row column to z-index. */
@@ -208,7 +224,8 @@ public class ZIndexer implements Serializable {
                     return NULL_BYTES;
                 }
                 ZOrderByteUtils.reuse(reuse, PRIMITIVE_BUFFER_SIZE);
-                reuse.put(0, (byte) (row.getBoolean(fieldIndex) ? -127 : 0));
+                // FALSE must not encode to the all-zero NULL_BYTES sentinel.
+                reuse.put(0, (byte) (row.getBoolean(fieldIndex) ? -127 : 1));
                 return reuse.array();
             };
         }
@@ -237,16 +254,37 @@ public class ZIndexer implements Serializable {
         public ZProcessFunction visit(DecimalType decimalType) {
             final InternalRow.FieldGetter fieldGetter =
                     InternalRow.createFieldGetter(decimalType, fieldIndex);
+            // Encode the unscaled value as a fixed-width, sign-flipped big-endian two's complement.
+            // The width holds any value of this precision, so the encoding is order-preserving
+            // under the unsigned comparison a z-value gets and keeps full resolution: small
+            // separated values, their negatives, and values past the long range all get distinct
+            // keys. An 8-byte projection cannot, since one wide-decimal column exceeds 64 bits and
+            // every value below the shift collapses to a single key.
+            final int width = decimalBytes(decimalType.getPrecision());
+            final byte[] nullBytes = new byte[width];
             return (row, reuse) -> {
                 Object o = fieldGetter.getFieldOrNull(row);
-                return o == null
-                        ? NULL_BYTES
-                        : ZOrderByteUtils.byteTruncateOrFill(
-                                        ((Decimal) o).toUnscaledBytes(),
-                                        PRIMITIVE_BUFFER_SIZE,
-                                        reuse)
-                                .array();
+                if (o == null) {
+                    return nullBytes;
+                }
+                Decimal decimal = (Decimal) o;
+                BigInteger unscaled =
+                        decimal.isCompact()
+                                ? BigInteger.valueOf(decimal.toUnscaledLong())
+                                : decimal.toBigDecimal().unscaledValue();
+                return orderedDecimalBytes(unscaled, width, reuse);
             };
+        }
+
+        private static byte[] orderedDecimalBytes(
+                BigInteger unscaled, int width, ByteBuffer reuse) {
+            byte[] buffer = ZOrderByteUtils.reuse(reuse, width).array();
+            Arrays.fill(buffer, 0, width, unscaled.signum() < 0 ? (byte) 0xFF : (byte) 0x00);
+            byte[] magnitude = unscaled.toByteArray();
+            System.arraycopy(magnitude, 0, buffer, width - magnitude.length, magnitude.length);
+            // Flip the sign bit so signed order becomes unsigned lexicographic order.
+            buffer[0] ^= (byte) 0x80;
+            return buffer;
         }
 
         @Override
@@ -361,6 +399,11 @@ public class ZIndexer implements Serializable {
 
         @Override
         public ZProcessFunction visit(ArrayType arrayType) {
+            throw new RuntimeException("Unsupported type");
+        }
+
+        @Override
+        public ZProcessFunction visit(VectorType vectorType) {
             throw new RuntimeException("Unsupported type");
         }
 

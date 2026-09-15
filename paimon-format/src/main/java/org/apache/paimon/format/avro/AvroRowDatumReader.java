@@ -21,6 +21,7 @@ package org.apache.paimon.format.avro;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.format.avro.FieldReaderFactory.RowReader;
 import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.UriReader;
 
 import org.apache.avro.Schema;
 import org.apache.avro.io.DatumReader;
@@ -32,30 +33,37 @@ import java.io.IOException;
 public class AvroRowDatumReader implements DatumReader<InternalRow> {
 
     private final RowType projectedRowType;
+    private final UriReader uriReader;
 
     private RowReader reader;
-    private boolean isUnion;
+    private int nullIndex;
 
     public AvroRowDatumReader(RowType projectedRowType) {
+        this(projectedRowType, null);
+    }
+
+    public AvroRowDatumReader(RowType projectedRowType, UriReader uriReader) {
         this.projectedRowType = projectedRowType;
+        this.uriReader = uriReader;
     }
 
     @Override
     public void setSchema(Schema schema) {
-        this.isUnion = false;
+        this.nullIndex = -1;
         if (schema.isUnion()) {
-            this.isUnion = true;
-            schema = schema.getTypes().get(1);
+            this.nullIndex = FieldReaderFactory.nullableUnionNullIndex(schema);
+            schema = schema.getTypes().get(1 - nullIndex);
         }
         this.reader =
-                new FieldReaderFactory().createRowReader(schema, projectedRowType.getFields());
+                new FieldReaderFactory(uriReader)
+                        .createRowReader(schema, projectedRowType.getFields());
     }
 
     @Override
     public InternalRow read(InternalRow reuse, Decoder in) throws IOException {
-        if (isUnion) {
+        if (nullIndex >= 0) {
             int index = in.readIndex();
-            if (index == 0) {
+            if (index == nullIndex) {
                 throw new RuntimeException("Cannot read a null row.");
             }
         }

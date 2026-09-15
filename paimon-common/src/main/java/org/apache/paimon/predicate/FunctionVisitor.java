@@ -18,7 +18,9 @@
 
 package org.apache.paimon.predicate;
 
+import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 /** A {@link PredicateVisitor} to visit functions. */
@@ -26,8 +28,14 @@ public interface FunctionVisitor<T> extends PredicateVisitor<T> {
 
     @Override
     default T visit(LeafPredicate predicate) {
-        return predicate.function().visit(this, predicate.fieldRef(), predicate.literals());
+        Optional<FieldRef> fieldRef = predicate.fieldRefOptional();
+        if (!fieldRef.isPresent()) {
+            return visitNonFieldLeaf(predicate);
+        }
+        return predicate.function().visit(this, fieldRef.get(), predicate.literals());
     }
+
+    T visitNonFieldLeaf(LeafPredicate leafPredicate);
 
     @Override
     default T visit(CompoundPredicate predicate) {
@@ -46,6 +54,10 @@ public interface FunctionVisitor<T> extends PredicateVisitor<T> {
 
     T visitIsNull(FieldRef fieldRef);
 
+    default T visitIsNaN(FieldRef fieldRef) {
+        throw new UnsupportedOperationException();
+    }
+
     // ----------------- Binary functions ------------------------
 
     T visitStartsWith(FieldRef fieldRef, Object literal);
@@ -53,6 +65,18 @@ public interface FunctionVisitor<T> extends PredicateVisitor<T> {
     T visitEndsWith(FieldRef fieldRef, Object literal);
 
     T visitContains(FieldRef fieldRef, Object literal);
+
+    default T visitArrayContains(FieldRef fieldRef, Object literal) {
+        throw new UnsupportedOperationException();
+    }
+
+    default T visitArraysOverlap(FieldRef fieldRef, List<Object> literals) {
+        throw new UnsupportedOperationException();
+    }
+
+    default T visitArrayContainsAll(FieldRef fieldRef, List<Object> literals) {
+        throw new UnsupportedOperationException();
+    }
 
     T visitLike(FieldRef fieldRef, Object literal);
 
@@ -73,6 +97,16 @@ public interface FunctionVisitor<T> extends PredicateVisitor<T> {
     T visitIn(FieldRef fieldRef, List<Object> literals);
 
     T visitNotIn(FieldRef fieldRef, List<Object> literals);
+
+    default T visitBetween(FieldRef fieldRef, Object from, Object to) {
+        return visitAnd(
+                Arrays.asList(visitGreaterOrEqual(fieldRef, from), visitLessOrEqual(fieldRef, to)));
+    }
+
+    default T visitNotBetween(FieldRef fieldRef, Object from, Object to) {
+        return visitOr(
+                Arrays.asList(visitLessThan(fieldRef, from), visitGreaterThan(fieldRef, to)));
+    }
 
     // ----------------- Compound functions ------------------------
 

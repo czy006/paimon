@@ -104,11 +104,10 @@ public class RescaleProcedure extends BaseProcedure {
         checkArgument(
                 partitions == null || where == null,
                 "partitions and where cannot be used together.");
-        String finalWhere = partitions != null ? SparkProcedureUtils.toWhere(partitions) : where;
-
-        return modifyPaimonTable(
+        return modifySparkTable(
                 tableIdent,
-                table -> {
+                sparkTable -> {
+                    org.apache.paimon.table.Table table = sparkTable.getTable();
                     checkArgument(table instanceof FileStoreTable);
                     FileStoreTable fileStoreTable = (FileStoreTable) table;
 
@@ -130,13 +129,20 @@ public class RescaleProcedure extends BaseProcedure {
                             String.valueOf(snapshot.id()));
                     fileStoreTable = fileStoreTable.copy(dynamicOptions);
 
-                    DataSourceV2Relation relation = createRelation(tableIdent);
-                    PartitionPredicate partitionPredicate =
-                            SparkProcedureUtils.convertToPartitionPredicate(
-                                    finalWhere,
-                                    fileStoreTable.schema().logicalPartitionType(),
-                                    spark(),
-                                    relation);
+                    DataSourceV2Relation relation = createRelation(tableIdent, sparkTable);
+                    PartitionPredicate partitionPredicate;
+                    if (partitions != null) {
+                        partitionPredicate =
+                                SparkProcedureUtils.convertPartitionsToPartitionPredicate(
+                                        partitions, fileStoreTable, spark());
+                    } else {
+                        partitionPredicate =
+                                SparkProcedureUtils.convertToPartitionPredicate(
+                                        where,
+                                        fileStoreTable.schema().logicalPartitionType(),
+                                        spark(),
+                                        relation);
+                    }
 
                     if (bucketNum == null) {
                         checkArgument(
@@ -144,7 +150,7 @@ public class RescaleProcedure extends BaseProcedure {
                                 "When rescaling postpone bucket tables, you must provide the resulting bucket number.");
                     }
 
-                    execute(fileStoreTable, bucketNum, partitionPredicate, tableIdent);
+                    execute(fileStoreTable, bucketNum, partitionPredicate, relation);
 
                     InternalRow internalRow = newInternalRow(true);
                     return new InternalRow[] {internalRow};
@@ -155,14 +161,12 @@ public class RescaleProcedure extends BaseProcedure {
             FileStoreTable table,
             @Nullable Integer bucketNum,
             PartitionPredicate partitionPredicate,
-            Identifier tableIdent) {
-        DataSourceV2Relation relation = createRelation(tableIdent);
-
+            DataSourceV2Relation relation) {
         SnapshotReader snapshotReader = table.newSnapshotReader();
         if (partitionPredicate != null) {
             snapshotReader = snapshotReader.withPartitionFilter(partitionPredicate);
         }
-        List<DataSplit> dataSplits = snapshotReader.read().dataSplits();
+        List<DataSplit> dataSplits = snapshotReader.onlyReadRealBuckets().read().dataSplits();
 
         if (dataSplits.isEmpty()) {
             LOG.info("No data splits found for the specified partition. No need to rescale.");
@@ -182,7 +186,7 @@ public class RescaleProcedure extends BaseProcedure {
         FileStoreTable rescaledTable = table.copy(table.schema().copy(bucketOptions));
 
         PaimonSparkWriter writer = PaimonSparkWriter.apply(rescaledTable);
-        writer.writeBuilder().withOverwrite();
+        writer.withOverwrite();
         writer.commit(writer.write(datasetForRead));
     }
 

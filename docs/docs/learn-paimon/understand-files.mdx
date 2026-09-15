@@ -1,0 +1,252 @@
+---
+title: "Understand Files"
+sidebar_position: 3
+---
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# Understand Files
+
+Follow a small primary-key table from creation through inserts, an update, a delete, compaction,
+and snapshot expiration. The key distinction is between **logical rows**, **files referenced by
+a snapshot**, and **files still present on storage**.
+
+## Prerequisite
+
+Use a local Flink SQL environment from the [Flink quick start](../flink/quick-start), with a Paimon
+catalog and support for [procedures](../flink/procedures). The local filesystem paths below are
+for a single-machine experiment. A cluster needs a shared warehouse accessible to its tasks.
+Read [Basic Concepts](../concepts/basic-concepts) first if snapshots or manifests are new to you.
+
+Run the statements in order on a fresh table. Use batch mode and wait for each DML job to finish:
+
+```sql
+SET 'execution.runtime-mode' = 'batch';
+SET 'table.dml-sync' = 'true';
+```
+
+## Understand File Operations
+
+### Create Catalog
+
+```sql
+CREATE CATALOG paimon WITH (
+    'type' = 'paimon',
+    'warehouse' = 'file:///tmp/paimon'
+);
+USE CATALOG paimon;
+USE `default`;
+```
+
+The warehouse is the root for databases and tables. Creating a catalog does not publish a table
+data snapshot.
+
+### Create Table
+
+```sql
+CREATE TABLE file_demo (
+    id BIGINT,
+    amount INT,
+    status STRING,
+    dt STRING,
+    PRIMARY KEY (id, dt) NOT ENFORCED
+) PARTITIONED BY (dt) WITH (
+    'bucket' = '1',
+    'file.format' = 'parquet'
+);
+```
+
+This table has four columns and uses the default `deduplicate` merge engine in merge-on-read
+mode. One fixed bucket makes the layout easier to inspect; it is not a production sizing choice.
+The initial schema is stored at `/tmp/paimon/default.db/file_demo/schema/schema-0`.
+
+### Insert Records Into Table
+
+```sql
+INSERT INTO file_demo VALUES
+    (1, 10, 'open', '20260911'),
+    (2, 20, 'open', '20260911');
+
+SELECT * FROM file_demo ORDER BY id;
+-- (1, 10, 'open', '20260911')
+-- (2, 20, 'open', '20260911')
+```
+
+The writer creates data files, and a successful commit publishes a snapshot referencing them.
+Readers resolve the committed file set through metadata rather than listing every file under
+the table directory.
+
+![A snapshot references its schema and manifest lists; lists reference manifests, which describe the data files to read.](/img/concepts-file-layout.svg)
+
+A simplified directory tree after a write is:
+
+```text
+/tmp/paimon/default.db/file_demo/
+├── schema/
+│   └── schema-0
+├── snapshot/
+│   └── snapshot-<id>
+├── manifest/
+│   ├── manifest-list-<base>
+│   ├── manifest-list-<delta>
+│   └── manifest-<uuid>
+└── dt=20260911/
+    └── bucket-0/
+        └── data-<uuid>.parquet
+```
+
+Names here are symbolic. Snapshot hints and additional metadata can also appear. Flushes and
+compaction can change the number of files and snapshots, so do not expect an exact directory
+listing or a fixed one-statement-to-one-snapshot mapping.
+
+#### Read the Metadata
+
+| Metadata | What it describes |
+| --- | --- |
+| Schema | Field IDs, types, primary and partition keys, and table options |
+| Snapshot | A committed version, including schema ID, commit kind, and manifest references |
+| Base manifest list | Manifests describing the base file set for the commit |
+| Delta manifest list | Manifests describing the commit's file additions and removals |
+| Manifest | File-level `ADD` / `DELETE` entries and metadata such as partition, bucket, and statistics |
+| Data file | Physical records; a primary-key file can contain row versions and deletion records |
+
+The base and delta lists together resolve a snapshot's live data files. A manifest list references
+**manifest files**; it does not directly contain the data-file entries. Optional changelog and
+index metadata serve separate purposes. See the [Snapshot specification](../concepts/spec/snapshot).
+
+Inspect the actual commits and live files with Flink SQL:
+
+```sql
+SELECT snapshot_id, schema_id, commit_kind, commit_time
+FROM `file_demo$snapshots`
+ORDER BY snapshot_id;
+
+SELECT `partition`, bucket, file_path, level, record_count, file_size_in_bytes
+FROM `file_demo$files`;
+```
+
+`record_count` counts physical records, which can include multiple versions of a key. Use a query
+on `file_demo` when you need logical rows. Keep the snapshot IDs from your run for comparisons.
+
+### Update a Record
+
+Insert a new value for the same primary key:
+
+```sql
+INSERT INTO file_demo VALUES (1, 15, 'paid', '20260911');
+
+SELECT * FROM file_demo ORDER BY id;
+-- (1, 15, 'paid', '20260911')
+-- (2, 20, 'open', '20260911')
+```
+
+A new record supersedes the old version of key `(1, '20260911')`. The reader merges versions to
+produce the latest row. This does not require overwriting the original data file in place.
+
+### Delete Records From Table
+
+Use a predicate on a non-partition column to exercise row-level deletion:
+
+```sql
+DELETE FROM file_demo WHERE id = 2;
+
+SELECT * FROM file_demo ORDER BY id;
+-- (1, 15, 'paid', '20260911')
+```
+
+In this MOR example, a deletion record cancels the earlier row when versions are merged.
+A new file containing deletion records is represented by a manifest **`ADD`** entry. A manifest
+**`DELETE`** entry instead retires an entire data file from a snapshot. These are different kinds
+of deletion. A partition-only SQL delete can use a different path and is not the example here.
+
+### Compact Table
+
+In the same batch SQL session:
+
+```sql
+CALL sys.compact('default.file_demo');
+```
+
+Full compaction resolves row versions in the selected buckets and commits the resulting file
+changes. The query still returns `(1, 15, 'paid', '20260911')`. Inspect `$snapshots` and `$files`
+again to see which files changed. Compaction can replace files or promote a file's level using
+metadata; it need not rewrite every file. See [Compaction](../primary-key-table/compaction).
+
+![After appending two rows, updates and deletion records change the query result; compaction retires old files, and expiration later reclaims them while retaining the current file.](/img/learn-paimon-file-lifecycle.svg)
+
+The diagram groups updates and deletes into one stage. Letters label illustrative files, not
+actual filenames or a promised file count. Older snapshots can still reference the original files
+after compaction has removed those files from the latest snapshot.
+
+### Alter Table
+
+Change an option without writing data:
+
+```sql
+ALTER TABLE file_demo SET ('full-compaction.delta-commits' = '1');
+```
+
+This creates a new schema version. Existing snapshots retain their recorded schema IDs; a later
+data commit can reference the updated schema. The option requests frequent full compaction for
+subsequent writes, with additional write cost. It does not itself publish a new data snapshot or
+rewrite existing files. See [Table Mode](../primary-key-table/table-mode#copy-on-write).
+
+### Expire Snapshots
+
+Snapshot expiration reclaims obsolete files when retention rules and protected references allow
+it. A file is not deleted merely because the snapshot that first introduced it has expired:
+newer snapshots may still use that same file.
+
+| After an operation | Latest query | Physical storage |
+| --- | --- | --- |
+| Row update or delete | Reflects merged row changes | Can still contain earlier row versions |
+| Compaction | Same logical result | Can contain both old and replacement files |
+| Expiration of obsolete history | Same logical result | Eligible retired files and expired metadata are reclaimed |
+
+Retention combines `snapshot.time-retained`, `snapshot.num-retained.min`, and
+`snapshot.num-retained.max`. Tags and tracked consumers can protect history or its files; see
+[Manage Snapshots](../maintenance/manage-snapshots#expire-snapshots). The latest required state
+must remain available even as older snapshots expire.
+
+After files are reclaimed, empty directories are kept by default. Cleaning them requires
+`snapshot.clean-empty-directories = true`, so an empty partition directory alone is not evidence
+of failed data cleanup. Files left by unsuccessful writes need the separate
+[orphan-file cleanup](../maintenance/manage-snapshots#remove-orphan-files) workflow.
+
+## Flink Stream Write {#flink-stream-write}
+
+Streaming writes repeat the same commit and compaction lifecycle around checkpoints. Continue
+with [Streaming Writes and Small Files](./small-files#follow-a-streaming-write) for the operator
+flow, visibility, and file-size implications.
+
+## Understand Small Files
+
+Use the [small-file diagnosis guide](./small-files#diagnose-before-tuning) to determine whether
+files belong to the current snapshot, retained history, changelogs, or unsuccessful writes.
+Reducing live files and reclaiming old files require different actions.
+
+| Topic | Continue reading |
+| --- | --- |
+| <a id="understand-checkpoints"></a>Checkpoints | [Checkpoint interval](./small-files#checkpoint-interval) |
+| <a id="understand-snapshots"></a>Snapshots | [Reclaim historical files](./small-files#reclaim-historical-files) |
+| <a id="understand-partitions-and-buckets"></a>Distribution | [Partitions and buckets](./small-files#partitions-and-buckets) |
+| <a id="understand-lsm-for-primary-table"></a>LSM files | [Primary-key tables](./small-files#primary-key-tables) |
+| <a id="understand-files-for-bucketed-append-table"></a>Bucketed append files | [Append tables](./small-files#append-tables) |
+| <a id="understand-full-compaction"></a>Full compaction | [Dedicated compaction](../maintenance/dedicated-compaction) |

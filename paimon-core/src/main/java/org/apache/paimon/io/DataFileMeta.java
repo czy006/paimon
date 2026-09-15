@@ -37,11 +37,14 @@ import org.apache.paimon.utils.RoaringBitmap32;
 import javax.annotation.Nullable;
 
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 import static org.apache.paimon.data.BinaryRow.EMPTY_ROW;
 import static org.apache.paimon.stats.SimpleStats.EMPTY_STATS;
@@ -57,35 +60,61 @@ import static org.apache.paimon.utils.SerializationUtils.newStringType;
 @Public
 public interface DataFileMeta {
 
+    String FILE_NAME = "_FILE_NAME";
+    String FILE_SIZE = "_FILE_SIZE";
+    String ROW_COUNT = "_ROW_COUNT";
+    String MIN_KEY = "_MIN_KEY";
+    String MAX_KEY = "_MAX_KEY";
+    String KEY_STATS = "_KEY_STATS";
+    String VALUE_STATS = "_VALUE_STATS";
+    String MIN_SEQUENCE_NUMBER = "_MIN_SEQUENCE_NUMBER";
+    String MAX_SEQUENCE_NUMBER = "_MAX_SEQUENCE_NUMBER";
+    String SCHEMA_ID = "_SCHEMA_ID";
+    String LEVEL = "_LEVEL";
+    String EXTRA_FILES = "_EXTRA_FILES";
+    String CREATION_TIME = "_CREATION_TIME";
+    String DELETE_ROW_COUNT = "_DELETE_ROW_COUNT";
+    String EMBEDDED_FILE_INDEX = "_EMBEDDED_FILE_INDEX";
+    String FILE_SOURCE = "_FILE_SOURCE";
+    String VALUE_STATS_COLS = "_VALUE_STATS_COLS";
+    String EXTERNAL_PATH = "_EXTERNAL_PATH";
+    String FIRST_ROW_ID = "_FIRST_ROW_ID";
+    String WRITE_COLS = "_WRITE_COLS";
+    String WRITE_COLS_SEQUENCES = "_WRITE_COLS_SEQUENCES";
+
     RowType SCHEMA =
             new RowType(
                     false,
                     Arrays.asList(
-                            new DataField(0, "_FILE_NAME", newStringType(false)),
-                            new DataField(1, "_FILE_SIZE", new BigIntType(false)),
-                            new DataField(2, "_ROW_COUNT", new BigIntType(false)),
-                            new DataField(3, "_MIN_KEY", newBytesType(false)),
-                            new DataField(4, "_MAX_KEY", newBytesType(false)),
-                            new DataField(5, "_KEY_STATS", SimpleStats.SCHEMA),
-                            new DataField(6, "_VALUE_STATS", SimpleStats.SCHEMA),
-                            new DataField(7, "_MIN_SEQUENCE_NUMBER", new BigIntType(false)),
-                            new DataField(8, "_MAX_SEQUENCE_NUMBER", new BigIntType(false)),
-                            new DataField(9, "_SCHEMA_ID", new BigIntType(false)),
-                            new DataField(10, "_LEVEL", new IntType(false)),
+                            new DataField(0, FILE_NAME, newStringType(false)),
+                            new DataField(1, FILE_SIZE, new BigIntType(false)),
+                            new DataField(2, ROW_COUNT, new BigIntType(false)),
+                            new DataField(3, MIN_KEY, newBytesType(false)),
+                            new DataField(4, MAX_KEY, newBytesType(false)),
+                            new DataField(5, KEY_STATS, SimpleStats.SCHEMA),
+                            new DataField(6, VALUE_STATS, SimpleStats.SCHEMA),
+                            new DataField(7, MIN_SEQUENCE_NUMBER, new BigIntType(false)),
+                            new DataField(8, MAX_SEQUENCE_NUMBER, new BigIntType(false)),
+                            new DataField(9, SCHEMA_ID, new BigIntType(false)),
+                            new DataField(10, LEVEL, new IntType(false)),
                             new DataField(
-                                    11, "_EXTRA_FILES", new ArrayType(false, newStringType(false))),
-                            new DataField(12, "_CREATION_TIME", DataTypes.TIMESTAMP_MILLIS()),
-                            new DataField(13, "_DELETE_ROW_COUNT", new BigIntType(true)),
-                            new DataField(14, "_EMBEDDED_FILE_INDEX", newBytesType(true)),
-                            new DataField(15, "_FILE_SOURCE", new TinyIntType(true)),
+                                    11, EXTRA_FILES, new ArrayType(false, newStringType(false))),
+                            new DataField(12, CREATION_TIME, DataTypes.TIMESTAMP_MILLIS()),
+                            new DataField(13, DELETE_ROW_COUNT, new BigIntType(true)),
+                            new DataField(14, EMBEDDED_FILE_INDEX, newBytesType(true)),
+                            new DataField(15, FILE_SOURCE, new TinyIntType(true)),
                             new DataField(
                                     16,
-                                    "_VALUE_STATS_COLS",
+                                    VALUE_STATS_COLS,
                                     DataTypes.ARRAY(DataTypes.STRING().notNull())),
-                            new DataField(17, "_EXTERNAL_PATH", newStringType(true)),
-                            new DataField(18, "_FIRST_ROW_ID", new BigIntType(true)),
+                            new DataField(17, EXTERNAL_PATH, newStringType(true)),
+                            new DataField(18, FIRST_ROW_ID, new BigIntType(true)),
                             new DataField(
-                                    19, "_WRITE_COLS", new ArrayType(true, newStringType(false)))));
+                                    19, WRITE_COLS, new ArrayType(true, newStringType(false))),
+                            new DataField(
+                                    20,
+                                    WRITE_COLS_SEQUENCES,
+                                    new ArrayType(true, new BigIntType(false)))));
 
     BinaryRow EMPTY_MIN_KEY = EMPTY_ROW;
     BinaryRow EMPTY_MAX_KEY = EMPTY_ROW;
@@ -126,7 +155,8 @@ public interface DataFileMeta {
                 valueStatsCols,
                 externalPath,
                 firstRowId,
-                writeCols);
+                writeCols,
+                null);
     }
 
     static DataFileMeta create(
@@ -149,7 +179,7 @@ public interface DataFileMeta {
             @Nullable String externalPath,
             @Nullable Long firstRowId,
             @Nullable List<String> writeCols) {
-        return new PojoDataFileMeta(
+        return create(
                 fileName,
                 fileSize,
                 rowCount,
@@ -169,7 +199,8 @@ public interface DataFileMeta {
                 valueStatsCols,
                 externalPath,
                 firstRowId,
-                writeCols);
+                writeCols,
+                null);
     }
 
     static DataFileMeta create(
@@ -210,7 +241,8 @@ public interface DataFileMeta {
                 valueStatsCols,
                 null,
                 firstRowId,
-                writeCols);
+                writeCols,
+                null);
     }
 
     static DataFileMeta create(
@@ -233,7 +265,8 @@ public interface DataFileMeta {
             @Nullable List<String> valueStatsCols,
             @Nullable String externalPath,
             @Nullable Long firstRowId,
-            @Nullable List<String> writeCols) {
+            @Nullable List<String> writeCols,
+            @Nullable long[] columnMaxSequenceNumbers) {
         return new PojoDataFileMeta(
                 fileName,
                 fileSize,
@@ -254,7 +287,8 @@ public interface DataFileMeta {
                 valueStatsCols,
                 externalPath,
                 firstRowId,
-                writeCols);
+                writeCols,
+                columnMaxSequenceNumbers);
     }
 
     String fileName();
@@ -275,8 +309,15 @@ public interface DataFileMeta {
 
     SimpleStats valueStats();
 
+    /**
+     * Minimum sequence number of records in this file. When {@code sequence.snapshot-ordering} is
+     * enabled for a primary-key table, this field is repurposed to carry the commit snapshot id
+     * instead of the per-record sequence number range (the snapshot id is stamped into it at commit
+     * time by {@code FileStoreCommitImpl}).
+     */
     long minSequenceNumber();
 
+    /** @see #minSequenceNumber() */
     long maxSequenceNumber();
 
     long schemaId();
@@ -287,7 +328,13 @@ public interface DataFileMeta {
 
     Timestamp creationTime();
 
-    long creationTimeEpochMillis();
+    default long creationTimeEpochMillis() {
+        return creationTime()
+                .toLocalDateTime()
+                .atZone(ZoneId.systemDefault())
+                .toInstant()
+                .toEpochMilli();
+    }
 
     String fileFormat();
 
@@ -305,12 +352,32 @@ public interface DataFileMeta {
 
     default long nonNullFirstRowId() {
         Long firstRowId = firstRowId();
-        checkArgument(firstRowId != null, "First row id of '%s' should not be null.", fileName());
+        checkArgument(firstRowId != null, "First row id should not be null.");
         return firstRowId;
     }
 
+    default Range nonNullRowIdRange() {
+        long firstRowId = nonNullFirstRowId();
+        return new Range(firstRowId, firstRowId + rowCount() - 1);
+    }
+
+    /**
+     * Columns physically stored in this file. A null value means all table fields, except that a
+     * normal data-evolution file whose schema enables compact write-column metadata and has
+     * dedicated BLOB or vector fields contains all non-dedicated fields.
+     */
     @Nullable
     List<String> writeCols();
+
+    /**
+     * Maximum sequence number per physical table field after data-evolution compaction.
+     *
+     * <p>Values follow the table-field order selected by {@link #writeCols()} when it is non-null
+     * (system fields are ignored), or the physical field order implied by a null write-columns
+     * value otherwise. A null value means that only the file-level sequence range is available.
+     */
+    @Nullable
+    long[] columnMaxSequenceNumbers();
 
     DataFileMeta upgrade(int newLevel);
 
@@ -320,7 +387,11 @@ public interface DataFileMeta {
 
     DataFileMeta assignSequenceNumber(long minSequenceNumber, long maxSequenceNumber);
 
+    DataFileMeta withColumnMaxSequenceNumbers(long[] columnMaxSequenceNumbers);
+
     DataFileMeta assignFirstRowId(long firstRowId);
+
+    DataFileMeta newFirstRowId(@Nullable Long newFirstRowId);
 
     default List<Path> collectFiles(DataFilePathFactory pathFactory) {
         List<Path> paths = new ArrayList<>();
@@ -335,12 +406,45 @@ public interface DataFileMeta {
 
     DataFileMeta copy(byte[] newEmbeddedIndex);
 
-    RoaringBitmap32 toFileSelection(List<Range> indices);
+    default RoaringBitmap32 toFileSelection(List<Range> rowRanges) {
+        RoaringBitmap32 selection = null;
+        if (rowRanges != null) {
+            if (firstRowId() == null) {
+                throw new IllegalStateException(
+                        "firstRowId is null, can't convert to file selection");
+            }
+            selection = new RoaringBitmap32();
+            Range fileRange = nonNullRowIdRange();
+            List<Range> result = new ArrayList<>();
+            for (Range expected : rowRanges) {
+                Range intersection = Range.intersection(fileRange, expected);
+                if (intersection != null) {
+                    result.add(intersection);
+                }
+            }
+
+            if (result.size() == 1 && result.get(0).equals(fileRange)) {
+                return null;
+            }
+
+            for (Range range : result) {
+                for (long rowId = range.from; rowId <= range.to; rowId++) {
+                    selection.add((int) (rowId - fileRange.from));
+                }
+            }
+        }
+        return selection;
+    }
 
     static long getMaxSequenceNumber(List<DataFileMeta> fileMetas) {
         return fileMetas.stream()
                 .map(DataFileMeta::maxSequenceNumber)
                 .max(Long::compare)
                 .orElse(-1L);
+    }
+
+    static Map<Integer, List<DataFileMeta>> groupByLevel(List<DataFileMeta> files) {
+        return files.stream()
+                .collect(Collectors.groupingBy(DataFileMeta::level, Collectors.toList()));
     }
 }

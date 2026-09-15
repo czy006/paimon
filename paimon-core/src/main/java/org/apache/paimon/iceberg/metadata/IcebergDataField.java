@@ -28,20 +28,27 @@ import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.DateType;
 import org.apache.paimon.types.DecimalType;
 import org.apache.paimon.types.DoubleType;
+import org.apache.paimon.types.EdgeAlgorithm;
 import org.apache.paimon.types.FloatType;
+import org.apache.paimon.types.GeographyType;
+import org.apache.paimon.types.GeometryType;
 import org.apache.paimon.types.IntType;
 import org.apache.paimon.types.LocalZonedTimestampType;
 import org.apache.paimon.types.MapType;
+import org.apache.paimon.types.MultisetType;
 import org.apache.paimon.types.RowType;
+import org.apache.paimon.types.TimeType;
 import org.apache.paimon.types.TimestampType;
 import org.apache.paimon.types.VarBinaryType;
 import org.apache.paimon.types.VarCharType;
+import org.apache.paimon.types.VariantType;
 import org.apache.paimon.utils.Preconditions;
 
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.annotation.JsonCreator;
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.annotation.JsonGetter;
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.annotation.JsonIgnore;
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.annotation.JsonInclude;
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.annotation.JsonProperty;
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.databind.annotation.JsonDeserialize;
 
@@ -78,6 +85,7 @@ public class IcebergDataField {
     @JsonIgnore private DataType dataType;
 
     @JsonProperty(FIELD_DOC)
+    @JsonInclude(JsonInclude.Include.NON_NULL)
     private final String doc;
 
     public IcebergDataField(DataField dataField) {
@@ -161,6 +169,12 @@ public class IcebergDataField {
                 return "double";
             case DATE:
                 return "date";
+            case TIME_WITHOUT_TIME_ZONE:
+                int timePrecision = ((TimeType) dataType).getPrecision();
+                Preconditions.checkArgument(
+                        timePrecision >= 0 && timePrecision <= 3,
+                        "Paimon Iceberg compatibility only support time type with precision from 0 to 3.");
+                return "time";
             case CHAR:
             case VARCHAR:
                 return "string";
@@ -172,22 +186,39 @@ public class IcebergDataField {
                 return String.format(
                         "decimal(%d, %d)", decimalType.getPrecision(), decimalType.getScale());
             case TIMESTAMP_WITHOUT_TIME_ZONE:
+                // Nanoseconds name the Iceberg v3 type. Whether a table may publish one is decided
+                // by SchemaValidation#validateIcebergTimestampPrecisions, which knows the mirror is
+                // enabled and writes INT96.
                 int timestampPrecision = ((TimestampType) dataType).getPrecision();
                 Preconditions.checkArgument(
                         timestampPrecision >= 3 && timestampPrecision <= 9,
-                        "Paimon Iceberg compatibility only support timestamp type with precision from 3 to 9.");
+                        "Paimon Iceberg compatibility only supports timestamp types with a "
+                                + "precision from 3 to 9.");
                 return timestampPrecision >= 7 ? "timestamp_ns" : "timestamp";
             case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
                 int timestampLtzPrecision = ((LocalZonedTimestampType) dataType).getPrecision();
                 Preconditions.checkArgument(
                         timestampLtzPrecision >= 3 && timestampLtzPrecision <= 9,
-                        "Paimon Iceberg compatibility only support timestamp type with precision from 3 to 9.");
+                        "Paimon Iceberg compatibility only supports timestamp types with a "
+                                + "precision from 3 to 9.");
                 return timestampLtzPrecision >= 7 ? "timestamptz_ns" : "timestamptz";
+            case VARIANT:
+                return "variant";
+            case GEOMETRY:
+                return String.format("geometry(%s)", ((GeometryType) dataType).getCrs());
+            case GEOGRAPHY:
+                GeographyType geographyType = (GeographyType) dataType;
+                Preconditions.checkArgument(
+                        !geographyType.getCrs().contains(","),
+                        "Geography CRS '%s' cannot contain ',' in Iceberg metadata.",
+                        geographyType.getCrs());
+                return String.format(
+                        "geography(%s, %s)", geographyType.getCrs(), geographyType.getAlgorithm());
             case ARRAY:
                 ArrayType arrayType = (ArrayType) dataType;
                 return new IcebergListType(
                         SpecialFields.getArrayElementFieldId(fieldId, depth + 1),
-                        !dataType.isNullable(),
+                        !arrayType.getElementType().isNullable(),
                         toTypeObject(arrayType.getElementType(), fieldId, depth + 1));
             case MAP:
                 MapType mapType = (MapType) dataType;
@@ -197,6 +228,14 @@ public class IcebergDataField {
                         SpecialFields.getMapValueFieldId(fieldId, depth + 1),
                         !mapType.getValueType().isNullable(),
                         toTypeObject(mapType.getValueType(), fieldId, depth + 1));
+            case MULTISET:
+                MultisetType multisetType = (MultisetType) dataType;
+                return new IcebergMapType(
+                        SpecialFields.getMapKeyFieldId(fieldId, depth + 1),
+                        toTypeObject(multisetType.getElementType(), fieldId, depth + 1),
+                        SpecialFields.getMapValueFieldId(fieldId, depth + 1),
+                        true,
+                        "int");
             case ROW:
                 RowType rowType = (RowType) dataType;
                 return new IcebergStructType(
@@ -233,6 +272,8 @@ public class IcebergDataField {
                     return new DoubleType(!isRequired);
                 case "date":
                     return new DateType(!isRequired);
+                case "time":
+                    return new TimeType(!isRequired, 3);
                 case "string":
                     return new VarCharType(!isRequired, VarCharType.MAX_LENGTH);
                 case "binary":
@@ -265,6 +306,22 @@ public class IcebergDataField {
                     return new TimestampType(!isRequired, 9);
                 case "timestamptz_ns": // iceberg v3 format
                     return new LocalZonedTimestampType(!isRequired, 9);
+                case "variant": // iceberg v3 format
+                    return new VariantType(!isRequired);
+                case "geometry": // iceberg v3 format
+                    return new GeometryType(!isRequired, geometryParameter(simpleType));
+                case "geography": // iceberg v3 format
+                    String[] parameters = geographyParameters(simpleType);
+                    Preconditions.checkArgument(
+                            parameters.length == 1 || parameters.length == 2,
+                            "Invalid Iceberg geography type: %s",
+                            simpleType);
+                    return new GeographyType(
+                            !isRequired,
+                            parameters[0],
+                            parameters.length == 1
+                                    ? GeographyType.DEFAULT_ALGORITHM
+                                    : EdgeAlgorithm.fromName(parameters[1]));
                 default:
                     throw new UnsupportedOperationException(
                             "Unsupported primitive data type: " + icebergType);
@@ -294,6 +351,37 @@ public class IcebergDataField {
                         "Unsupported nested data type: " + icebergType.getClass());
             }
         }
+    }
+
+    private static String geometryParameter(String simpleType) {
+        if ("geometry".equals(simpleType)) {
+            return GeometryType.DEFAULT_CRS;
+        }
+        int start = simpleType.indexOf('(');
+        Preconditions.checkArgument(
+                start >= 0 && simpleType.endsWith(")"),
+                "Invalid Iceberg geometry type: %s",
+                simpleType);
+        return simpleType.substring(start + 1, simpleType.length() - 1).trim();
+    }
+
+    private static String[] geographyParameters(String simpleType) {
+        int start = simpleType.indexOf('(');
+        if (start < 0) {
+            if ("geography".equals(simpleType)) {
+                return new String[] {GeometryType.DEFAULT_CRS, EdgeAlgorithm.SPHERICAL.toString()};
+            }
+        }
+        Preconditions.checkArgument(
+                start >= 0 && simpleType.endsWith(")"),
+                "Invalid Iceberg geospatial type: %s",
+                simpleType);
+        String parameters = simpleType.substring(start + 1, simpleType.length() - 1);
+        String[] result = parameters.split(",", -1);
+        for (int i = 0; i < result.length; i++) {
+            result[i] = result[i].trim();
+        }
+        return result;
     }
 
     public DataField toDatafield() {

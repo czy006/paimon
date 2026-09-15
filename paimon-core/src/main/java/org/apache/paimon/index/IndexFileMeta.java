@@ -103,8 +103,9 @@ public class IndexFileMeta {
             String fileName,
             long fileSize,
             long rowCount,
-            @Nullable GlobalIndexMeta globalIndexMeta) {
-        this(indexType, fileName, fileSize, rowCount, null, null, globalIndexMeta);
+            @Nullable GlobalIndexMeta globalIndexMeta,
+            @Nullable String externalPath) {
+        this(indexType, fileName, fileSize, rowCount, null, externalPath, globalIndexMeta);
     }
 
     public String indexType() {
@@ -151,12 +152,14 @@ public class IndexFileMeta {
                 && fileSize == that.fileSize
                 && rowCount == that.rowCount
                 && Objects.equals(dvRanges, that.dvRanges)
-                && Objects.equals(externalPath, that.externalPath);
+                && Objects.equals(externalPath, that.externalPath)
+                && Objects.equals(globalIndexMeta, that.globalIndexMeta);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(indexType, fileName, fileSize, rowCount, dvRanges, externalPath);
+        return Objects.hash(
+                indexType, fileName, fileSize, rowCount, dvRanges, externalPath, globalIndexMeta);
     }
 
     @Override

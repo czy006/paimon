@@ -60,6 +60,7 @@ public class DataFileTestUtils {
                 null,
                 null,
                 null,
+                null,
                 null);
     }
 
@@ -104,6 +105,27 @@ public class DataFileTestUtils {
                 0,
                 level,
                 deleteRowCount,
+                null,
+                FileSource.APPEND,
+                null,
+                null,
+                null);
+    }
+
+    public static DataFileMeta newFile(long fileSize) {
+        return DataFileMeta.create(
+                "",
+                fileSize,
+                100,
+                row(0),
+                row(0),
+                EMPTY_STATS,
+                EMPTY_STATS,
+                0,
+                0,
+                0,
+                0,
+                0L,
                 null,
                 FileSource.APPEND,
                 null,

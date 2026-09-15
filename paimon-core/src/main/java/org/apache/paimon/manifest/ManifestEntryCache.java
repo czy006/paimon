@@ -65,13 +65,49 @@ import static org.apache.paimon.manifest.ManifestEntrySerializer.totalBucketGett
 @ThreadSafe
 public class ManifestEntryCache extends ObjectsCache<Path, ManifestEntry, ManifestEntrySegments> {
 
+    @Nullable private final FilteredReader filteredReader;
+
     public ManifestEntryCache(
             SegmentsCache<Path> cache,
             ObjectSerializer<ManifestEntry> projectedSerializer,
             RowType formatSchema,
             FunctionWithIOException<Path, Long> fileSizeFunction,
             BiFunctionWithIOE<Path, Long, CloseableIterator<InternalRow>> reader) {
+        this(cache, projectedSerializer, formatSchema, fileSizeFunction, reader, null);
+    }
+
+    public ManifestEntryCache(
+            SegmentsCache<Path> cache,
+            ObjectSerializer<ManifestEntry> projectedSerializer,
+            RowType formatSchema,
+            FunctionWithIOException<Path, Long> fileSizeFunction,
+            BiFunctionWithIOE<Path, Long, CloseableIterator<InternalRow>> reader,
+            @Nullable FilteredReader filteredReader) {
         super(cache, projectedSerializer, formatSchema, fileSizeFunction, reader);
+        this.filteredReader = filteredReader;
+    }
+
+    /** Uncached reads skip non-matching partitions and buckets before decoding their stats. */
+    @Override
+    protected CloseableIterator<InternalRow> createFilteredIterator(
+            Path path, @Nullable Long fileSize, Filters<ManifestEntry> filters) throws IOException {
+        if (filteredReader != null && filters instanceof ManifestEntryFilters) {
+            ManifestEntryFilters manifestFilters = (ManifestEntryFilters) filters;
+            return filteredReader.read(
+                    path, fileSize, manifestFilters.partitionFilter, manifestFilters.bucketFilter);
+        }
+        return super.createFilteredIterator(path, fileSize, filters);
+    }
+
+    /** Reader of manifest rows which can skip entries by partition and bucket while decoding. */
+    @FunctionalInterface
+    public interface FilteredReader {
+        CloseableIterator<InternalRow> read(
+                Path path,
+                @Nullable Long fileSize,
+                @Nullable PartitionPredicate partitionFilter,
+                @Nullable BucketFilter bucketFilter)
+                throws IOException;
     }
 
     @Override
@@ -112,8 +148,10 @@ public class ManifestEntryCache extends ObjectsCache<Path, ManifestEntry, Manife
     }
 
     @Override
-    protected List<ManifestEntry> readFromSegments(
-            ManifestEntrySegments manifestSegments, Filters<ManifestEntry> filters)
+    protected <R> List<R> readFromSegments(
+            ManifestEntrySegments manifestSegments,
+            Filters<ManifestEntry> filters,
+            Function<ManifestEntry, R> convertor)
             throws IOException {
         PartitionPredicate partitionFilter = null;
         BucketFilter bucketFilter = null;
@@ -125,10 +163,10 @@ public class ManifestEntryCache extends ObjectsCache<Path, ManifestEntry, Manife
         List<RichSegments> segments = manifestSegments.segments();
 
         // try to do fast filter first
-        Optional<BinaryRow> partition = extractSinglePartition(partitionFilter);
-        if (partition.isPresent()) {
+        Optional<BinaryRow> singlePartition = extractSinglePartition(partitionFilter);
+        if (singlePartition.isPresent()) {
             Map<Integer, List<RichSegments>> segMap =
-                    manifestSegments.indexedSegments().get(partition.get());
+                    manifestSegments.indexedSegments().get(singlePartition.get());
             if (segMap == null) {
                 return Collections.emptyList();
             }
@@ -147,23 +185,29 @@ public class ManifestEntryCache extends ObjectsCache<Path, ManifestEntry, Manife
         // do force loop filter
         List<Segments> segmentsList = new ArrayList<>();
         for (RichSegments richSegments : segments) {
-            if (partitionFilter != null && !partitionFilter.test(richSegments.partition())) {
+            BinaryRow partition = richSegments.partition();
+            if (partitionFilter != null && !partitionFilter.test(partition)) {
                 continue;
             }
             if (bucketFilter != null
-                    && !bucketFilter.test(richSegments.bucket(), richSegments.totalBucket())) {
+                    && !bucketFilter.test(
+                            partition, richSegments.bucket(), richSegments.totalBucket())) {
                 continue;
             }
             segmentsList.add(richSegments.segments());
         }
 
         // read manifest entries from segments with per record filter
-        List<ManifestEntry> result = new ArrayList<>();
+        List<R> result = new ArrayList<>();
         InternalRowSerializer formatSerializer = this.formatSerializer.get();
         for (Segments subSegments : segmentsList) {
             result.addAll(
                     SimpleObjectsCache.readFromSegments(
-                            formatSerializer, projectedSerializer, subSegments, filters));
+                            formatSerializer,
+                            projectedSerializer,
+                            subSegments,
+                            filters,
+                            convertor));
         }
         return result;
     }

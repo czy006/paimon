@@ -1,0 +1,643 @@
+---
+title: "System Tables"
+sidebar_position: 7
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# System Tables
+
+System tables expose table state and catalog metadata through SQL. Use a table suffix such as
+`my_table$snapshots` to inspect one table, or the catalog's `sys` database for global metadata.
+
+## Find the Right System Table
+
+| What you want to inspect | System tables |
+| --- | --- |
+| Commit history and schema versions | [Snapshots](#snapshots-table), [Schemas](#schemas-table) |
+| Configuration | [Options](#options-table), [All table options](#all-options-table), [Catalog options](#catalog-options-table) |
+| Physical files and data distribution | [Files](#files-table), [Manifests](#manifests-table), [Partitions](#partitions-table), [Buckets](#buckets-table) |
+| Index coverage and key ranges | [File indexes](#file-indexes-table), [Table indexes](#table-indexes-table), [File key ranges](#file-key-ranges-table) |
+| Changes and read views | [Audit log](#audit-log-table), [Binlog](#binlog-table), [Read-optimized](#read-optimized-table) |
+| Retained versions and streaming progress | [Tags](#tags-table), [Branches](#branches-table), [Consumers](#consumers-table) |
+| Additional table metadata | [Aggregation fields](#aggregation-fields-table), [Statistics](#statistic-table), [Row tracking](#row-tracking-table) |
+| Catalog inventory | [All tables](#all-tables-table), [All partitions](#all-partitions-table) |
+
+The sections below describe syntax and availability. Some system tables require particular table
+features or options to be enabled. On tables with `query-auth.enabled = true`, the `files`,
+`file_key_ranges`, `binlog`, and `statistics` system tables are unavailable because their raw
+metadata cannot be covered by column masking.
+
+## Data System Table
+
+Data System tables contain metadata and information about each Paimon data table, such as the snapshots created and the
+options in use. Use batch queries to inspect metadata. The `audit_log` and `binlog` tables
+also support streaming changelog reads when the underlying table provides the required changes.
+
+Currently, Flink, Spark, Trino and StarRocks support querying system tables.
+
+In some cases, the table name needs to be enclosed with back quotes to avoid syntax parsing conflicts, for example triple access mode:
+```sql
+SELECT * FROM my_catalog.my_db.`my_table$snapshots`;
+```
+
+### Snapshots Table
+
+The `snapshots` table lists retained snapshots and their commit metadata. For example, inspect the
+most recent commits:
+
+```sql
+SELECT snapshot_id, schema_id, commit_kind, commit_time,
+       total_record_count, delta_record_count
+FROM my_table$snapshots
+ORDER BY snapshot_id DESC;
+```
+
+Additional columns include manifest-list names, `changelog_record_count`, `watermark`,
+`next_row_id`, `operation`, and `writer_version`. Optional metadata can be `NULL`, depending on
+the writer and enabled features. See the [Snapshot specification](./spec/snapshot) for the meaning
+of these fields.
+
+`total_record_count` and `delta_record_count` are unmerged counts calculated from data files, not
+logical row counts. All dedicated data files contribute to these values. For example, appending `N`
+logical rows to a table with one [dedicated BLOB column](../multimodal-table/blob#storage-layout)
+adds `N` records to the regular data files and `N` records to the BLOB files, so
+`delta_record_count` increases by `2 * N`. Use `COUNT(*)` when you need the logical row count.
+
+### Schemas Table
+
+You can query the historical schemas of the table through schemas table.
+
+```sql
+SELECT * FROM my_table$schemas;
+
+/*
++-----------+--------------------------------+----------------+--------------+---------+---------+-------------------------+
+| schema_id |                         fields | partition_keys | primary_keys | options | comment |       update_time       |
++-----------+--------------------------------+----------------+--------------+---------+---------+-------------------------+
+|         0 | [{"id":0,"name":"word","typ... |             [] |     ["word"] |      {} |         | 2022-10-28 11:44:20.600 |
+|         1 | [{"id":0,"name":"word","typ... |             [] |     ["word"] |      {} |         | 2022-10-27 11:44:15.600 |
+|         2 | [{"id":0,"name":"word","typ... |             [] |     ["word"] |      {} |         | 2022-10-26 11:44:10.600 |
++-----------+--------------------------------+----------------+--------------+---------+---------+-------------------------+
+3 rows in set
+*/
+```
+
+You can join the snapshots table and schemas table to get the fields of given snapshots.
+
+```sql
+SELECT s.snapshot_id, t.schema_id, t.fields 
+    FROM my_table$snapshots s JOIN my_table$schemas t 
+    ON s.schema_id=t.schema_id where s.snapshot_id=100;
+```
+
+### Options Table
+
+You can query the table's option information which is specified from the DDL through options table. The options not shown will be the default value. You can take reference to [Configuration](../maintenance/configurations#coreoptions).
+
+```sql
+SELECT * FROM my_table$options;
+
+/*
++------------------------+--------------------+
+|         key            |        value       |
++------------------------+--------------------+
+| snapshot.time-retained |         5 h        |
++------------------------+--------------------+
+1 rows in set
+*/
+```
+
+### Audit log Table
+
+If you need to audit the changelog of the table, you can use the `audit_log` system table. Through `audit_log` table, you can get the `rowkind` column when you get the incremental data of the table. You can use this column for
+filtering and other operations to complete the audit.
+
+There are four values for `rowkind`:
+
+- `+I`: Insertion operation.
+- `-U`: Update operation with the previous content of the updated row.
+- `+U`: Update operation with new content of the updated row.
+- `-D`: Deletion operation.
+
+```sql
+SELECT * FROM my_table$audit_log;
+
+/*
++------------------+-----------------+-----------------+
+|     rowkind      |     column_0    |     column_1    |
++------------------+-----------------+-----------------+
+|        +I        |      ...        |      ...        |
++------------------+-----------------+-----------------+
+|        -U        |      ...        |      ...        |
++------------------+-----------------+-----------------+
+|        +U        |      ...        |      ...        |
++------------------+-----------------+-----------------+
+3 rows in set
+*/
+```
+
+For primary key tables, you can enable the `table-read.sequence-number.enabled` option to include the `_SEQUENCE_NUMBER` field in the output.
+
+<Tabs groupId="audit-log-sequence-number">
+
+<TabItem value="enable-via-alter-table" label="Enable via ALTER TABLE">
+
+```sql
+ALTER TABLE my_table SET ('table-read.sequence-number.enabled' = 'true');
+```
+
+</TabItem>
+
+<TabItem value="enable-via-create-table" label="Enable via CREATE TABLE">
+
+```sql
+CREATE TABLE my_table (
+    ...
+) WITH (
+    'table-read.sequence-number.enabled' = 'true'
+);
+```
+
+</TabItem>
+
+</Tabs>
+
+```sql
+SELECT * FROM my_table$audit_log;
+
+/*
++------------------+--------------------+-----------------+-----------------+
+|     rowkind      | _SEQUENCE_NUMBER   |     column_0    |     column_1    |
++------------------+--------------------+-----------------+-----------------+
+|        +I        |                 0  |      ...        |      ...        |
++------------------+--------------------+-----------------+-----------------+
+|        -U        |                 0  |      ...        |      ...        |
++------------------+--------------------+-----------------+-----------------+
+|        +U        |                 1  |      ...        |      ...        |
++------------------+--------------------+-----------------+-----------------+
+3 rows in set
+*/
+```
+
+:::info
+
+The `table-read.sequence-number.enabled` option cannot be set via SQL hints.
+
+:::
+
+### Binlog Table
+
+The `binlog` table represents each data column as an array. During a streaming changelog read,
+it packs an update-before and update-after pair into one row, with `[before, after]` in each
+array. Insertions and deletions use single-element arrays. A batch read uses single-element
+arrays and does not perform this pairing.
+
+The following Flink example assumes that the underlying table produces update-before and
+update-after records; see [Changelog Producers](../primary-key-table/changelog-producer).
+
+Currently, the binlog table is unable to display Flink's computed columns.
+
+```sql
+SET 'execution.runtime-mode' = 'streaming';
+SELECT * FROM T$binlog;
+
+/*
++------------------+----------------------+-----------------------+
+|     rowkind      |       column_0       |       column_1        |
++------------------+----------------------+-----------------------+
+|        +I        |       [col_0]        |       [col_1]         |
++------------------+----------------------+-----------------------+
+|        +U        | [col_0_ub, col_0_ua] | [col_1_ub, col_1_ua]  |
++------------------+----------------------+-----------------------+
+|        -D        |       [col_0]        |       [col_1]         |
++------------------+----------------------+-----------------------+
+*/
+```
+
+Similar to the audit_log table, you can also enable `table-read.sequence-number.enabled` to include `_SEQUENCE_NUMBER` in the binlog table output:
+
+```sql
+SELECT * FROM T$binlog;
+
+/*
++------------------+--------------------+----------------------+-----------------------+
+|     rowkind      | _SEQUENCE_NUMBER   |       column_0       |       column_1        |
++------------------+--------------------+----------------------+-----------------------+
+|        +I        |                 0  |       [col_0]        |       [col_1]         |
++------------------+--------------------+----------------------+-----------------------+
+|        +U        |                 1  | [col_0_ub, col_0_ua] | [col_1_ub, col_1_ua]  |
++------------------+--------------------+----------------------+-----------------------+
+|        -D        |                 2  |       [col_0]        |       [col_1]         |
++------------------+--------------------+----------------------+-----------------------+
+*/
+```
+
+### Read-optimized Table
+
+If you require extreme reading performance and can accept reading slightly old data,
+you can use the `ro` (read-optimized) system table.
+Read-optimized system table improves reading performance by only scanning files which does not need merging.
+
+For primary-key tables, `ro` system table only scans files on the topmost level.
+That is to say, `ro` system table only produces the result of the latest full compaction.
+
+:::info
+
+It is possible that different buckets carry out full compaction at difference times,
+so it is possible that the values of different keys come from different snapshots.
+
+:::
+
+For append tables, as all files can be read without merging,
+`ro` system table acts like the normal append table.
+
+```sql
+SELECT * FROM my_table$ro;
+```
+
+### Files Table
+
+The `files` table lists the data files in a snapshot, including their sizes, record counts, levels,
+and column statistics. Select the columns relevant to your investigation:
+
+```sql
+-- Files in the latest snapshot.
+SELECT partition, bucket, file_path, level, record_count, file_size_in_bytes
+FROM my_table$files;
+
+-- Flink: inspect a specific retained snapshot.
+SELECT partition, bucket, file_path, level, record_count, file_size_in_bytes
+FROM my_table$files /*+ OPTIONS('scan.snapshot-id'='1') */;
+```
+
+| Columns | Meaning |
+| --- | --- |
+| `file_format`, `schema_id` | File encoding and the schema used to write it. |
+| `min_key`, `max_key` | Key bounds recorded for the file. |
+| `null_value_counts`, `min_value_stats`, `max_value_stats` | Column statistics stored in file metadata. |
+| `min_sequence_number`, `max_sequence_number` | Sequence-number bounds. |
+| `creation_time`, `file_source` | File creation time and origin. |
+| `deleteRowCount` | Delete-row count recorded in the data file metadata. |
+| `first_row_id` | Starting row ID for a file with row-tracking metadata. |
+| `write_cols` | Columns written to the file when a column subset is recorded. |
+
+Optional fields can be `NULL` for older files or when the corresponding feature is not enabled.
+See [Data File Metadata](./spec/manifest#data-file-metadata) for the underlying metadata structure.
+
+### File Indexes Table
+
+You can query the file indexes of every data file in a specific snapshot through the
+`file_indexes` table. Each row represents one index type for one column in one data file.
+Multiple rows can therefore refer to the same index container.
+
+```sql
+SELECT * FROM my_table$file_indexes;
+
+/*
++-----------+--------+--------------------------------+--------------------+--------------+-----------+-------------+--------------+--------------+--------------------------------+--------------------+----------------------------+----------+
+| partition | bucket |                      file_path | file_size_in_bytes | record_count | schema_id | column_name |  index_type  | storage_type |               index_file_path | index_size_in_bytes | index_container_size_in_bytes | is_empty |
++-----------+--------+--------------------------------+--------------------+--------------+-----------+-------------+--------------+--------------+--------------------------------+--------------------+----------------------------+----------+
+|       {1} |      0 | data-8f64af95-29cc-4342-adc... |                593 |            2 |         0 |          id |      bitmap |     EMBEDDED |                         <NULL> |                 12 |                           48 |    false |
+|       {1} |      0 | data-8f64af95-29cc-4342-adc... |                593 |            2 |         0 |          id | bloom-filter |     EMBEDDED |                         <NULL> |                 16 |                           48 |    false |
+|       {2} |      0 | data-8b369068-0d37-4011-aa5... |                593 |            2 |         0 |          id |      bitmap |         FILE | data-8b369068-0d37-4011-aa5... |                 12 |                           48 |    false |
+|       {2} |      0 | data-8b369068-0d37-4011-aa5... |                593 |            2 |         0 |          id | bloom-filter |         FILE | data-8b369068-0d37-4011-aa5... |                 16 |                           48 |    false |
++-----------+--------+--------------------------------+--------------------+--------------+-----------+-------------+--------------+--------------+--------------------------------+--------------------+----------------------------+----------+
+4 rows in set
+*/
+```
+
+The system table reads only file index headers and does not load index payloads. It lists indexes
+that physically exist in the selected snapshot; data files without file indexes do not produce
+rows.
+
+This table is different from `table_indexes`, which lists independently managed index files from
+the snapshot's index manifest, such as deletion vectors and global indexes.
+
+### File Key Ranges Table
+
+You can query the key ranges and file location of each data file through the file key ranges table.
+This is useful for diagnosing data distribution and Global Index coverage.
+
+```sql
+SELECT * FROM my_table$file_key_ranges;
+
+/*
++-----------+--------+--------------------------------+-------------+-----------+-------+--------------+--------------------+---------+---------+--------------+
+| partition | bucket |                      file_path | file_format | schema_id | level | record_count | file_size_in_bytes | min_key | max_key | first_row_id |
++-----------+--------+--------------------------------+-------------+-----------+-------+--------------+--------------------+---------+---------+--------------+
+|       {3} |      0 | data-8f64af95-29cc-4342-adc... |         orc |         0 |     0 |            1 |                593 |     [c] |     [c] |            1 |
+|       {2} |      0 | data-8b369068-0d37-4011-aa5... |         orc |         0 |     0 |            1 |                593 |     [b] |     [b] |            2 |
+|       {1} |      0 | data-10abb5bc-0170-43ae-b6a... |         orc |         0 |     0 |            1 |                595 |     [a] |     [a] |            3 |
++-----------+--------+--------------------------------+-------------+-----------+-------+--------------+--------------------+---------+---------+--------------+
+3 rows in set
+*/
+```
+
+### Tags Table
+
+The `tags` table lists tag names and the snapshots they retain. A tag's creation time is separate
+from the commit time of its snapshot:
+
+```sql
+SELECT tag_name, snapshot_id, schema_id, commit_time, create_time, time_retained
+FROM my_table$tags;
+```
+
+`record_count` reports the snapshot's record count. `create_time` and `time_retained` can be `NULL`
+when that metadata is absent. See [Manage Tags](../maintenance/manage-tags) for creating tags and
+reading a table at a tag.
+
+### Branches Table
+
+You can query the branches of the table.
+
+```sql
+SELECT * FROM my_table$branches;
+
+/*
++----------------------+-------------------------+
+|          branch_name |             create_time |
++----------------------+-------------------------+
+|              branch1 | 2024-07-18 20:31:39.084 |
+|              branch2 | 2024-07-18 21:11:14.373 |
++----------------------+-------------------------+
+2 rows in set
+*/
+```
+
+### Consumers Table
+
+You can query all consumers which contains next snapshot.
+
+```sql
+SELECT * FROM my_table$consumers;
+
+/*
++-------------+------------------+
+| consumer_id | next_snapshot_id |
++-------------+------------------+
+|         id1 |                1 |
+|         id2 |                3 |
++-------------+------------------+
+2 rows in set
+*/
+```
+
+### Manifests Table
+
+The `manifests` table lists manifest files referenced by a snapshot. It exposes `file_name`,
+`file_size`, `num_added_files`, `num_deleted_files`, `schema_id`, `min_partition_stats`, and
+`max_partition_stats`.
+
+```sql
+-- Inspect the latest snapshot.
+SELECT * FROM my_table$manifests;
+
+-- Flink: select a retained snapshot by ID, tag, or timestamp.
+SELECT * FROM my_table$manifests /*+ OPTIONS('scan.snapshot-id'='1') */;
+SELECT * FROM my_table$manifests /*+ OPTIONS('scan.tag-name'='tag1') */;
+SELECT * FROM my_table$manifests /*+ OPTIONS('scan.timestamp-millis'='1678883047356') */;
+```
+
+The added and deleted counts describe manifest entries. See [Manifest](./spec/manifest) for how
+manifest lists and entries reconstruct a snapshot's file set.
+
+### Aggregation fields Table
+
+The `aggregation_fields` table describes field aggregation settings in the latest schema,
+including aggregate functions, their options, and field comments.
+
+```sql
+SELECT * FROM my_table$aggregation_fields;
+
+/*
++------------+-----------------+--------------+--------------------------------+---------+
+| field_name |      field_type |    function  |               function_options | comment |
++------------+-----------------+--------------+--------------------------------+---------+
+| product_id | BIGINT NOT NULL |           [] |                             [] |  <NULL> |
+|      price |             INT | [true,count] | [fields.price.ignore-retrac... |  <NULL> |
+|      sales |          BIGINT |        [sum] | [fields.sales.aggregate-fun... |  <NULL> |
++------------+-----------------+--------------+--------------------------------+---------+
+3 rows in set
+*/
+```
+
+### Partitions Table
+
+The `partitions` table summarizes each partition's files and record counts. Its `partition` column
+uses a directory-style name, such as `pt=1` or `pt=1/dt=2026-09-10`, rather than the brace-delimited
+partition values shown by some file-level system tables.
+
+For a table partitioned by `pt`, inspect one partition with:
+
+```sql
+SELECT partition, record_count, file_size_in_bytes, file_count,
+       last_update_time, total_buckets, done, deleted_record_count
+FROM my_table$partitions
+WHERE partition = 'pt=1';
+```
+
+Additional columns include `created_at`, `created_by`, `updated_by`, and `options`. These are
+populated from REST catalog audit information and are `NULL` for non-REST catalogs.
+
+`deleted_record_count` counts records marked deleted by deletion vectors. It is `0` when a
+partition has no deletion vectors and `NULL` when legacy deletion-vector metadata does not
+contain cardinality.
+
+### Buckets Table
+
+You can query the bucket files of the table.
+
+```sql
+SELECT * FROM my_table$buckets;
+
+/*
++---------------+--------+----------------+--------------------+--------------------+------------------------+
+|  partition    | bucket |   record_count |  file_size_in_bytes|          file_count|        last_update_time|
++---------------+--------+----------------+--------------------+--------------------+------------------------+
+|  [1]          |   0    |           1    |             645    |                1   | 2024-06-24 10:25:57.400|
++---------------+--------+----------------+--------------------+--------------------+------------------------+
+*/
+```
+
+### Statistic Table
+You can query the statistic information through statistic table.
+
+```sql
+SELECT * FROM T$statistics;
+
+/*
++--------------+------------+-----------------------+------------------+----------+
+|  snapshot_id |  schema_id |     mergedRecordCount | mergedRecordSize |  colstat |
++--------------+------------+-----------------------+------------------+----------+
+|            2 |          0 |              2        |         2        |    {}    |
++--------------+------------+-----------------------+------------------+----------+
+1 rows in set
+*/
+```
+
+### Table Indexes Table
+
+The `table_indexes` table lists index files referenced by the table, including dynamic-bucket hash
+indexes, deletion vectors, and global indexes.
+
+```sql
+SELECT partition, bucket, index_type, file_name, file_size, row_count
+FROM my_table$table_indexes;
+```
+
+Additional metadata depends on the index type:
+
+| Columns | Meaning |
+| --- | --- |
+| `dv_ranges` | Per-data-file deletion-vector metadata. |
+| `row_range_start`, `row_range_end` | Row range covered by a global index. |
+| `index_field_id`, `index_field_name` | Indexed field for a global index. |
+
+Fields that do not apply to an index can be `NULL`. See [Table Index](./spec/tableindex) for the
+index-file layout and deletion-vector encoding.
+
+### Row Tracking Table
+
+If you need to query the unique row id assigned to each row in an append table, you can use the `row_tracking` system table.
+The `row_tracking` table appends `_ROW_ID` and `_SEQUENCE_NUMBER` metadata columns to the original table schema.
+
+:::note
+
+The table must have `'row-tracking.enabled' = 'true'` set. This feature is only supported for append tables.
+
+:::
+
+```sql
+SELECT * FROM my_table$row_tracking;
+
+/*
++----------+-----------+---------+------------------+
+|    id    |   data    | _ROW_ID | _SEQUENCE_NUMBER |
++----------+-----------+---------+------------------+
+|       11 |         a |       0 |                1 |
+|       22 |         b |       1 |                1 |
++----------+-----------+---------+------------------+
+2 rows in set
+*/
+```
+
+- `_ROW_ID`: A globally unique row identifier within the table, assigned during write.
+- `_SEQUENCE_NUMBER`: The sequence number (snapshot id) when the row was written.
+
+You can also select these columns directly from the original table (without using the system table) when row tracking is enabled:
+
+```sql
+SELECT *, _ROW_ID, _SEQUENCE_NUMBER FROM my_table;
+```
+
+## Global System Table
+
+Global system tables expose metadata across databases in the current catalog. In Flink or Spark,
+list the tables in the `sys` system database:
+
+```sql
+USE sys;
+SHOW TABLES;
+```
+
+### All Tables Table
+
+Shows all the tables in all database.
+
+```sql
+SELECT * FROM sys.tables;
+
+/*
++---------------+------------+------------+-------------+-------------+-------------+-------------+-------------+-------------+-------------+-------------+------------------+-------------+-------------------------+
+| database_name | table_name | table_type | partitioned | primary_key |    owner    |  created_at |  created_by |  updated_at |  updated_by | record_count|file_size_in_bytes| file_count  | last_file_creation_time |
++---------------+------------+------------+-------------+-------------+-------------+-------------+-------------+-------------+-------------+-------------+------------------+-------------+-------------------------+
+|         my_db | Orders_orc |    table   |     false   |    false    |    *****    |    *****    |    *****    |    *****    |    *****    |    *****    |    *****         |    *****    |    *****                |
+|         my_db |  Orders2   |    table   |     true    |     true    |    *****    |     ****    |     ****    |     ****    |     ****    |     ****    |     ****         |     ****    |     ****                |
+|         my_db2|  OrdersSum |    table   |     false   |     false   |     *****   |     *****   |     *****   |     *****   |     *****   |     *****   |     *****        |     *****   |     *****               |
++---------------+------------+------------+-------------+-------------+-------------+-------------+-------------+-------------+-------------+-------------+------------------+-------------+-------------------------+
+3 rows in set
+*/
+```
+
+This table also displays various information from REST Server, such as owner, created_at, updated_at.
+
+### All Partitions Table
+
+Shows all the partitions in all database.
+
+```sql
+SELECT * FROM sys.partitions;
+
+/*
++---------------+------------+----------------+-------------+------------------+-------------+-------------------------+-------------+
+| database_name | table_name | partition_name | record_count|file_size_in_bytes| file_count  | last_file_creation_time |    done     |
++---------------+------------+----------------+-------------+------------------+-------------+-------------------------+-------------+
+|         my_db | Orders_orc |      dt=1      |    *****    |    *****         |    *****    |    *****                |    *****    |
+|         my_db |  Orders2   |      dt=1      |     ****    |     ****         |     ****    |     ****                |    ****     |
+|         my_db2|  OrdersSum |      dt=1      |     *****   |     *****        |     *****   |     *****               |   *****     |
++---------------+------------+----------------+-------------+------------------+-------------+-------------------------+-------------+
+3 rows in set
+*/
+```
+
+This table also displays various statistics information of partition.
+
+### ALL Options Table
+
+This table is similar to [Options Table](#options-table), but it shows all the table options in all database.
+
+```sql
+SELECT * FROM sys.all_table_options;
+
+/*
++---------------+--------------------------------+--------------------------------+------------------+
+| database_name |                     table_name |                            key |            value |
++---------------+--------------------------------+--------------------------------+------------------+
+|         my_db |                    Orders_orc  |                         bucket |               -1 |
+|         my_db |                        Orders2 |                         bucket |               -1 |
+|         my_db |                        Orders2 |               sink.parallelism |                7 |
+|         my_db2|                      OrdersSum |                         bucket |                1 |
++---------------+--------------------------------+--------------------------------+------------------+
+7 rows in set
+*/
+```
+
+### Catalog Options Table
+
+You can query the catalog's option information through catalog options table when `catalog-options-table.enabled` is set to `true`.
+The options not shown will be the default value. You can take reference to [Configuration](../maintenance/configurations#catalogoptions).
+
+```sql
+SELECT * FROM sys.catalog_options;
+
+/*
++-----------+---------------------------+
+|       key |                     value |
++-----------+---------------------------+
+| warehouse | hdfs:///path/to/warehouse |
++-----------+---------------------------+
+1 rows in set
+*/
+```

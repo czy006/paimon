@@ -24,9 +24,11 @@ import org.apache.paimon.function.Function;
 import org.apache.paimon.function.FunctionChange;
 import org.apache.paimon.partition.Partition;
 import org.apache.paimon.partition.PartitionStatistics;
+import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.rest.responses.GetTagResponse;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.schema.SchemaChange;
+import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.table.Instant;
 import org.apache.paimon.table.Table;
 import org.apache.paimon.table.TableSnapshot;
@@ -127,6 +129,11 @@ public abstract class DelegateCatalog implements Catalog {
     }
 
     @Override
+    public List<Table> listTableDetails(String databaseName) throws DatabaseNotExistException {
+        return wrapped.listTableDetails(databaseName);
+    }
+
+    @Override
     public PagedList<Identifier> listTablesPagedGlobally(
             String databaseNamePattern,
             String tableNamePattern,
@@ -149,6 +156,11 @@ public abstract class DelegateCatalog implements Catalog {
     }
 
     @Override
+    public Table getTableById(String tableId) throws TableIdNotExistException {
+        return wrapped.getTableById(tableId);
+    }
+
+    @Override
     public void renameTable(Identifier fromTable, Identifier toTable, boolean ignoreIfNotExists)
             throws TableNotExistException, TableAlreadyExistException {
         wrapped.renameTable(fromTable, toTable, ignoreIfNotExists);
@@ -159,6 +171,12 @@ public abstract class DelegateCatalog implements Catalog {
             Identifier identifier, List<SchemaChange> changes, boolean ignoreIfNotExists)
             throws TableNotExistException, ColumnAlreadyExistException, ColumnNotExistException {
         wrapped.alterTable(identifier, changes, ignoreIfNotExists);
+    }
+
+    @Override
+    public void replaceTable(Identifier identifier, Schema newSchema, boolean ignoreIfNotExists)
+            throws TableNotExistException {
+        wrapped.replaceTable(identifier, newSchema, ignoreIfNotExists);
     }
 
     @Override
@@ -207,9 +225,28 @@ public abstract class DelegateCatalog implements Catalog {
     }
 
     @Override
+    public Optional<TableSchema> loadSchema(Identifier identifier, String version)
+            throws TableNotExistException {
+        return wrapped.loadSchema(identifier, version);
+    }
+
+    @Override
+    public PagedList<TableSchema> listSchemasPaged(
+            Identifier identifier, @Nullable Integer maxResults, @Nullable String pageToken)
+            throws TableNotExistException {
+        return wrapped.listSchemasPaged(identifier, maxResults, pageToken);
+    }
+
+    @Override
     public void rollbackTo(Identifier identifier, Instant instant, @Nullable Long fromSnapshot)
             throws Catalog.TableNotExistException {
         wrapped.rollbackTo(identifier, instant, fromSnapshot);
+    }
+
+    @Override
+    public void rollbackSchema(Identifier identifier, long schemaId)
+            throws Catalog.TableNotExistException {
+        wrapped.rollbackSchema(identifier, schemaId);
     }
 
     @Override
@@ -219,8 +256,21 @@ public abstract class DelegateCatalog implements Catalog {
     }
 
     @Override
+    public void createBranch(
+            Identifier identifier, String branch, @Nullable String fromTag, boolean ignoreIfExists)
+            throws TableNotExistException, BranchAlreadyExistException, TagNotExistException {
+        wrapped.createBranch(identifier, branch, fromTag, ignoreIfExists);
+    }
+
+    @Override
     public void dropBranch(Identifier identifier, String branch) throws BranchNotExistException {
         wrapped.dropBranch(identifier, branch);
+    }
+
+    @Override
+    public void renameBranch(Identifier identifier, String fromBranch, String toBranch)
+            throws BranchNotExistException, BranchAlreadyExistException {
+        wrapped.renameBranch(identifier, fromBranch, toBranch);
     }
 
     @Override
@@ -252,9 +302,12 @@ public abstract class DelegateCatalog implements Catalog {
 
     @Override
     public PagedList<String> listTagsPaged(
-            Identifier identifier, @Nullable Integer maxResults, @Nullable String pageToken)
+            Identifier identifier,
+            @Nullable Integer maxResults,
+            @Nullable String pageToken,
+            @Nullable String tagNamePrefix)
             throws TableNotExistException {
-        return wrapped.listTagsPaged(identifier, maxResults, pageToken);
+        return wrapped.listTagsPaged(identifier, maxResults, pageToken, tagNamePrefix);
     }
 
     @Override
@@ -267,16 +320,41 @@ public abstract class DelegateCatalog implements Catalog {
     public boolean commitSnapshot(
             Identifier identifier,
             @Nullable String tableUuid,
+            @Nullable String baseSnapshotUuid,
             Snapshot snapshot,
             List<PartitionStatistics> statistics)
             throws TableNotExistException {
-        return wrapped.commitSnapshot(identifier, tableUuid, snapshot, statistics);
+        return wrapped.commitSnapshot(
+                identifier, tableUuid, baseSnapshotUuid, snapshot, statistics);
+    }
+
+    @Override
+    public boolean supportsPartitionModification() {
+        return wrapped.supportsPartitionModification();
     }
 
     @Override
     public void createPartitions(Identifier identifier, List<Map<String, String>> partitions)
             throws TableNotExistException {
         wrapped.createPartitions(identifier, partitions);
+    }
+
+    @Override
+    public void createPartitions(
+            Identifier identifier,
+            List<Map<String, String>> partitions,
+            boolean ignoreIfExists,
+            @Nullable List<PartitionStatistics> statistics,
+            boolean replaceStatistics,
+            @Nullable List<Map<String, String>> partitionOptions)
+            throws TableNotExistException {
+        wrapped.createPartitions(
+                identifier,
+                partitions,
+                ignoreIfExists,
+                statistics,
+                replaceStatistics,
+                partitionOptions);
     }
 
     @Override
@@ -406,7 +484,26 @@ public abstract class DelegateCatalog implements Catalog {
     }
 
     @Override
-    public List<String> authTableQuery(Identifier identifier, @Nullable List<String> select)
+    public PagedList<Partition> listPartitionsByFilterPaged(
+            Identifier identifier,
+            Predicate predicate,
+            Integer maxResults,
+            String pageToken,
+            String partitionNamePattern)
+            throws TableNotExistException {
+        return wrapped.listPartitionsByFilterPaged(
+                identifier, predicate, maxResults, pageToken, partitionNamePattern);
+    }
+
+    @Override
+    public List<Partition> listPartitionsByNames(
+            Identifier identifier, List<Map<String, String>> partitions)
+            throws TableNotExistException {
+        return wrapped.listPartitionsByNames(identifier, partitions);
+    }
+
+    @Override
+    public TableQueryAuthResult authTableQuery(Identifier identifier, @Nullable List<String> select)
             throws TableNotExistException {
         return wrapped.authTableQuery(identifier, select);
     }

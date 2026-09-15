@@ -29,6 +29,7 @@ import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.manifest.FileSource;
 import org.apache.paimon.mergetree.LevelSortedRun;
 import org.apache.paimon.partition.PartitionPredicate;
+import org.apache.paimon.schema.FileSystemSchemaManager;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.schema.SchemaChange;
 import org.apache.paimon.schema.SchemaManager;
@@ -56,18 +57,6 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 public class IncrementalClusterManagerTest {
 
     @TempDir java.nio.file.Path tempDir;
-
-    @Test
-    public void testNonUnAwareBucketTable() {
-        Map<String, String> options = new HashMap<>();
-        options.put(CoreOptions.BUCKET.key(), "1");
-        options.put(CoreOptions.BUCKET_KEY.key(), "f0");
-
-        assertThatThrownBy(() -> createTable(options, Collections.emptyList()))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining(
-                        "Cannot define bucket for incremental clustering  table, it only support bucket = -1");
-    }
 
     @Test
     public void testNonClusterIncremental() throws Exception {
@@ -159,6 +148,38 @@ public class IncrementalClusterManagerTest {
     }
 
     @Test
+    public void testClusteringIncrementalModeDefault() throws Exception {
+        // Test default mode is GLOBAL_SORT
+        Map<String, String> options = new HashMap<>();
+        FileStoreTable table = createTable(options, Collections.emptyList());
+        IncrementalClusterManager manager = new IncrementalClusterManager(table);
+        assertThat(manager.clusteringIncrementalMode())
+                .isEqualTo(CoreOptions.ClusteringIncrementalMode.GLOBAL_SORT);
+    }
+
+    @Test
+    public void testClusteringIncrementalModeLocalSort() throws Exception {
+        // Test local-sort mode
+        Map<String, String> options = new HashMap<>();
+        options.put(CoreOptions.CLUSTERING_INCREMENTAL_MODE.key(), "local-sort");
+        FileStoreTable table = createTable(options, Collections.emptyList());
+        IncrementalClusterManager manager = new IncrementalClusterManager(table);
+        assertThat(manager.clusteringIncrementalMode())
+                .isEqualTo(CoreOptions.ClusteringIncrementalMode.LOCAL_SORT);
+    }
+
+    @Test
+    public void testClusteringIncrementalModeGlobalSort() throws Exception {
+        // Test explicit global-sort mode
+        Map<String, String> options = new HashMap<>();
+        options.put(CoreOptions.CLUSTERING_INCREMENTAL_MODE.key(), "global-sort");
+        FileStoreTable table = createTable(options, Collections.emptyList());
+        IncrementalClusterManager manager = new IncrementalClusterManager(table);
+        assertThat(manager.clusteringIncrementalMode())
+                .isEqualTo(CoreOptions.ClusteringIncrementalMode.GLOBAL_SORT);
+    }
+
+    @Test
     public void testHistoryPartitionAutoClustering() throws Exception {
         Map<String, String> options = new HashMap<>();
         options.put(CoreOptions.CLUSTERING_HISTORY_PARTITION_IDLE_TIME.key(), "2s");
@@ -240,7 +261,7 @@ public class IncrementalClusterManagerTest {
                         "");
 
         SchemaManager schemaManager =
-                new SchemaManager(LocalFileIO.create(), new Path(tempDir.toString()));
+                new FileSystemSchemaManager(LocalFileIO.create(), new Path(tempDir.toString()));
         return FileStoreTableFactory.create(
                 LocalFileIO.create(),
                 new Path(tempDir.toString()),

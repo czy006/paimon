@@ -42,6 +42,9 @@ public class LookupMergeFunction implements MergeFunction<KeyValue> {
     private boolean containLevel0;
     private InternalRow currentKey;
 
+    /** Position of the record {@link #pickHighLevel} chose, -1 when there is none. */
+    private int highLevelIndex = -1;
+
     public LookupMergeFunction(
             MergeFunction<KeyValue> mergeFunction,
             CoreOptions options,
@@ -57,6 +60,7 @@ public class LookupMergeFunction implements MergeFunction<KeyValue> {
         candidates.reset();
         currentKey = null;
         containLevel0 = false;
+        highLevelIndex = -1;
     }
 
     @Override
@@ -75,19 +79,22 @@ public class LookupMergeFunction implements MergeFunction<KeyValue> {
     @Nullable
     public KeyValue pickHighLevel() {
         KeyValue highLevel = null;
+        highLevelIndex = -1;
+        int index = 0;
         try (CloseableIterator<KeyValue> iterator = candidates.iterator()) {
             while (iterator.hasNext()) {
                 KeyValue kv = iterator.next();
                 // records that has not been stored on the disk yet, such as the data in the write
                 // buffer being at level -1
-                if (kv.level() <= 0) {
-                    continue;
+                if (kv.level() > 0) {
+                    // For high-level comparison logic (not involving Level 0), only the value of
+                    // the minimum Level should be selected
+                    if (highLevel == null || kv.level() < highLevel.level()) {
+                        highLevel = kv;
+                        highLevelIndex = index;
+                    }
                 }
-                // For high-level comparison logic (not involving Level 0), only the value of the
-                // minimum Level should be selected
-                if (highLevel == null || kv.level() < highLevel.level()) {
-                    highLevel = kv;
-                }
+                index++;
             }
         } catch (Exception e) {
             throw new RuntimeException(e);
@@ -106,15 +113,20 @@ public class LookupMergeFunction implements MergeFunction<KeyValue> {
     @Override
     public KeyValue getResult() {
         mergeFunction.reset();
-        KeyValue highLevel = pickHighLevel();
+        // match the high level record by its position: once the candidates have spilled, every
+        // iteration deserializes fresh KeyValue instances, so the one picked above is never the
+        // same object as the one seen here
+        pickHighLevel();
+        int index = 0;
         try (CloseableIterator<KeyValue> iterator = candidates.iterator()) {
             while (iterator.hasNext()) {
                 KeyValue kv = iterator.next();
                 // records that has not been stored on the disk yet, such as the data in the write
                 // buffer being at level -1
-                if (kv.level() <= 0 || kv == highLevel) {
+                if (kv.level() <= 0 || index == highLevelIndex) {
                     mergeFunction.add(kv);
                 }
+                index++;
             }
         } catch (Exception e) {
             throw new RuntimeException(e);
@@ -143,7 +155,7 @@ public class LookupMergeFunction implements MergeFunction<KeyValue> {
     /** Factory to create {@link LookupMergeFunction}. */
     public static class Factory implements MergeFunctionFactory<KeyValue> {
 
-        private static final long serialVersionUID = 1L;
+        private static final long serialVersionUID = 2L;
 
         private final MergeFunctionFactory<KeyValue> wrapped;
         private final CoreOptions options;
@@ -167,15 +179,19 @@ public class LookupMergeFunction implements MergeFunction<KeyValue> {
             this.ioManager = ioManager;
         }
 
-        @Override
-        public MergeFunction<KeyValue> create(@Nullable int[][] projection) {
-            return new LookupMergeFunction(
-                    wrapped.create(projection), options, keyType, valueType, ioManager);
+        public MergeFunctionFactory<KeyValue> wrapped() {
+            return wrapped;
         }
 
         @Override
-        public AdjustedProjection adjustProjection(@Nullable int[][] projection) {
-            return wrapped.adjustProjection(projection);
+        public MergeFunction<KeyValue> create(@Nullable RowType readType) {
+            return new LookupMergeFunction(
+                    wrapped.create(readType), options, keyType, valueType, ioManager);
+        }
+
+        @Override
+        public RowType adjustReadType(RowType readType) {
+            return wrapped.adjustReadType(readType);
         }
     }
 }

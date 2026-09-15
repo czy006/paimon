@@ -68,6 +68,21 @@ public class OnlyPartitionKeyEqualVisitor implements FunctionVisitor<Boolean> {
     }
 
     @Override
+    public Boolean visitArrayContains(FieldRef fieldRef, Object literal) {
+        return false;
+    }
+
+    @Override
+    public Boolean visitArraysOverlap(FieldRef fieldRef, List<Object> literals) {
+        return false;
+    }
+
+    @Override
+    public Boolean visitArrayContainsAll(FieldRef fieldRef, List<Object> literals) {
+        return false;
+    }
+
+    @Override
     public Boolean visitLike(FieldRef fieldRef, Object literal) {
         return false;
     }
@@ -128,7 +143,7 @@ public class OnlyPartitionKeyEqualVisitor implements FunctionVisitor<Boolean> {
     }
 
     @Override
-    public Boolean visit(TransformPredicate predicate) {
+    public Boolean visitNonFieldLeaf(LeafPredicate predicate) {
         return false;
     }
 }

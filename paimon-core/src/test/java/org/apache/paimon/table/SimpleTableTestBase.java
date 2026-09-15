@@ -43,6 +43,7 @@ import org.apache.paimon.predicate.PredicateBuilder;
 import org.apache.paimon.reader.ReaderSupplier;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.reader.RecordReaderIterator;
+import org.apache.paimon.schema.FileSystemSchemaManager;
 import org.apache.paimon.schema.SchemaChange;
 import org.apache.paimon.schema.SchemaManager;
 import org.apache.paimon.schema.TableSchema;
@@ -57,6 +58,7 @@ import org.apache.paimon.table.sink.StreamTableWrite;
 import org.apache.paimon.table.sink.StreamWriteBuilder;
 import org.apache.paimon.table.sink.TableCommitImpl;
 import org.apache.paimon.table.source.DataSplit;
+import org.apache.paimon.table.source.IncrementalSplit;
 import org.apache.paimon.table.source.OutOfRangeException;
 import org.apache.paimon.table.source.ReadBuilder;
 import org.apache.paimon.table.source.ScanMode;
@@ -586,7 +588,7 @@ public abstract class SimpleTableTestBase {
         write.write(rowData(1, 20, 200L));
         commit.commit(0, write.prepareCommit(true, 0));
 
-        SchemaManager schemaManager = new SchemaManager(table.fileIO(), table.location());
+        SchemaManager schemaManager = new FileSystemSchemaManager(table.fileIO(), table.location());
         schemaManager.commitChanges(SchemaChange.addColumn("added", DataTypes.INT()));
         table = table.copyWithLatestSchema();
         assertThat(table.coreOptions().snapshotNumRetainMax()).isEqualTo(100);
@@ -612,6 +614,17 @@ public abstract class SimpleTableTestBase {
                                 "1|20|200|binary|varbinary|mapKey:mapVal|multiset|null",
                                 "1|30|300|binary|varbinary|mapKey:mapVal|multiset|3000",
                                 "1|40|400|binary|varbinary|mapKey:mapVal|multiset|4000"));
+    }
+
+    @Test
+    public void testCopyWithLatestSchemaPicksUpAlteredOptions() throws Exception {
+        FileStoreTable table = createFileStoreTable();
+        SchemaManager schemaManager = new FileSystemSchemaManager(table.fileIO(), table.location());
+
+        schemaManager.commitChanges(SchemaChange.setOption("my-custom-key", "my-custom-value"));
+
+        FileStoreTable updated = table.copyWithLatestSchema();
+        assertThat(updated.schema().options()).containsEntry("my-custom-key", "my-custom-value");
     }
 
     @Test
@@ -735,7 +748,10 @@ public abstract class SimpleTableTestBase {
                         })
                 .satisfies(
                         anyCauseMatches(
-                                OutOfRangeException.class, "The snapshot with id 5 has expired."));
+                                OutOfRangeException.class,
+                                "The wanted read snapshot with id 5 has expired."))
+                .hasMessageContaining("Earliest Snapshot ID:")
+                .hasMessageContaining("Latest Snapshot ID:");
 
         write.close();
         commit.close();
@@ -1083,11 +1099,47 @@ public abstract class SimpleTableTestBase {
 
         // verify schema in test-branch is equal to schema 0
         SchemaManager schemaManager =
-                new SchemaManager(table.fileIO(), table.location(), "test-branch");
+                new FileSystemSchemaManager(table.fileIO(), table.location(), "test-branch");
         TableSchema branchSchema =
                 SchemaManager.fromPath(table.fileIO(), schemaManager.toSchemaPath(0));
         TableSchema schema0 = schemaManager.schema(0);
         assertThat(branchSchema.equals(schema0)).isTrue();
+    }
+
+    @Test
+    public void testCreateBranchFromTagAfterSnapshotExpired() throws Exception {
+        FileStoreTable table = createFileStoreTable();
+        try (StreamTableWrite write = table.newWrite(commitUser);
+                StreamTableCommit commit = table.newCommit(commitUser)) {
+            write.write(rowData(1, 10, 100L));
+            commit.commit(0, write.prepareCommit(false, 1));
+            write.write(rowData(2, 20, 200L));
+            commit.commit(1, write.prepareCommit(false, 2));
+            write.write(rowData(3, 30, 300L));
+            commit.commit(2, write.prepareCommit(false, 3));
+        }
+
+        table.createTag("test-tag", 2);
+
+        Options expire = new Options();
+        expire.set(SNAPSHOT_NUM_RETAINED_MIN, 1);
+        expire.set(SNAPSHOT_NUM_RETAINED_MAX, 1);
+        table.copy(expire.toMap()).newCommit(commitUser).expireSnapshots();
+
+        SnapshotManager snapshotManager = newSnapshotManager(table.fileIO(), table.location());
+        assertThat(snapshotManager.snapshotExists(2)).isFalse();
+        TagManager tagManager = new TagManager(table.fileIO(), table.location());
+        assertThat(tagManager.tagExists("test-tag")).isTrue();
+
+        table.createBranch("test-branch", "test-tag");
+        assertThat(table.branchManager().branchExists("test-branch")).isTrue();
+
+        Snapshot tagged = tagManager.getOrThrow("test-tag").trimToSnapshot();
+        SnapshotManager branchSnapshotManager =
+                newSnapshotManager(table.fileIO(), table.location(), "test-branch");
+        Snapshot branchSnapshot =
+                SnapshotManager.fromPath(table.fileIO(), branchSnapshotManager.snapshotPath(2));
+        assertThat(branchSnapshot.equals(tagged)).isTrue();
     }
 
     @Test
@@ -1134,6 +1186,56 @@ public abstract class SimpleTableTestBase {
     }
 
     @Test
+    public void testCreateBranchWithIgnoreIfExists() throws Exception {
+        FileStoreTable table = createFileStoreTable();
+
+        try (StreamTableWrite write = table.newWrite(commitUser);
+                StreamTableCommit commit = table.newCommit(commitUser)) {
+            write.write(rowData(1, 10, 100L));
+            commit.commit(0, write.prepareCommit(false, 1));
+            write.write(rowData(2, 20, 200L));
+            commit.commit(1, write.prepareCommit(false, 2));
+        }
+
+        table.createTag("test-tag", 2);
+        BranchManager branchManager = table.branchManager();
+
+        // Test create branch with ignoreIfExists=true (branch doesn't exist)
+        table.createBranch("new-branch", "test-tag", true);
+        assertThat(branchManager.branchExists("new-branch")).isTrue();
+
+        // Test create branch with ignoreIfExists=false (branch doesn't exist)
+        table.createBranch("another-branch", "test-tag", false);
+        assertThat(branchManager.branchExists("another-branch")).isTrue();
+
+        // Test create existing branch with ignoreIfExists=true (should succeed silently)
+        table.createBranch("new-branch", "test-tag", true);
+        assertThat(branchManager.branchExists("new-branch")).isTrue();
+
+        // Test create existing branch with ignoreIfExists=false (should throw exception)
+        assertThatThrownBy(() -> table.createBranch("new-branch", "test-tag", false))
+                .satisfies(
+                        anyCauseMatches(
+                                IllegalArgumentException.class,
+                                "Branch name 'new-branch' already exists."));
+
+        // Test create empty branch with ignoreIfExists
+        table.createBranch("empty-branch", true);
+        assertThat(branchManager.branchExists("empty-branch")).isTrue();
+
+        // Test create existing empty branch with ignoreIfExists=true
+        table.createBranch("empty-branch", true);
+        assertThat(branchManager.branchExists("empty-branch")).isTrue();
+
+        // Test create existing empty branch with ignoreIfExists=false
+        assertThatThrownBy(() -> table.createBranch("empty-branch", false))
+                .satisfies(
+                        anyCauseMatches(
+                                IllegalArgumentException.class,
+                                "Branch name 'empty-branch' already exists."));
+    }
+
+    @Test
     public void testDeleteBranch() throws Exception {
         FileStoreTable table = createFileStoreTable();
 
@@ -1167,9 +1269,8 @@ public abstract class SimpleTableTestBase {
                 .satisfies(
                         anyCauseMatches(
                                 IllegalArgumentException.class,
-                                "can not delete the fallback branch. "
-                                        + "branchName to be deleted is fallback. you have set 'scan.fallback-branch' = 'fallback'. "
-                                        + "you should reset 'scan.fallback-branch' before deleting this branch."));
+                                "Cannot delete branch 'fallback' because it is configured as"
+                                        + " 'scan.fallback-branch'. Unset 'scan.fallback-branch' first."));
 
         table.deleteBranch("fallback");
     }
@@ -1250,7 +1351,7 @@ public abstract class SimpleTableTestBase {
         assertThat(branchSnapshot.equals(snapshot)).isTrue();
 
         // verify schema in branch1 and main branch is same
-        SchemaManager schemaManager = new SchemaManager(table.fileIO(), table.location());
+        SchemaManager schemaManager = new FileSystemSchemaManager(table.fileIO(), table.location());
         TableSchema branchSchema =
                 SchemaManager.fromPath(
                         table.fileIO(), schemaManager.copyWithBranch(BRANCH_NAME).toSchemaPath(0));
@@ -1301,6 +1402,35 @@ public abstract class SimpleTableTestBase {
                         "2|20|200|binary|varbinary|mapKey:mapVal|multiset",
                         "3|30|300|binary|varbinary|mapKey:mapVal|multiset",
                         "4|40|400|binary|varbinary|mapKey:mapVal|multiset");
+    }
+
+    @Test
+    public void testFastForwardWithoutTag() throws Exception {
+        FileStoreTable table = createFileStoreTable();
+
+        try (StreamTableWrite write = table.newWrite(commitUser);
+                StreamTableCommit commit = table.newCommit(commitUser)) {
+            write.write(rowData(0, 0, 0L));
+            commit.commit(0, write.prepareCommit(false, 1));
+        }
+
+        table.createBranch(BRANCH_NAME);
+        FileStoreTable tableBranch = createBranchTable(BRANCH_NAME);
+
+        try (StreamTableWrite write = tableBranch.newWrite(commitUser);
+                StreamTableCommit commit = tableBranch.newCommit(commitUser)) {
+            write.write(rowData(2, 20, 200L));
+            commit.commit(1, write.prepareCommit(false, 2));
+        }
+
+        table.fastForward(BRANCH_NAME);
+
+        assertThat(
+                        getResult(
+                                table.newRead(),
+                                toSplits(table.newSnapshotReader().read().dataSplits()),
+                                BATCH_ROW_TO_STRING))
+                .contains("2|20|200|binary|varbinary|mapKey:mapVal|multiset");
     }
 
     @Test
@@ -1641,8 +1771,8 @@ public abstract class SimpleTableTestBase {
                                 .dataSplits());
 
         for (Split split : splits) {
-            DataSplit dataSplit = (DataSplit) split;
-            Assertions.assertThat(dataSplit.deletionFiles().isPresent()).isFalse();
+            IncrementalSplit incrementalSplit = (IncrementalSplit) split;
+            Assertions.assertThat(incrementalSplit.afterDeletionFiles()).isNull();
         }
     }
 
@@ -1792,5 +1922,56 @@ public abstract class SimpleTableTestBase {
         assertThat(snapshotManager.latestSnapshotId()).isEqualTo(expectedLatest);
         assertThat(table.tagManager().allTagNames())
                 .containsExactlyInAnyOrderElementsOf(expectedTags);
+    }
+
+    @Test
+    public void testRollbackSchemaSuccess() throws Exception {
+        FileStoreTable table = createFileStoreTable();
+        SchemaManager schemaManager = table.schemaManager();
+        long firstSchemaId = schemaManager.latest().get().id();
+
+        // evolve schema twice
+        schemaManager.commitChanges(SchemaChange.setOption("aa", "bb"));
+        long secondSchemaId = schemaManager.latest().get().id();
+        schemaManager.commitChanges(SchemaChange.setOption("cc", "dd"));
+        long thirdSchemaId = schemaManager.latest().get().id();
+
+        // rollback to first schema
+        table.rollbackSchema(firstSchemaId);
+        assertThat(schemaManager.latest().get().id()).isEqualTo(firstSchemaId);
+        assertThat(schemaManager.schemaExists(secondSchemaId)).isFalse();
+        assertThat(schemaManager.schemaExists(thirdSchemaId)).isFalse();
+    }
+
+    @Test
+    public void testRollbackSchemaFailedWithSnapshotReference() throws Exception {
+        FileStoreTable table = createFileStoreTable();
+        SchemaManager schemaManager = table.schemaManager();
+        long firstSchemaId = schemaManager.latest().get().id();
+
+        // write data to create a snapshot referencing firstSchemaId
+        StreamTableWrite write = table.newWrite(commitUser);
+        StreamTableCommit commit = table.newCommit(commitUser);
+        write.write(rowData(0, 0, 0L));
+        commit.commit(0, write.prepareCommit(false, 0));
+        write.close();
+        commit.close();
+
+        // evolve schema
+        schemaManager.commitChanges(SchemaChange.setOption("aa", "bb"));
+
+        // write data to create a snapshot referencing secondSchemaId
+        table = table.copyWithLatestSchema();
+        write = table.newWrite(commitUser);
+        commit = table.newCommit(commitUser);
+        write.write(rowData(1, 10, 100L));
+        commit.commit(1, write.prepareCommit(false, 1));
+        write.close();
+        commit.close();
+
+        // rollback should fail because snapshot references secondSchemaId
+        FileStoreTable finalTable = table;
+        assertThatThrownBy(() -> finalTable.rollbackSchema(firstSchemaId))
+                .hasMessageContaining("Cannot rollback to schema");
     }
 }

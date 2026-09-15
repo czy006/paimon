@@ -389,10 +389,18 @@ class IcebergMetadataTest {
     void testFormatVersionV3Table() throws Exception {
         // Create a v3 format version Iceberg table
         Table icebergTable = createIcebergTableV3("v3_snapshot_table");
-        TableMetadata base = ((HasTableOperations) icebergTable).operations().current();
-        ((HasTableOperations) icebergTable)
-                .operations()
-                .commit(base, TableMetadata.buildFrom(base).enableRowLineage().build());
+        try {
+            // pre-GA Iceberg (< 1.10) required opting into v3 row lineage; the builder
+            // method was removed in GA, where row lineage is always on for v3
+            java.lang.reflect.Method enableRowLineage =
+                    TableMetadata.Builder.class.getMethod("enableRowLineage");
+            TableMetadata base = ((HasTableOperations) icebergTable).operations().current();
+            TableMetadata.Builder builder = TableMetadata.buildFrom(base);
+            enableRowLineage.invoke(builder);
+            ((HasTableOperations) icebergTable).operations().commit(base, builder.build());
+        } catch (NoSuchMethodException e) {
+            // GA Iceberg: nothing to opt into
+        }
 
         // Read metadata using Paimon's IcebergMetadata
         IcebergMetadata paimonIcebergMetadata = readIcebergMetadata(icebergTable);
@@ -512,8 +520,17 @@ class IcebergMetadataTest {
         // Verify snapshot summary contains operation information
         assertThat(snapshot.summary().operation()).isEqualTo("append");
         assertThat(snapshot.summary().getSummary().get("operation")).isEqualTo("append");
+
+        // Verify required fields for Redshift Spectrum compatibility
         assertThat(snapshot.summary().getSummary().get("total-records")).isEqualTo("10");
+        assertThat(snapshot.summary().getSummary().get("total-data-files")).isEqualTo("1");
+        assertThat(snapshot.summary().getSummary().get("total-delete-files")).isEqualTo("0");
+        assertThat(snapshot.summary().getSummary().get("total-position-deletes")).isEqualTo("0");
+        assertThat(snapshot.summary().getSummary().get("total-equality-deletes")).isEqualTo("0");
+
+        // Verify change fields
         assertThat(snapshot.summary().getSummary().get("added-data-files")).isEqualTo("1");
+        assertThat(snapshot.summary().getSummary().get("added-records")).isEqualTo("10");
         assertThat(snapshot.summary().getSummary().get("added-files-size")).isEqualTo("100");
     }
 

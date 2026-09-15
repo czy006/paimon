@@ -33,20 +33,21 @@ import static java.nio.charset.StandardCharsets.UTF_8;
  * Endian byte order.
  *
  * <pre>
- * | Offset (Bytes) | Field Name    | Type      | Size (Bytes) | Description                                         |
- * |----------------|---------------|-----------|--------------|-----------------------------------------------------|
- * | 0              | version       | byte      | 1            | Serialization structure version                     |
- * | 1              | uriLength     | int       | 4            | Length (N) of the URI string in UTF-8 bytes         |
- * | 5              | uriBytes      | byte[N]   | N            | UTF-8 encoded bytes of the URI string               |
- * | 5 + N          | offset        | long      | 8            | Starting offset of the Blob within the URI resource |
- * | 13 + N         | length        | long      | 8            | Length of the Blob data                             |
+ * | Offset | Field Name    | Type      | Size |
+ * |--------|---------------|-----------|------|
+ * | 0      | version       | byte      | 1    |
+ * | 1      | magicNumber   | long      | 8    |
+ * | 9      | uriLength     | int       | 4    |
+ * | 13     | uriBytes      | byte[N]   | N    |
+ * | 13 + N | offset        | long      | 8    |
+ * | 21 + N | length        | long      | 8    |
  * </pre>
  */
 public class BlobDescriptor implements Serializable {
 
     private static final long serialVersionUID = 1L;
-
-    private static final byte CURRENT_VERSION = 1;
+    private static final long MAGIC = 0x424C4F4244455343L; // "BLOBDESC"
+    private static final byte CURRENT_VERSION = 2;
 
     private final byte version;
     private final String uri;
@@ -98,7 +99,6 @@ public class BlobDescriptor implements Serializable {
         return "BlobDescriptor{"
                 + "version="
                 + version
-                + '\''
                 + ", uri='"
                 + uri
                 + '\''
@@ -113,11 +113,12 @@ public class BlobDescriptor implements Serializable {
         byte[] uriBytes = uri.getBytes(UTF_8);
         int uriLength = uriBytes.length;
 
-        int totalSize = 1 + 4 + uriLength + 8 + 8;
+        int totalSize = 1 + 8 + 4 + uriLength + 8 + 8;
         ByteBuffer buffer = ByteBuffer.allocate(totalSize);
         buffer.order(ByteOrder.LITTLE_ENDIAN);
 
-        buffer.put(version);
+        buffer.put(CURRENT_VERSION);
+        buffer.putLong(MAGIC);
         buffer.putInt(uriLength);
         buffer.put(uriBytes);
 
@@ -128,19 +129,50 @@ public class BlobDescriptor implements Serializable {
     }
 
     public static BlobDescriptor deserialize(byte[] bytes) {
+        if (bytes == null || bytes.length < Byte.BYTES) {
+            throw invalidPayload("too short");
+        }
+        if (VideoFrameDescriptor.isVideoFrameDescriptor(bytes)) {
+            return VideoFrameDescriptor.deserialize(bytes);
+        }
+
         ByteBuffer buffer = ByteBuffer.wrap(bytes);
         buffer.order(ByteOrder.LITTLE_ENDIAN);
 
         byte version = buffer.get();
-        if (version != CURRENT_VERSION) {
+        if (version > CURRENT_VERSION) {
             throw new UnsupportedOperationException(
-                    "Expecting BlobDescriptor version to be "
+                    "Expecting BlobDescriptor version to be less than or equal to "
                             + CURRENT_VERSION
                             + ", but found "
                             + version
                             + ".");
         }
+
+        if (version > 1) {
+            checkRemaining(buffer, Long.BYTES, "too short");
+            long magic = buffer.getLong();
+            if (MAGIC != magic) {
+                throw new IllegalArgumentException(
+                        "Invalid BlobDescriptor: missing magic header. Expected magic: "
+                                + MAGIC
+                                + ", but found: "
+                                + magic);
+            }
+        }
+
+        checkRemaining(buffer, Integer.BYTES, "too short");
         int uriLength = buffer.getInt();
+        if (uriLength < 0) {
+            throw invalidPayload("negative URI length: " + uriLength);
+        }
+        if (uriLength > buffer.remaining()) {
+            throw invalidPayload("URI length exceeds data size");
+        }
+        if (buffer.remaining() - uriLength < Long.BYTES + Long.BYTES) {
+            throw invalidPayload("missing offset/length");
+        }
+
         byte[] uriBytes = new byte[uriLength];
         buffer.get(uriBytes);
         String uri = new String(uriBytes, StandardCharsets.UTF_8);
@@ -148,5 +180,37 @@ public class BlobDescriptor implements Serializable {
         long offset = buffer.getLong();
         long length = buffer.getLong();
         return new BlobDescriptor(version, uri, offset, length);
+    }
+
+    private static void checkRemaining(ByteBuffer buffer, int length, String message) {
+        if (buffer.remaining() < length) {
+            throw invalidPayload(message);
+        }
+    }
+
+    private static IllegalArgumentException invalidPayload(String message) {
+        return new IllegalArgumentException("Invalid BlobDescriptor data: " + message);
+    }
+
+    public static boolean isBlobDescriptor(byte[] bytes) {
+        if (bytes == null) {
+            return false;
+        }
+        if (bytes.length < 9) {
+            return false;
+        }
+        ByteBuffer buffer = ByteBuffer.wrap(bytes);
+        buffer.order(ByteOrder.LITTLE_ENDIAN);
+
+        byte version = buffer.get();
+        if (version > CURRENT_VERSION) {
+            return false;
+        }
+        return MAGIC == buffer.getLong();
+    }
+
+    /** Returns whether the bytes encode any descriptor type understood by this version. */
+    public static boolean isSerializedDescriptor(byte[] bytes) {
+        return isBlobDescriptor(bytes) || VideoFrameDescriptor.isVideoFrameDescriptor(bytes);
     }
 }

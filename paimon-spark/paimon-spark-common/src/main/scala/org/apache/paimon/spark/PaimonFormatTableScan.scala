@@ -20,9 +20,17 @@ package org.apache.paimon.spark
 
 import org.apache.paimon.partition.PartitionPredicate
 import org.apache.paimon.predicate.Predicate
+import org.apache.paimon.spark.read.{BaseScan, PaimonStatistics, PaimonSupportsRuntimeFiltering}
 import org.apache.paimon.table.FormatTable
+import org.apache.paimon.table.format.FormatTableScan
+import org.apache.paimon.table.source.Split
 
+import org.apache.spark.sql.connector.read.Statistics
 import org.apache.spark.sql.types.StructType
+
+import java.util.OptionalLong
+
+import scala.collection.JavaConverters._
 
 /** Scan implementation for [[FormatTable]] */
 case class PaimonFormatTableScan(
@@ -31,4 +39,23 @@ case class PaimonFormatTableScan(
     pushedPartitionFilters: Seq[PartitionPredicate],
     pushedDataFilters: Seq[Predicate],
     override val pushedLimit: Option[Int])
-  extends PaimonFormatTableBaseScan {}
+  extends BaseScan
+  with PaimonSupportsRuntimeFiltering {
+
+  @volatile private var plannedRowCount: OptionalLong = OptionalLong.empty()
+
+  protected def getInputSplits: Array[Split] = {
+    val plan = readBuilder.newScan().plan()
+    val splits = plan.splits().asScala.toArray
+    plannedRowCount = plan match {
+      case formatPlan: FormatTableScan.Plan => formatPlan.rowCount()
+      case _ => OptionalLong.empty()
+    }
+    splits
+  }
+
+  override def estimateStatistics: Statistics = {
+    val splits = inputSplits
+    PaimonStatistics(splits, readTableRowType, table.rowType(), table.statistics(), plannedRowCount)
+  }
+}

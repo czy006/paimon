@@ -1,25 +1,26 @@
-"""
-Licensed to the Apache Software Foundation (ASF) under one
-or more contributor license agreements.  See the NOTICE file
-distributed with this work for additional information
-regarding copyright ownership.  The ASF licenses this file
-to you under the Apache License, Version 2.0 (the
-"License"); you may not use this file except in compliance
-with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+from datetime import timedelta
 from enum import Enum
 from typing import Any, Type
 
 from pypaimon.common.memory_size import MemorySize
+from pypaimon.common.time_utils import parse_duration
 
 
 class OptionsUtils:
@@ -63,12 +64,16 @@ class OptionsUtils:
             return OptionsUtils.convert_to_double(value)
         elif target_type == MemorySize:
             return OptionsUtils.convert_to_memory_size(value)
+        elif target_type == timedelta:
+            return OptionsUtils.convert_to_duration(value)
         else:
             raise ValueError(f"Unsupported type: {target_type}")
 
     @staticmethod
     def convert_to_string(value: Any) -> str:
         """Convert value to string."""
+        if isinstance(value, Enum):
+            return str(value.value)
         return str(value)
 
     @staticmethod
@@ -124,6 +129,15 @@ class OptionsUtils:
         if isinstance(value, str):
             return MemorySize.parse(value)
         raise ValueError(f"Cannot convert {type(value)} to MemorySize")
+
+    @staticmethod
+    def convert_to_duration(value: Any) -> timedelta:
+        if isinstance(value, timedelta):
+            return value
+        if isinstance(value, str):
+            milliseconds = parse_duration(value)
+            return timedelta(milliseconds=milliseconds)
+        raise ValueError(f"Cannot convert {type(value)} to timedelta")
 
     @staticmethod
     def convert_to_enum(value: Any, enum_class: Type[Enum]) -> Enum:

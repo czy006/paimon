@@ -1,20 +1,19 @@
-################################################################################
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-# limitations under the License.
-################################################################################
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
 import logging
 import uuid
@@ -23,67 +22,81 @@ from typing import Optional, Tuple, Dict
 
 from pypaimon.common.options.core_options import CoreOptions
 from pypaimon.data.timestamp import Timestamp
+from pypaimon.table.row.blob import (
+    BlobConsumer,
+    video_payload_descriptor,
+)
 from pypaimon.write.writer.append_only_data_writer import AppendOnlyDataWriter
 from pypaimon.write.writer.blob_file_writer import BlobFileWriter
+from pypaimon.write.writer.video_group import VideoGroupRollingPolicy
 
 logger = logging.getLogger(__name__)
-
-CHECK_ROLLING_RECORD_CNT = 1000
 
 
 class BlobWriter(AppendOnlyDataWriter):
 
     def __init__(self, table, partition: Tuple, bucket: int, max_seq_number: int, blob_column: str,
-                 options: Dict[str, str] = None):
+                 options: Dict[str, str] = None, blob_consumer: Optional[BlobConsumer] = None,
+                 video: bool = False, uri_reader_factory=None):
         super().__init__(table, partition, bucket, max_seq_number,
                          options, write_cols=[blob_column])
 
-        # Override file format to "blob"
-        self.file_format = CoreOptions.FILE_FORMAT_BLOB
+        self.video = video
+        if video and blob_consumer is not None:
+            raise ValueError(
+                f"BlobConsumer is not supported for video frame field '{blob_column}'."
+            )
+        self.file_format = (
+            CoreOptions.FILE_FORMAT_VIDEO
+            if video
+            else CoreOptions.FILE_FORMAT_BLOB
+        )
 
         # Store blob column name for use in metadata creation
         self.blob_column = blob_column
 
         options = self.table.options
         self.blob_target_file_size = CoreOptions.blob_target_file_size(options)
+        # Use the effective options (constructor-provided), consistent with the other accessors.
+        self.blob_copy_buffer_size = self.options.blob_copy_buffer_size()
 
+        self._blob_consumer = blob_consumer
+        self._uri_reader_factory = uri_reader_factory
         self.current_writer: Optional[BlobFileWriter] = None
         self.current_file_path: Optional[str] = None
         self.record_count = 0
 
         self.file_uuid = str(uuid.uuid4())
         self.file_count = 0
+        self._video_group_policy = VideoGroupRollingPolicy() if video else None
 
         logger.info(f"Initialized BlobWriter with blob file format, blob_target_file_size={self.blob_target_file_size}")
 
     def _check_and_roll_if_needed(self):
-        if self.pending_data is None:
+        # Rolling here is driven by the size of the external blobs, which the
+        # buffered descriptors say nothing about, so there is no cheap count to
+        # check first: every write drains the buffer.
+        pending = self._buffer.take()
+        if pending is None:
             return
 
-        if self.blob_as_descriptor:
-            # blob-as-descriptor=true: Write row by row and check actual file size
-            for i in range(self.pending_data.num_rows):
-                row_data = self.pending_data.slice(i, 1)
-                self._write_row_to_file(row_data)
-                self.record_count += 1
+        # Always write blob rows one-by-one so rolling uses actual blob bytes size rather than
+        # in-memory serialized descriptor size.
+        for i in range(pending.num_rows):
+            row_data = pending.slice(i, 1)
+            next_group = video_payload_descriptor(row_data.column(0)[0])
+            self._roll_before_video_group(next_group)
+            self._write_row_to_file(row_data)
+            self.record_count += 1
+            if self._video_group_policy is not None:
+                self._video_group_policy.record(next_group)
 
-                if self.rolling_file(False):
+            if self.rolling_file():
+                if (
+                    self._video_group_policy is None
+                    or not self._video_group_policy.defer_roll()
+                ):
                     self.close_current_writer()
-
-            # All data has been written
-            self.pending_data = None
-        else:
-            # blob-as-descriptor=false: Use blob_target_file_size instead of target_file_size
-            current_size = self.pending_data.nbytes
-            if current_size > self.blob_target_file_size:
-                split_row = self._find_optimal_split_point(self.pending_data, self.blob_target_file_size)
-                if split_row > 0:
-                    data_to_write = self.pending_data.slice(0, split_row)
-                    remaining_data = self.pending_data.slice(split_row)
-
-                    self._write_data_to_file(data_to_write)
-                    self.pending_data = remaining_data
-                    self._check_and_roll_if_needed()
 
     def _write_row_to_file(self, row_data: pa.Table):
         """Write a single row to the current blob file. Opens a new file if needed."""
@@ -97,20 +110,59 @@ class BlobWriter(AppendOnlyDataWriter):
         # This ensures each row has a unique sequence number for data versioning and consistency
         self.sequence_generator.next()
 
+    def write_blob(self, value, arrow_type=pa.large_binary()):
+        next_group = video_payload_descriptor(value)
+        self._roll_before_video_group(next_group)
+        if self.current_writer is None:
+            self.open_current_writer()
+
+        self.current_writer.write_blob(self.blob_column, arrow_type, value)
+        self.sequence_generator.next()
+        self.record_count += 1
+        if self._video_group_policy is not None:
+            self._video_group_policy.record(next_group)
+
+        if self.rolling_file():
+            if (
+                self._video_group_policy is None
+                or not self._video_group_policy.defer_roll()
+            ):
+                self.close_current_writer()
+
     def open_current_writer(self):
         file_name = (f"{CoreOptions.data_file_prefix(self.options)}"
                      f"{self.file_uuid}-{self.file_count}.{self.file_format}")
         self.file_count += 1  # Increment counter for next file
         file_path = self._generate_file_path(file_name)
         self.current_file_path = file_path
-        self.current_writer = BlobFileWriter(self.file_io, file_path, self.blob_as_descriptor)
+        self.current_writer = BlobFileWriter(
+            self.file_io,
+            file_path,
+            blob_consumer=self._blob_consumer,
+            copy_buffer_size=self.blob_copy_buffer_size,
+            video=self.video,
+            uri_reader_factory=self._uri_reader_factory,
+        )
 
-    def rolling_file(self, force_check: bool = False) -> bool:
+    def rolling_file(self) -> bool:
         if self.current_writer is None:
             return False
 
-        should_check = force_check or (self.record_count % CHECK_ROLLING_RECORD_CNT == 0)
-        return self.current_writer.reach_target_size(should_check, self.blob_target_file_size)
+        return (
+            self.current_writer.row_count >= self.target_file_row_num
+            or self.current_writer.reach_target_size(self.blob_target_file_size)
+        )
+
+    def should_roll_before_group(self, row_count: int) -> bool:
+        return (
+            self._video_group_policy is not None
+            and self.current_writer is not None
+            and (
+                self._video_group_policy.pending_roll
+                or self.current_writer.row_count + row_count
+                > self.target_file_row_num
+            )
+        )
 
     def close_current_writer(self):
         """Close current writer and create metadata."""
@@ -129,11 +181,21 @@ class BlobWriter(AppendOnlyDataWriter):
 
         self.current_writer = None
         self.current_file_path = None
+        if self._video_group_policy is not None:
+            self._video_group_policy.reset()
+
+    def _roll_before_video_group(self, next_group):
+        if (
+            self._video_group_policy is not None
+            and self.current_writer is not None
+            and self._video_group_policy.should_roll_before(next_group)
+        ):
+            self.close_current_writer()
 
     def _write_data_to_file(self, data):
         """
-        Override for blob format in normal mode (blob-as-descriptor=false).
-        Only difference from parent: use shared UUID + counter for file naming.
+        Keep a fallback path for direct blob table writes while preserving the writer uuid+counter
+        naming behavior.
         """
         if data.num_rows == 0:
             return
@@ -146,8 +208,7 @@ class BlobWriter(AppendOnlyDataWriter):
         self.file_count += 1
         file_path = self._generate_file_path(file_name)
 
-        # Write blob file (parent class already supports blob format)
-        self.file_io.write_blob(file_path, data, self.blob_as_descriptor)
+        self.file_io.write_blob(file_path, data)
 
         file_size = self.file_io.get_file_size(file_path)
 
@@ -182,7 +243,7 @@ class BlobWriter(AppendOnlyDataWriter):
         else:
             # row_count only (from BlobFileWriter)
             row_count = data_or_row_count
-            data_fields = [PyarrowFieldParser.to_paimon_schema(pa.schema([(self.blob_column, pa.large_binary())]))[0]]
+            data_fields = [self.table.field_dict[self.blob_column]]
             min_value_stats = [None]
             max_value_stats = [None]
             value_null_counts = [0]
@@ -218,22 +279,25 @@ class BlobWriter(AppendOnlyDataWriter):
         ))
 
     def prepare_commit(self):
-        """Prepare commit, ensuring all data is written."""
-        # Close current file if open (blob-as-descriptor=true mode)
+        """Prepare commit, preserving blob files in write/rolling order."""
+        # Close current file if open.
         if self.current_writer is not None:
             self.close_current_writer()
 
-        # Call parent to handle pending_data (blob-as-descriptor=false mode)
+        # Call parent to flush anything left in the buffer.
         return super().prepare_commit()
 
     def close(self):
         """Close current writer if open."""
-        # Close current file if open (blob-as-descriptor=true mode)
+        # Close current file if open.
         if self.current_writer is not None:
             self.close_current_writer()
 
-        # Call parent to handle pending_data (blob-as-descriptor=false mode)
+        # Call parent to flush anything left in the buffer.
         super().close()
+
+    def delete_file_upon_abort(self) -> bool:
+        return self._blob_consumer is None
 
     def abort(self):
         if self.current_writer is not None:
@@ -243,7 +307,13 @@ class BlobWriter(AppendOnlyDataWriter):
                 logger.warning(f"Error aborting blob writer: {e}", exc_info=e)
             self.current_writer = None
             self.current_file_path = None
-        super().abort()
+        if self._video_group_policy is not None:
+            self._video_group_policy.reset()
+        if not self.delete_file_upon_abort():
+            self._buffer.reset()
+            self.committed_files.clear()
+        else:
+            super().abort()
 
     @staticmethod
     def _get_column_stats(data_or_batch, column_name: str):

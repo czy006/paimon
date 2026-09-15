@@ -18,15 +18,17 @@
 
 package org.apache.paimon.spark.data
 
-import org.apache.paimon.types.{DataTypeRoot, RowType}
+import org.apache.paimon.types.RowType
 
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.paimon.shims.SparkShimLoader
 
-import java.util.OptionalInt
+import scala.collection.JavaConverters._
 
 abstract class SparkInternalRow extends InternalRow {
   def replace(row: org.apache.paimon.data.InternalRow): SparkInternalRow
+
+  def withBlobAsDescriptor(blobAsDescriptor: Boolean): SparkInternalRow
 }
 
 object SparkInternalRow {
@@ -36,26 +38,15 @@ object SparkInternalRow {
   }
 
   def create(rowType: RowType, blobAsDescriptor: Boolean): SparkInternalRow = {
-    val fieldIndex = blobFieldIndex(rowType)
-    if (fieldIndex.isPresent) {
+    val blobFieldIndices = rowType.getBlobFieldIndices
+    if (blobFieldIndices.isEmpty) {
+      SparkShimLoader.shim.createSparkInternalRow(rowType).withBlobAsDescriptor(blobAsDescriptor)
+    } else {
       SparkShimLoader.shim.createSparkInternalRowWithBlob(
         rowType,
-        fieldIndex.getAsInt,
+        blobFieldIndices.asScala.map(_.intValue()).toSet,
         blobAsDescriptor)
-    } else {
-      SparkShimLoader.shim.createSparkInternalRow(rowType)
     }
-  }
-
-  private def blobFieldIndex(rowType: RowType): OptionalInt = {
-    var i: Int = 0
-    while (i < rowType.getFieldCount) {
-      if (rowType.getTypeAt(i).getTypeRoot.equals(DataTypeRoot.BLOB)) {
-        return OptionalInt.of(i)
-      }
-      i += 1
-    }
-    OptionalInt.empty()
   }
 
 }

@@ -51,6 +51,7 @@ import org.apache.paimon.utils.DecimalUtils;
 
 import org.junit.jupiter.api.Test;
 
+import java.time.LocalDateTime;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -643,6 +644,15 @@ public class CastExecutorTest {
         assertThat(valueArray.getInt(0)).isEqualTo(42);
         assertThat(keyArray.getString(1).toString()).isEqualTo("key1");
         assertThat(valueArray.isNullAt(1)).isTrue();
+
+        result = stringToMap.cast(BinaryString.fromString("MAP(key1, null, key2, 42)"));
+        assertThat(result.size()).isEqualTo(2);
+        keyArray = result.keyArray();
+        valueArray = result.valueArray();
+        assertThat(keyArray.getString(0).toString()).isEqualTo("key2");
+        assertThat(valueArray.getInt(0)).isEqualTo(42);
+        assertThat(keyArray.getString(1).toString()).isEqualTo("key1");
+        assertThat(valueArray.isNullAt(1)).isTrue();
     }
 
     @Test
@@ -818,6 +828,72 @@ public class CastExecutorTest {
     }
 
     @Test
+    public void testTimestampToDatePreEpoch() {
+        CastExecutor<?, ?> cast = CastExecutors.resolve(new TimestampType(6), new DateType());
+        LocalDateTime[] timestamps = {
+            LocalDateTime.of(1969, 12, 31, 23, 59, 59),
+            LocalDateTime.of(1960, 6, 15, 10, 30),
+            LocalDateTime.of(1969, 12, 31, 0, 0),
+            LocalDateTime.of(2024, 3, 4, 5, 6, 7)
+        };
+
+        for (LocalDateTime timestamp : timestamps) {
+            compareCastResult(
+                    cast,
+                    Timestamp.fromLocalDateTime(timestamp),
+                    (int) timestamp.toLocalDate().toEpochDay());
+        }
+    }
+
+    @Test
+    public void testTimestampToTimePreEpoch() {
+        CastExecutor<?, ?> cast = CastExecutors.resolve(new TimestampType(3), new TimeType(3));
+
+        // pre-epoch 1969-12-31 23:00:00 -> time-of-day 23:00:00 == 82_800_000 ms
+        compareCastResult(
+                cast,
+                Timestamp.fromLocalDateTime(LocalDateTime.of(1969, 12, 31, 23, 0, 0)),
+                82800000);
+
+        // pre-epoch 1969-12-31 12:34:56.789 -> 12*3600000 + 34*60000 + 56*1000 + 789
+        compareCastResult(
+                cast,
+                Timestamp.fromLocalDateTime(LocalDateTime.of(1969, 12, 31, 12, 34, 56, 789000000)),
+                45296789);
+
+        // post-epoch 1970-01-01 10:00:00 -> 36_000_000 ms (unchanged behavior)
+        compareCastResult(
+                cast,
+                Timestamp.fromLocalDateTime(LocalDateTime.of(1970, 1, 1, 10, 0, 0)),
+                36000000);
+    }
+
+    @Test
+    public void testTimestampToNumericPreEpoch() {
+        CastExecutor<?, ?> cast =
+                CastExecutors.resolve(new TimestampType(3), new BigIntType(false));
+
+        // pre-epoch 1969-12-31 23:59:58.500 is -1500 millis, whose epoch second is -2
+        compareCastResult(cast, Timestamp.fromEpochMillis(-1500), -2L);
+        compareCastResult(cast, Timestamp.fromEpochMillis(-1000), -1L);
+
+        // post-epoch 1970-01-01 00:00:01.500 -> 1 (unchanged behavior)
+        compareCastResult(cast, Timestamp.fromEpochMillis(1500), 1L);
+    }
+
+    @Test
+    public void testTimestampToTimestampPreEpoch() {
+        CastExecutor<?, ?> cast = CastExecutors.resolve(new TimestampType(6), new TimestampType(0));
+
+        // narrowing 1969-12-31 23:59:59.999999 must drop the fraction, not cross the epoch
+        compareCastResult(
+                cast,
+                Timestamp.fromLocalDateTime(
+                        LocalDateTime.of(1969, 12, 31, 23, 59, 59, 999_999_000)),
+                Timestamp.fromLocalDateTime(LocalDateTime.of(1969, 12, 31, 23, 59, 59)));
+    }
+
+    @Test
     public void testDateToTimestamp() {
         String date = "2023-06-06";
         compareCastResult(
@@ -900,10 +976,204 @@ public class CastExecutorTest {
     }
 
     @Test
+    public void testStringToArrayQuotingAndEscaping() {
+        ArrayType arrayType = new ArrayType(DataTypes.STRING());
+        CastExecutor<BinaryString, InternalArray> cast =
+                (CastExecutor<BinaryString, InternalArray>)
+                        CastExecutors.resolve(VarCharType.STRING_TYPE, arrayType);
+
+        // quotes group a token across the separator and do not survive into the value
+        compareCastResult(
+                cast,
+                BinaryString.fromString("[\"a,b\", c]"),
+                new GenericArray(
+                        new Object[] {
+                            BinaryString.fromString("a,b"), BinaryString.fromString("c")
+                        }));
+
+        // quoting is how an empty string is written, so the element must be kept
+        compareCastResult(
+                cast,
+                BinaryString.fromString("[\"\", a]"),
+                new GenericArray(
+                        new Object[] {BinaryString.fromString(""), BinaryString.fromString("a")}));
+
+        // an unquoted null is the null element; a quoted one is the four-character string
+        compareCastResult(
+                cast,
+                BinaryString.fromString("[null, \"null\"]"),
+                new GenericArray(new Object[] {null, BinaryString.fromString("null")}));
+
+        // a backslash escapes the next character and is itself syntax
+        compareCastResult(
+                cast,
+                BinaryString.fromString("[a\\,b, c]"),
+                new GenericArray(
+                        new Object[] {
+                            BinaryString.fromString("a,b"), BinaryString.fromString("c")
+                        }));
+    }
+
+    @Test
+    public void testStringToRowQuotingAndEscaping() {
+        RowType rowType =
+                DataTypes.ROW(
+                        DataTypes.FIELD(0, "f0", DataTypes.STRING()),
+                        DataTypes.FIELD(1, "f1", DataTypes.INT()));
+        CastExecutor<BinaryString, InternalRow> cast =
+                (CastExecutor<BinaryString, InternalRow>)
+                        CastExecutors.resolve(VarCharType.STRING_TYPE, rowType);
+
+        compareCastResult(
+                cast,
+                BinaryString.fromString("{\"a,b\", 2}"),
+                GenericRow.of(BinaryString.fromString("a,b"), 2));
+
+        // an empty quoted field stays a field, so the field count still matches
+        compareCastResult(
+                cast,
+                BinaryString.fromString("{\"\", 2}"),
+                GenericRow.of(BinaryString.fromString(""), 2));
+
+        // a quoted null is the string, an unquoted one is SQL NULL
+        compareCastResult(
+                cast,
+                BinaryString.fromString("{\"null\", 2}"),
+                GenericRow.of(BinaryString.fromString("null"), 2));
+        compareCastResult(cast, BinaryString.fromString("{null, 2}"), GenericRow.of(null, 2));
+
+        compareCastResult(
+                cast,
+                BinaryString.fromString("{a\\,b, 2}"),
+                GenericRow.of(BinaryString.fromString("a,b"), 2));
+    }
+
+    @Test
+    public void testStringToNestedArrayKeepsInnerSyntax() {
+        // quotes and escapes belong to whichever level wrote them: the outer split must leave a
+        // nested literal's own syntax in place for the element rule to parse again, or the inner
+        // separator stops being protected and the element count changes
+        ArrayType nested = new ArrayType(new ArrayType(DataTypes.STRING()));
+        CastExecutor<BinaryString, InternalArray> cast =
+                (CastExecutor<BinaryString, InternalArray>)
+                        CastExecutors.resolve(VarCharType.STRING_TYPE, nested);
+
+        assertNestedElements(cast, "[[\"a,b\"], [c]]", new String[] {"a,b"}, new String[] {"c"});
+        assertNestedElements(cast, "[[a\\,b], [c]]", new String[] {"a,b"}, new String[] {"c"});
+        assertNestedElements(cast, "[[\"null\"], [a]]", new String[] {"null"}, new String[] {"a"});
+        assertNestedElements(cast, "[[\"\"], [a]]", new String[] {""}, new String[] {"a"});
+        assertNestedElements(cast, "[[\" a \"], [b]]", new String[] {" a "}, new String[] {"b"});
+        assertNestedElements(cast, "[[1, 2], [3]]", new String[] {"1", "2"}, new String[] {"3"});
+    }
+
+    private static void assertNestedElements(
+            CastExecutor<BinaryString, InternalArray> cast, String literal, String[]... expected) {
+        InternalArray outer = cast.cast(BinaryString.fromString(literal));
+        assertThat(outer.size()).as("outer size of %s", literal).isEqualTo(expected.length);
+        for (int i = 0; i < expected.length; i++) {
+            InternalArray inner = outer.getArray(i);
+            assertThat(inner.size())
+                    .as("inner size of %s at %s", literal, i)
+                    .isEqualTo(expected[i].length);
+            for (int j = 0; j < expected[i].length; j++) {
+                assertThat(inner.getString(j).toString())
+                        .as("element %s.%s of %s", i, j, literal)
+                        .isEqualTo(expected[i][j]);
+            }
+        }
+    }
+
+    @Test
+    public void testStringToArrayEscapedNullIsALiteral() {
+        ArrayType arrayType = new ArrayType(DataTypes.STRING());
+        CastExecutor<BinaryString, InternalArray> cast =
+                (CastExecutor<BinaryString, InternalArray>)
+                        CastExecutors.resolve(VarCharType.STRING_TYPE, arrayType);
+
+        // escaping, like quoting, says the token is written text rather than the null literal
+        compareCastResult(
+                cast,
+                BinaryString.fromString("[\\null, x]"),
+                new GenericArray(
+                        new Object[] {
+                            BinaryString.fromString("null"), BinaryString.fromString("x")
+                        }));
+    }
+
+    @Test
+    public void testStringToRowWhitespaceOnlyFieldIsNotAField() {
+        RowType rowType =
+                DataTypes.ROW(
+                        DataTypes.FIELD(0, "f0", DataTypes.STRING()),
+                        DataTypes.FIELD(1, "f1", DataTypes.STRING()),
+                        DataTypes.FIELD(2, "f2", DataTypes.STRING()));
+        CastExecutor<BinaryString, InternalRow> cast =
+                (CastExecutor<BinaryString, InternalRow>)
+                        CastExecutors.resolve(VarCharType.STRING_TYPE, rowType);
+
+        // whitespace is not part of a token, so a field made only of whitespace was never
+        // written, and where it sits does not change that
+        for (String literal : new String[] {"{a,  ,b}", "{ ,a,b}", "{a,b, }"}) {
+            assertThatThrownBy(() -> cast.cast(BinaryString.fromString(literal)))
+                    .as("%s", literal)
+                    .hasMessageContaining("Row field count mismatch. Expected: 3, Actual: 2");
+        }
+
+        // quoting is how an empty field is written
+        compareCastResult(
+                cast,
+                BinaryString.fromString("{a, \"\", b}"),
+                GenericRow.of(
+                        BinaryString.fromString("a"),
+                        BinaryString.fromString(""),
+                        BinaryString.fromString("b")));
+    }
+
+    @Test
+    public void testStringToArraySkipsAnEmptyElement() {
+        ArrayType arrayType = new ArrayType(DataTypes.INT());
+        CastExecutor<BinaryString, InternalArray> cast =
+                (CastExecutor<BinaryString, InternalArray>)
+                        CastExecutors.resolve(VarCharType.STRING_TYPE, arrayType);
+
+        // an element written as nothing, with or without whitespace, is no element: handing the
+        // empty string to the int cast instead would fail the whole array
+        compareCastResult(
+                cast, BinaryString.fromString("[1,,3]"), new GenericArray(new Integer[] {1, 3}));
+        compareCastResult(
+                cast, BinaryString.fromString("[1, , 3]"), new GenericArray(new Integer[] {1, 3}));
+    }
+
+    @Test
     public void testSplitMapEntriesWithQuotes() {
         String content = "1, \"abc\"";
         List<String> result = StringToMapCastRule.INSTANCE.splitMapEntries(content);
         assertThat(result).containsExactly("1", "abc");
+    }
+
+    @Test
+    public void testSplitMapEntriesWithEscapes() {
+        // the escaped separator must survive as a literal instead of vanishing
+        assertThat(StringToMapCastRule.INSTANCE.splitMapEntries("a\\,b, c"))
+                .containsExactly("a,b", "c");
+        // an escaped backslash yields one literal backslash
+        assertThat(StringToMapCastRule.INSTANCE.splitMapEntries("x\\\\y, z"))
+                .containsExactly("x\\y", "z");
+        // an escaped quote is a literal and does not toggle quote state
+        assertThat(StringToMapCastRule.INSTANCE.splitMapEntries("\"q\\\"z, w\""))
+                .containsExactly("q\"z, w");
+    }
+
+    @Test
+    public void testStringToMapPreservesEscapedCharacters() {
+        Map<Object, Object> expected = new HashMap<>();
+        expected.put(BinaryString.fromString("a,b"), BinaryString.fromString("v\\1"));
+        compareCastResult(
+                CastExecutors.resolve(
+                        VarCharType.STRING_TYPE,
+                        new MapType(DataTypes.STRING(), DataTypes.STRING())),
+                BinaryString.fromString("{a\\,b -> v\\\\1}"),
+                new GenericMap(expected));
     }
 
     @SuppressWarnings("rawtypes")

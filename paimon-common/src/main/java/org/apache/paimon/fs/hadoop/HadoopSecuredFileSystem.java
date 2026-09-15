@@ -21,6 +21,7 @@ package org.apache.paimon.fs.hadoop;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.security.HadoopModule;
 import org.apache.paimon.security.SecurityConfiguration;
+import org.apache.paimon.utils.StringUtils;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
@@ -195,11 +196,34 @@ public class HadoopSecuredFileSystem extends FileSystem {
         }
     }
 
+    /**
+     * The underlying {@link FileSystem} this secured wrapper delegates to. Callers that reach past
+     * the wrapper for a method it cannot override, such as {@link FileSystem}'s protected
+     * three-argument {@code rename}, have to run the call through {@link #callAsLoginUser} so it
+     * still happens as the login user.
+     */
+    public FileSystem unwrap() {
+        return fileSystem;
+    }
+
+    /** Runs the callable as the login user, like every delegating method here does. */
+    public <T> T callAsLoginUser(Callable<T> callable) throws IOException {
+        return runSecuredWithIOException(callable);
+    }
+
     public static FileSystem trySecureFileSystem(
             FileSystem fileSystem, Options options, Configuration configuration)
             throws IOException {
         SecurityConfiguration config = new SecurityConfiguration(options);
         if (config.isLegal()) {
+            if (StringUtils.isNullOrWhitespaceOnly(config.getKeytab())
+                    && StringUtils.isNullOrWhitespaceOnly(config.getPrincipal())) {
+                LOG.info(
+                        "No paimon Kerberos credentials configured "
+                                + "(security.kerberos.login.keytab/principal); "
+                                + "skip HadoopModule.install() to preserve externally-established UGI.");
+                return fileSystem;
+            }
             LOG.info("Hadoop security configuration is legal, use the secured FileSystem.");
             HadoopModule module = new HadoopModule(config, configuration);
             module.install();

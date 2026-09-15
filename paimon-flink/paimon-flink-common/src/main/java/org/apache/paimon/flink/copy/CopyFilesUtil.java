@@ -30,6 +30,7 @@ import org.apache.paimon.manifest.IndexManifestEntry;
 import org.apache.paimon.manifest.ManifestFileMeta;
 import org.apache.paimon.manifest.ManifestList;
 import org.apache.paimon.manifest.SimpleFileEntry;
+import org.apache.paimon.schema.FileSystemSchemaManager;
 import org.apache.paimon.schema.SchemaManager;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.Table;
@@ -71,7 +72,7 @@ public class CopyFilesUtil {
         FileStore<?> store = table.store();
         SnapshotManager snapshotManager = store.snapshotManager();
         Snapshot snapshot = snapshotManager.tryGetSnapshot(snapshotId);
-        SchemaManager schemaManager = new SchemaManager(table.fileIO(), table.location());
+        SchemaManager schemaManager = new FileSystemSchemaManager(table.fileIO(), table.location());
         IndexFileHandler indexFileHandler = store.newIndexFileHandler();
         List<Path> fileList = new ArrayList<>();
         if (snapshot != null) {
@@ -248,7 +249,7 @@ public class CopyFilesUtil {
             Path relativePath = getPathExcludeTableRoot(file, sourceTableRoot);
             result.add(
                     new CopyFileInfo(
-                            file.toUri().toString(),
+                            file.toString(),
                             relativePath.toString(),
                             sourceIdentifier,
                             targetIdentifier));
@@ -257,7 +258,7 @@ public class CopyFilesUtil {
     }
 
     public static Path getPathExcludeTableRoot(Path absolutePath, Path sourceTableRoot) {
-        String fileAbsolutePath = absolutePath.toUri().toString();
+        String fileAbsolutePath = absolutePath.toString();
         String sourceTableRootPath = sourceTableRoot.toString();
 
         Preconditions.checkState(

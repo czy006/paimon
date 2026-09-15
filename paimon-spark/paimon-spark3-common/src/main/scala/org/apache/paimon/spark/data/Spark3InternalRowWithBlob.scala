@@ -18,20 +18,27 @@
 
 package org.apache.paimon.spark.data
 
+import org.apache.paimon.data.{Blob, BlobView}
 import org.apache.paimon.types.RowType
 import org.apache.paimon.utils.InternalRowUtils.copyInternalRow
 
 import org.apache.spark.sql.catalyst.InternalRow
 
-class Spark3InternalRowWithBlob(rowType: RowType, blobFieldIndex: Int, blobAsDescriptor: Boolean)
+class Spark3InternalRowWithBlob(rowType: RowType, blobFields: Set[Int], blobAsDescriptor: Boolean)
   extends Spark3InternalRow(rowType) {
 
+  withBlobAsDescriptor(blobAsDescriptor)
+
   override def getBinary(ordinal: Int): Array[Byte] = {
-    if (ordinal == blobFieldIndex) {
-      if (blobAsDescriptor) {
-        row.getBlob(ordinal).toDescriptor.serialize()
-      } else {
-        row.getBlob(ordinal).toData
+    if (blobFields.contains(ordinal)) {
+      val blob = row.getBlob(ordinal)
+      blob match {
+        case blobView: BlobView if !blobView.isResolved =>
+          Blob.serializeBlob(blobView)
+        case _ if blobAsDescriptor =>
+          blob.toDescriptor.serialize()
+        case _ =>
+          blob.toData
       }
     } else {
       super.getBinary(ordinal)

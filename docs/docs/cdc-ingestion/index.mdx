@@ -1,0 +1,108 @@
+---
+title: "CDC Ingestion"
+sidebar_position: 91
+---
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# Overview
+
+Use Paimon CDC actions to ingest database changes or change events from a message queue into
+Paimon tables. The actions create target tables and apply supported schema changes while the
+Flink job is running.
+
+## Choose an Ingestion Path
+
+| Source | Synchronize into one Paimon table | Synchronize into a Paimon database |
+| --- | --- | --- |
+| [MySQL](./mysql-cdc) | One source table, or merge multiple tables and shards | Synchronize selected tables; optionally merge same-name shards |
+| [PostgreSQL](./postgres-cdc) | One source table, or merge tables across schemas in one database | No database action |
+| [MongoDB](./mongo-cdc) | One collection | Synchronize selected collections |
+| [Kafka](./kafka-cdc) | Change events from one topic | Route tables from one or more topics |
+| [Pulsar](./pulsar-cdc) | Change events from one topic | Route tables from one or more topics |
+| [Flink DataStream API](../program-api/flink-api#cdc-ingestion-table) | Ingest custom CDC records | See the API guide for multi-table sinks |
+
+![Table synchronization merges selected sources into one target; database synchronization routes each source table to its target.](/img/cdc-ingestion-sync-modes.svg)
+
+Choose **table synchronization** when you want one target table. If several source tables feed
+that target, their schemas must be compatible and their primary keys must identify rows across
+all sources. Rows with the same target primary key represent the same record.
+
+Choose **database synchronization** when you want to preserve separate tables. Table filters,
+naming rules, primary-key requirements, and discovery of new tables depend on the source action;
+check its guide before starting the job.
+
+### Flink CDC YAML Pipelines
+
+Flink CDC also supports pipelines described in YAML. To write **into Paimon** through that framework,
+see the [Flink CDC Paimon sink connector](https://nightlies.apache.org/flink/flink-cdc-docs-release-3.5/docs/connectors/pipeline-connectors/paimon/).
+To read **from Paimon** and send changes to another system, see [Paimon as a Flink CDC Source](./flink-cdc).
+The action options in this section, such as `--table_conf`, belong to the Paimon action CLI.
+
+## Before You Start
+
+1. Set up [Paimon on Flink](../flink/quick-start) and install the source connector dependencies
+   listed in the source guide. Use the `paimon-flink-action-@@VERSION@@.jar` for the job.
+2. Choose the target warehouse, database, table layout, and primary keys. In action commands,
+   `--database` and `--table` identify the **Paimon target**; source names belong in `--mysql_conf`,
+   `--postgres_conf`, `--mongodb_conf`, `--kafka_conf`, or `--pulsar_conf`.
+3. Check the source's schema and change-event requirements. For Kafka and Pulsar, the event
+   format determines which types, table names, and keys can be recovered.
+4. Start with a source-specific example, then add [computed columns and job settings](./action-configuration).
+
+## What Is Schema Evolution {#what-is-schema-evolution}
+
+An ordinary Flink SQL `INSERT INTO ... SELECT ...` job uses the schemas declared for that job.
+Adding a column in the source does not automatically add it to the SQL definitions and target table.
+Paimon CDC actions can carry the new field and its values through to Paimon without restarting
+for a supported column addition.
+
+![A declared Flink SQL schema keeps the original three fields, while a Paimon CDC action adds field_4 to the target.](/img/cdc-ingestion-schema-evolution.svg)
+
+### Supported Changes {#schema-change-evolution}
+
+Schema evolution is not full DDL replication. Column additions and compatible type changes can
+be applied; dropping or renaming source objects does not perform the equivalent operation on
+existing Paimon objects. See [Schema Evolution and Type Mapping](./schema-evolution) for the
+supported changes, limitations, and mapping options.
+
+## Configuration Reference
+
+<span id="computed-functions" />
+<span id="temporal-functions" />
+<span id="other-functions" />
+
+- [Computed columns](./action-configuration#computed-functions): derive partition values and other
+  fields, with temporal and string functions.
+
+<span id="special-data-type-mapping" />
+
+- [Type mapping](./schema-evolution#special-data-type-mapping): control how source types become
+  Paimon types, including MySQL-specific mappings.
+
+<span id="custom-job-settings" />
+<span id="checkpointing" />
+<span id="job-name" />
+<span id="table-configuration" />
+
+- [Job settings](./action-configuration#custom-job-settings): configure checkpointing, the job name,
+  catalog properties, and table properties.
+- [Starting with an empty topic](./action-configuration#starting-with-an-empty-topic): create the
+  target schema before running a Kafka or Pulsar table action.

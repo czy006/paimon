@@ -20,8 +20,8 @@ package org.apache.paimon.fileindex;
 
 import org.apache.paimon.predicate.FieldRef;
 import org.apache.paimon.predicate.FunctionVisitor;
+import org.apache.paimon.predicate.LeafPredicate;
 import org.apache.paimon.predicate.TopN;
-import org.apache.paimon.predicate.TransformPredicate;
 
 import java.util.List;
 
@@ -44,6 +44,11 @@ public abstract class FileIndexReader implements FunctionVisitor<FileIndexResult
     }
 
     @Override
+    public FileIndexResult visitIsNaN(FieldRef fieldRef) {
+        return REMAIN;
+    }
+
+    @Override
     public FileIndexResult visitStartsWith(FieldRef fieldRef, Object literal) {
         return REMAIN;
     }
@@ -55,6 +60,21 @@ public abstract class FileIndexReader implements FunctionVisitor<FileIndexResult
 
     @Override
     public FileIndexResult visitContains(FieldRef fieldRef, Object literal) {
+        return REMAIN;
+    }
+
+    @Override
+    public FileIndexResult visitArrayContains(FieldRef fieldRef, Object literal) {
+        return REMAIN;
+    }
+
+    @Override
+    public FileIndexResult visitArraysOverlap(FieldRef fieldRef, List<Object> literals) {
+        return REMAIN;
+    }
+
+    @Override
+    public FileIndexResult visitArrayContainsAll(FieldRef fieldRef, List<Object> literals) {
         return REMAIN;
     }
 
@@ -112,7 +132,7 @@ public abstract class FileIndexReader implements FunctionVisitor<FileIndexResult
             fileIndexResult =
                     fileIndexResult == null
                             ? visitNotEqual(fieldRef, key)
-                            : fileIndexResult.or(visitNotEqual(fieldRef, key));
+                            : fileIndexResult.and(visitNotEqual(fieldRef, key));
         }
         return fileIndexResult;
     }
@@ -132,7 +152,17 @@ public abstract class FileIndexReader implements FunctionVisitor<FileIndexResult
     }
 
     @Override
-    public FileIndexResult visit(TransformPredicate predicate) {
+    public FileIndexResult visitNonFieldLeaf(LeafPredicate predicate) {
+        return REMAIN;
+    }
+
+    @Override
+    public FileIndexResult visitBetween(FieldRef fieldRef, Object from, Object to) {
+        return REMAIN;
+    }
+
+    @Override
+    public FileIndexResult visitNotBetween(FieldRef fieldRef, Object from, Object to) {
         return REMAIN;
     }
 }

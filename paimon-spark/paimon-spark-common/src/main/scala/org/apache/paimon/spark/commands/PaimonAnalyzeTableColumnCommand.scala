@@ -18,14 +18,11 @@
 
 package org.apache.paimon.spark.commands
 
-import org.apache.paimon.manifest.PartitionEntry
 import org.apache.paimon.schema.TableSchema
 import org.apache.paimon.spark.SparkTable
 import org.apache.paimon.spark.leafnode.PaimonLeafRunnableCommand
 import org.apache.paimon.stats.{ColStats, Statistics}
 import org.apache.paimon.table.FileStoreTable
-import org.apache.paimon.table.sink.BatchWriteBuilder
-import org.apache.paimon.table.source.DataSplit
 import org.apache.paimon.utils.Preconditions.checkState
 
 import org.apache.spark.sql.{PaimonStatsUtils, Row, SparkSession}
@@ -34,10 +31,9 @@ import org.apache.spark.sql.catalyst.plans.logical.ColumnStat
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.connector.catalog.{Identifier, TableCatalog}
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
-import org.apache.spark.sql.types.{DataType, Decimal, DecimalType, TimestampType}
+import org.apache.spark.sql.types.{DataType, Decimal, DecimalType, TimestampNTZType, TimestampType}
 
 import java.util
-import java.util.UUID
 
 import scala.collection.JavaConverters._
 
@@ -74,7 +70,7 @@ case class PaimonAnalyzeTableColumnCommand(
 
     val totalRecordCount = currentSnapshot.totalRecordCount()
     checkState(totalRecordCount >= mergedRecordCount)
-    val mergedRecordSize = totalSize * (mergedRecordCount.toDouble / totalRecordCount).toLong
+    val mergedRecordSize = (totalSize.toDouble * mergedRecordCount / totalRecordCount).toLong
 
     // convert to paimon stats
     val tableSchema = table.schema()
@@ -166,6 +162,8 @@ case class PaimonAnalyzeTableColumnCommand(
       case _: TimestampType =>
         val l = o.asInstanceOf[Long]
         org.apache.paimon.data.Timestamp.fromSQLTimestamp(DateTimeUtils.toJavaTimestamp(l))
+      case _: TimestampNTZType =>
+        org.apache.paimon.data.Timestamp.fromMicros(o.asInstanceOf[Long])
       case _ => o
     }
   }

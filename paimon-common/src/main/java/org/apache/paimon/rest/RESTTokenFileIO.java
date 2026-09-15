@@ -20,10 +20,12 @@ package org.apache.paimon.rest;
 
 import org.apache.paimon.catalog.CatalogContext;
 import org.apache.paimon.catalog.Identifier;
+import org.apache.paimon.data.BlobDescriptor;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.FileStatus;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.PositionOutputStream;
+import org.apache.paimon.fs.RemoteIterator;
 import org.apache.paimon.fs.SeekableInputStream;
 import org.apache.paimon.fs.TwoPhaseOutputStream;
 import org.apache.paimon.options.ConfigOption;
@@ -43,7 +45,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.io.UncheckedIOException;
+import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -51,6 +53,8 @@ import java.util.concurrent.TimeUnit;
 import static org.apache.paimon.options.CatalogOptions.FILE_IO_ALLOW_CACHE;
 import static org.apache.paimon.rest.RESTApi.TOKEN_EXPIRATION_SAFE_TIME_MILLIS;
 import static org.apache.paimon.rest.RESTCatalogOptions.DLF_OSS_ENDPOINT;
+import static org.apache.paimon.rest.RESTCatalogOptions.IO_CACHE_ENABLED;
+import static org.apache.paimon.utils.Preconditions.checkArgument;
 
 /** A {@link FileIO} to support getting token from REST Server. */
 public class RESTTokenFileIO implements FileIO {
@@ -77,6 +81,24 @@ public class RESTTokenFileIO implements FileIO {
                     .build();
 
     private static final Logger LOG = LoggerFactory.getLogger(RESTTokenFileIO.class);
+
+    /** Sets the maximum number of cached FileIO instances. */
+    public static void setFileIOCacheMaximumSize(long maximumSize) {
+        checkArgument(maximumSize > 0, "Maximum cache size must be positive.");
+        FILE_IO_CACHE
+                .policy()
+                .eviction()
+                .orElseThrow(IllegalStateException::new)
+                .setMaximum(maximumSize);
+    }
+
+    static long fileIOCacheMaximumSize() {
+        return FILE_IO_CACHE
+                .policy()
+                .eviction()
+                .orElseThrow(IllegalStateException::new)
+                .getMaximum();
+    }
 
     private final CatalogContext catalogContext;
     private final Identifier identifier;
@@ -130,6 +152,13 @@ public class RESTTokenFileIO implements FileIO {
     }
 
     @Override
+    public RemoteIterator<FileStatus> listFilesIterative(Path path, boolean recursive)
+            throws IOException {
+        // the interface default would hide the inner FileIO's iterative listing override
+        return fileIO().listFilesIterative(path, recursive);
+    }
+
+    @Override
     public boolean exists(Path path) throws IOException {
         return fileIO().exists(path);
     }
@@ -147,6 +176,22 @@ public class RESTTokenFileIO implements FileIO {
     @Override
     public boolean rename(Path src, Path dst) throws IOException {
         return fileIO().rename(src, dst);
+    }
+
+    @Override
+    public boolean tryToWriteAtomic(Path path, String content) throws IOException {
+        // the interface default (temp file + rename) would bypass the inner FileIO's atomic
+        // override
+        return fileIO().tryToWriteAtomic(path, content);
+    }
+
+    @Override
+    public String createBlobPresignedUrl(
+            Path tableRoot, BlobDescriptor descriptor, Duration validity) throws IOException {
+        if (!path.equals(tableRoot)) {
+            throw new IOException("Table root does not match RESTTokenFileIO bound table root.");
+        }
+        return fileIO().createBlobPresignedUrl(tableRoot, descriptor, validity);
     }
 
     @Override
@@ -181,11 +226,7 @@ public class RESTTokenFileIO implements FileIO {
                             catalogContext.hadoopConf(),
                             catalogContext.preferIO(),
                             catalogContext.fallbackIO());
-            try {
-                fileIO = FileIO.get(path, context);
-            } catch (IOException e) {
-                throw new UncheckedIOException(e);
-            }
+            fileIO = FileIO.get(path, context);
             FILE_IO_CACHE.put(token, fileIO);
             return fileIO;
         }
@@ -234,10 +275,15 @@ public class RESTTokenFileIO implements FileIO {
 
     private Map<String, String> mergeTokenWithCatalogOptions(Map<String, String> token) {
         Map<String, String> newToken = Maps.newLinkedHashMap(token);
+        Options catalogOptions = catalogContext.options();
         // DLF OSS endpoint should override the standard OSS endpoint.
-        String dlfOssEndpoint = catalogContext.options().get(DLF_OSS_ENDPOINT.key());
+        String dlfOssEndpoint = catalogOptions.get(DLF_OSS_ENDPOINT.key());
         if (dlfOssEndpoint != null && !dlfOssEndpoint.isEmpty()) {
             newToken.put("fs.oss.endpoint", dlfOssEndpoint);
+        }
+        if (catalogOptions.contains(IO_CACHE_ENABLED)) {
+            newToken.put(
+                    IO_CACHE_ENABLED.key(), String.valueOf(catalogOptions.get(IO_CACHE_ENABLED)));
         }
         return ImmutableMap.copyOf(newToken);
     }

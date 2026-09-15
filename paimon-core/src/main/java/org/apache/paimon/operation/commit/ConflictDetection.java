@@ -28,13 +28,17 @@ import org.apache.paimon.index.IndexFileMeta;
 import org.apache.paimon.manifest.FileEntry;
 import org.apache.paimon.manifest.FileKind;
 import org.apache.paimon.manifest.IndexManifestEntry;
+import org.apache.paimon.manifest.ManifestEntry;
 import org.apache.paimon.manifest.SimpleFileEntry;
 import org.apache.paimon.manifest.SimpleFileEntryWithDV;
 import org.apache.paimon.operation.PartitionExpire;
+import org.apache.paimon.operation.commit.RetryCommitResult.CommitFailRetryResult;
+import org.apache.paimon.schema.SchemaManager;
 import org.apache.paimon.table.BucketMode;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.FileStorePathFactory;
 import org.apache.paimon.utils.Pair;
+import org.apache.paimon.utils.SnapshotManager;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -51,30 +55,61 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+import static org.apache.paimon.deletionvectors.DeletionVectorsIndexFile.DELETION_VECTORS_INDEX;
 import static org.apache.paimon.utils.InternalRowPartitionComputer.partToSimpleString;
 import static org.apache.paimon.utils.Preconditions.checkState;
 
-/** Util class for detecting conflicts between base and delta files. */
-public class ConflictDetection {
+/** Base class for table-specific conflict detection between base and delta files. */
+public abstract class ConflictDetection {
 
     private static final Logger LOG = LoggerFactory.getLogger(ConflictDetection.class);
+    private static final int FIXED_BUCKET_CHECK_CACHE_MAX_SIZE = 1000;
 
     private final String tableName;
     private final String commitUser;
     private final RowType partitionType;
     private final FileStorePathFactory pathFactory;
-    private final @Nullable Comparator<InternalRow> keyComparator;
     private final BucketMode bucketMode;
     private final boolean deletionVectorsEnabled;
     private final IndexFileHandler indexFileHandler;
+    private final CommitScanner commitScanner;
+    private final Set<BinaryRow> checkedFixedBucketPartitions =
+            Collections.newSetFromMap(
+                    new LinkedHashMap<BinaryRow, Boolean>(
+                            FIXED_BUCKET_CHECK_CACHE_MAX_SIZE, 0.75f, false) {
+                        @Override
+                        protected boolean removeEldestEntry(Map.Entry<BinaryRow, Boolean> eldest) {
+                            return size() > FIXED_BUCKET_CHECK_CACHE_MAX_SIZE;
+                        }
+                    });
 
     private @Nullable PartitionExpire partitionExpire;
 
-    public ConflictDetection(
+    protected ConflictDetection(
+            String tableName,
+            String commitUser,
+            RowType partitionType,
+            FileStorePathFactory pathFactory,
+            BucketMode bucketMode,
+            boolean deletionVectorsEnabled,
+            IndexFileHandler indexFileHandler,
+            CommitScanner commitScanner) {
+        this.tableName = tableName;
+        this.commitUser = commitUser;
+        this.partitionType = partitionType;
+        this.pathFactory = pathFactory;
+        this.bucketMode = bucketMode;
+        this.deletionVectorsEnabled = deletionVectorsEnabled;
+        this.indexFileHandler = indexFileHandler;
+        this.commitScanner = commitScanner;
+    }
+
+    public static ConflictDetection create(
             String tableName,
             String commitUser,
             RowType partitionType,
@@ -82,34 +117,101 @@ public class ConflictDetection {
             @Nullable Comparator<InternalRow> keyComparator,
             BucketMode bucketMode,
             boolean deletionVectorsEnabled,
-            IndexFileHandler indexFileHandler) {
-        this.tableName = tableName;
-        this.commitUser = commitUser;
-        this.partitionType = partitionType;
-        this.pathFactory = pathFactory;
-        this.keyComparator = keyComparator;
-        this.bucketMode = bucketMode;
-        this.deletionVectorsEnabled = deletionVectorsEnabled;
-        this.indexFileHandler = indexFileHandler;
+            boolean dataEvolutionEnabled,
+            boolean dataEvolutionNestedFieldEnabled,
+            boolean pkClusteringOverride,
+            IndexFileHandler indexFileHandler,
+            SnapshotManager snapshotManager,
+            CommitScanner commitScanner) {
+        if (dataEvolutionEnabled) {
+            return new DataEvolutionConflictDetection(
+                    tableName,
+                    commitUser,
+                    partitionType,
+                    pathFactory,
+                    bucketMode,
+                    deletionVectorsEnabled,
+                    dataEvolutionNestedFieldEnabled,
+                    indexFileHandler,
+                    snapshotManager,
+                    commitScanner);
+        }
+        if (keyComparator != null) {
+            return new PrimaryKeyConflictDetection(
+                    tableName,
+                    commitUser,
+                    partitionType,
+                    pathFactory,
+                    keyComparator,
+                    bucketMode,
+                    deletionVectorsEnabled,
+                    pkClusteringOverride,
+                    indexFileHandler,
+                    commitScanner);
+        }
+        return new AppendConflictDetection(
+                tableName,
+                commitUser,
+                partitionType,
+                pathFactory,
+                bucketMode,
+                deletionVectorsEnabled,
+                indexFileHandler,
+                commitScanner);
+    }
+
+    public void setRowIdCheckFromSnapshot(@Nullable Long rowIdCheckFromSnapshot) {
+        // Only Data Evolution tables support Row ID conflict detection.
+    }
+
+    public void setRowIdCheckFromSnapshotForMaterializeDvCompaction(
+            @Nullable Long rowIdCheckFromSnapshot) {
+        // Only Data Evolution tables support Row ID conflict detection.
+    }
+
+    public boolean shouldCheckRowIdFromSnapshot(CommitKind commitKind) {
+        return false;
+    }
+
+    @Nullable
+    public RowIdConflictChecker createRowIdConflictChecker(
+            SchemaManager schemaManager, List<ManifestEntry> deltaFiles, CommitKind commitKind) {
+        return null;
     }
 
     @Nullable
     public Comparator<InternalRow> keyComparator() {
-        return keyComparator;
+        return null;
     }
 
     public void withPartitionExpire(PartitionExpire partitionExpire) {
         this.partitionExpire = partitionExpire;
     }
 
-    public void checkNoConflictsOrFail(
-            Snapshot snapshot,
+    public <T extends FileEntry> boolean shouldBeOverwriteCommit(
+            List<T> appendFileEntries, List<IndexManifestEntry> appendIndexFiles) {
+        for (T appendFileEntry : appendFileEntries) {
+            if (appendFileEntry.kind().equals(FileKind.DELETE)) {
+                return true;
+            }
+        }
+        for (IndexManifestEntry appendIndexFile : appendIndexFiles) {
+            if (appendIndexFile.indexFile().indexType().equals(DELETION_VECTORS_INDEX)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public final Optional<RuntimeException> checkConflicts(
+            Snapshot latestSnapshot,
             List<SimpleFileEntry> baseEntries,
             List<SimpleFileEntry> deltaEntries,
             List<IndexManifestEntry> deltaIndexEntries,
+            @Nullable RowIdConflictChecker rowIdConflictChecker,
             CommitKind commitKind) {
-        String baseCommitUser = snapshot.commitUser();
-        if (checkForDeletionVector()) {
+        String baseCommitUser = latestSnapshot.commitUser();
+        if (deletionVectorsEnabled && bucketMode.equals(BucketMode.BUCKET_UNAWARE)) {
             // Enrich dvName in fileEntry to checker for base ADD dv and delta DELETE dv.
             // For example:
             // If the base file is <ADD baseFile1, ADD dv1>,
@@ -120,43 +222,161 @@ public class ConflictDetection {
                 baseEntries =
                         buildBaseEntriesWithDV(
                                 baseEntries,
-                                snapshot.indexManifest() == null
+                                latestSnapshot.indexManifest() == null
                                         ? Collections.emptyList()
-                                        : indexFileHandler.readManifest(snapshot.indexManifest()));
+                                        : indexFileHandler.readManifest(
+                                                latestSnapshot.indexManifest()));
                 deltaEntries =
                         buildDeltaEntriesWithDV(baseEntries, deltaEntries, deltaIndexEntries);
             } catch (Throwable e) {
-                throw conflictException(commitUser, baseEntries, deltaEntries).apply(e);
+                return Optional.of(
+                        conflictException(commitUser, baseEntries, deltaEntries).apply(e));
             }
         }
 
         List<SimpleFileEntry> allEntries = new ArrayList<>(baseEntries);
         allEntries.addAll(deltaEntries);
 
-        checkBucketKeepSame(baseEntries, deltaEntries, commitKind, allEntries, baseCommitUser);
+        Optional<RuntimeException> exception =
+                checkBucketKeepSame(
+                        baseEntries, deltaEntries, commitKind, allEntries, baseCommitUser);
+        if (exception.isPresent()) {
+            return exception;
+        }
 
         Function<Throwable, RuntimeException> conflictException =
                 conflictException(baseCommitUser, baseEntries, deltaEntries);
+
+        try {
+            // check the delta, it is important not to delete and add the same file. Since scan
+            // relies on map for deduplication, this may result in the loss of this file
+            FileEntry.mergeEntries(deltaEntries);
+        } catch (Throwable e) {
+            throw conflictException.apply(e);
+        }
+
         Collection<SimpleFileEntry> mergedEntries;
         try {
             // merge manifest entries and also check if the files we want to delete are still there
             mergedEntries = FileEntry.mergeEntries(allEntries);
         } catch (Throwable e) {
-            throw conflictException.apply(e);
+            return Optional.of(conflictException.apply(e));
         }
 
-        checkNoDeleteInMergedEntries(mergedEntries, conflictException);
-        checkKeyRangeNoConflicts(baseEntries, deltaEntries, mergedEntries, baseCommitUser);
+        exception = checkDeleteInEntries(mergedEntries, conflictException);
+        if (exception.isPresent()) {
+            return exception;
+        }
+        return checkTableSpecificConflicts(
+                latestSnapshot,
+                baseEntries,
+                deltaEntries,
+                deltaIndexEntries,
+                mergedEntries,
+                rowIdConflictChecker,
+                commitKind,
+                baseCommitUser);
     }
 
-    private void checkBucketKeepSame(
+    protected abstract Optional<RuntimeException> checkTableSpecificConflicts(
+            Snapshot latestSnapshot,
+            List<SimpleFileEntry> baseEntries,
+            List<SimpleFileEntry> deltaEntries,
+            List<IndexManifestEntry> deltaIndexEntries,
+            Collection<SimpleFileEntry> mergedEntries,
+            @Nullable RowIdConflictChecker rowIdConflictChecker,
+            CommitKind commitKind,
+            String baseCommitUser);
+
+    public List<SimpleFileEntry> scanBaseDataFiles(
+            Snapshot latestSnapshot,
+            List<BinaryRow> changedPartitions,
+            List<ManifestEntry> deltaFiles,
+            List<IndexManifestEntry> indexFiles,
+            CommitKind commitKind,
+            @Nullable CommitFailRetryResult previousAttempt,
+            boolean hasOverwriteSincePreviousAttempt) {
+        return scanChangedPartitions(
+                latestSnapshot,
+                changedPartitions,
+                previousAttempt,
+                hasOverwriteSincePreviousAttempt);
+    }
+
+    protected List<SimpleFileEntry> scanChangedPartitions(
+            Snapshot latestSnapshot,
+            List<BinaryRow> changedPartitions,
+            @Nullable CommitFailRetryResult previousAttempt,
+            boolean hasOverwriteSincePreviousAttempt) {
+        if (previousAttempt != null
+                && previousAttempt.latestSnapshot != null
+                && previousAttempt.baseDataFiles != null
+                && !hasOverwriteSincePreviousAttempt) {
+            List<SimpleFileEntry> baseDataFiles = new ArrayList<>(previousAttempt.baseDataFiles);
+            List<SimpleFileEntry> incremental =
+                    commitScanner.readIncrementalChanges(
+                            previousAttempt.latestSnapshot, latestSnapshot, changedPartitions);
+            if (!incremental.isEmpty()) {
+                baseDataFiles.addAll(incremental);
+                baseDataFiles = new ArrayList<>(FileEntry.mergeEntries(baseDataFiles));
+            }
+            return baseDataFiles;
+        }
+        return commitScanner.readAllEntriesFromChangedPartitions(latestSnapshot, changedPartitions);
+    }
+
+    protected CommitScanner commitScanner() {
+        return commitScanner;
+    }
+
+    public <T extends FileEntry> Map<BinaryRow, Integer> collectUncheckedFixedBucketPartitions(
+            List<T> deltaEntries) {
+        Map<BinaryRow, Integer> totalBuckets = collectBucketPartitions(deltaEntries);
+        totalBuckets.keySet().removeAll(checkedFixedBucketPartitions);
+        return totalBuckets;
+    }
+
+    public <T extends FileEntry> void checkSameBucketWithinDelta(List<T> deltaEntries) {
+        collectBucketPartitions(deltaEntries);
+    }
+
+    private <T extends FileEntry> Map<BinaryRow, Integer> collectBucketPartitions(
+            List<T> deltaEntries) {
+        Map<BinaryRow, Integer> totalBuckets = new HashMap<>();
+        for (T entry : deltaEntries) {
+            if (entry.kind() != FileKind.ADD || entry.totalBuckets() <= 0) {
+                continue;
+            }
+
+            Integer previous = totalBuckets.putIfAbsent(entry.partition(), entry.totalBuckets());
+            if (previous != null && previous != entry.totalBuckets()) {
+                throwBucketNumMismatch(entry.partition(), entry.totalBuckets(), previous);
+            }
+        }
+        return totalBuckets;
+    }
+
+    public Optional<RuntimeException> checkSameFixedBucketByTotalBuckets(
+            Map<BinaryRow, Integer> expectedTotalBuckets,
+            Map<BinaryRow, Integer> previousTotalBuckets) {
+        for (Map.Entry<BinaryRow, Integer> entry : expectedTotalBuckets.entrySet()) {
+            Integer previous = previousTotalBuckets.get(entry.getKey());
+            if (previous != null && !Objects.equals(previous, entry.getValue())) {
+                return Optional.of(bucketNumMismatch(entry.getKey(), entry.getValue(), previous));
+            }
+        }
+        checkedFixedBucketPartitions.addAll(expectedTotalBuckets.keySet());
+        return Optional.empty();
+    }
+
+    private Optional<RuntimeException> checkBucketKeepSame(
             List<SimpleFileEntry> baseEntries,
             List<SimpleFileEntry> deltaEntries,
             CommitKind commitKind,
             List<SimpleFileEntry> allEntries,
             String baseCommitUser) {
         if (commitKind == CommitKind.OVERWRITE) {
-            return;
+            return Optional.empty();
         }
 
         // total buckets within the same partition should remain the same
@@ -165,7 +385,6 @@ public class ConflictDetection {
             if (entry.totalBuckets() <= 0) {
                 continue;
             }
-
             if (!totalBuckets.containsKey(entry.partition())) {
                 totalBuckets.put(entry.partition(), entry.totalBuckets());
                 continue;
@@ -179,7 +398,7 @@ public class ConflictDetection {
             Pair<RuntimeException, RuntimeException> conflictException =
                     createConflictException(
                             "Total buckets of partition "
-                                    + entry.partition()
+                                    + partToSimpleString(partitionType, entry.partition(), "-", 200)
                                     + " changed from "
                                     + old
                                     + " to "
@@ -190,55 +409,27 @@ public class ConflictDetection {
                             deltaEntries,
                             null);
             LOG.warn("", conflictException.getLeft());
-            throw conflictException.getRight();
+            return Optional.of(conflictException.getRight());
         }
+        return Optional.empty();
     }
 
-    private void checkKeyRangeNoConflicts(
-            List<SimpleFileEntry> baseEntries,
-            List<SimpleFileEntry> deltaEntries,
-            Collection<SimpleFileEntry> mergedEntries,
-            String baseCommitUser) {
-        // fast exit for file store without keys
-        if (keyComparator == null) {
-            return;
-        }
+    private void throwBucketNumMismatch(
+            BinaryRow partition, int numBuckets, int previousNumBuckets) {
+        throw bucketNumMismatch(partition, numBuckets, previousNumBuckets);
+    }
 
-        // group entries by partitions, buckets and levels
-        Map<LevelIdentifier, List<SimpleFileEntry>> levels = new HashMap<>();
-        for (SimpleFileEntry entry : mergedEntries) {
-            int level = entry.level();
-            if (level >= 1) {
-                levels.computeIfAbsent(
-                                new LevelIdentifier(entry.partition(), entry.bucket(), level),
-                                lv -> new ArrayList<>())
-                        .add(entry);
-            }
-        }
-
-        // check for all LSM level >= 1, key ranges of files do not intersect
-        for (List<SimpleFileEntry> entries : levels.values()) {
-            entries.sort((a, b) -> keyComparator.compare(a.minKey(), b.minKey()));
-            for (int i = 0; i + 1 < entries.size(); i++) {
-                SimpleFileEntry a = entries.get(i);
-                SimpleFileEntry b = entries.get(i + 1);
-                if (keyComparator.compare(a.maxKey(), b.minKey()) >= 0) {
-                    Pair<RuntimeException, RuntimeException> conflictException =
-                            createConflictException(
-                                    "LSM conflicts detected! Give up committing. Conflict files are:\n"
-                                            + a.identifier().toString(pathFactory)
-                                            + "\n"
-                                            + b.identifier().toString(pathFactory),
-                                    baseCommitUser,
-                                    baseEntries,
-                                    deltaEntries,
-                                    null);
-
-                    LOG.warn("", conflictException.getLeft());
-                    throw conflictException.getRight();
-                }
-            }
-        }
+    private RuntimeException bucketNumMismatch(
+            BinaryRow partition, int numBuckets, int previousNumBuckets) {
+        String partInfo =
+                partitionType.getFieldCount() > 0
+                        ? "partition {" + pathFactory.getPartitionString(partition) + "}"
+                        : "table";
+        return new RuntimeException(
+                String.format(
+                        "Try to write %s with a new bucket num %d, but the previous bucket num is %d. "
+                                + "Please switch to batch mode, and perform INSERT OVERWRITE to rescale current data layout first.",
+                        partInfo, numBuckets, previousNumBuckets));
     }
 
     private Function<Throwable, RuntimeException> conflictException(
@@ -258,11 +449,7 @@ public class ConflictDetection {
         };
     }
 
-    private boolean checkForDeletionVector() {
-        return deletionVectorsEnabled && bucketMode.equals(BucketMode.BUCKET_UNAWARE);
-    }
-
-    private void checkNoDeleteInMergedEntries(
+    private Optional<RuntimeException> checkDeleteInEntries(
             Collection<SimpleFileEntry> mergedEntries,
             Function<Throwable, RuntimeException> exceptionFunction) {
         try {
@@ -274,12 +461,17 @@ public class ConflictDetection {
                         tableName);
             }
         } catch (Throwable e) {
-            assertConflictForPartitionExpire(mergedEntries);
-            throw exceptionFunction.apply(e);
+            Optional<RuntimeException> exception = checkConflictForPartitionExpire(mergedEntries);
+            if (exception.isPresent()) {
+                return exception;
+            }
+            return Optional.of(exceptionFunction.apply(e));
         }
+        return Optional.empty();
     }
 
-    private void assertConflictForPartitionExpire(Collection<SimpleFileEntry> mergedEntries) {
+    private Optional<RuntimeException> checkConflictForPartitionExpire(
+            Collection<SimpleFileEntry> mergedEntries) {
         if (partitionExpire != null && partitionExpire.isValueExpiration()) {
             Set<BinaryRow> deletedPartitions = new HashSet<>();
             for (SimpleFileEntry entry : mergedEntries) {
@@ -295,13 +487,15 @@ public class ConflictDetection {
                                                 partToSimpleString(
                                                         partitionType, partition, "-", 200))
                                 .collect(Collectors.toList());
-                throw new RuntimeException(
-                        "You are writing data to expired partitions, and you can filter this data to avoid job failover."
-                                + " Otherwise, continuous expired records will cause the job to failover restart continuously."
-                                + " Expired partitions are: "
-                                + expiredPartitions);
+                return Optional.of(
+                        new RuntimeException(
+                                "You are writing data to expired partitions, and you can filter this data to avoid job failover."
+                                        + " Otherwise, continuous expired records will cause the job to failover restart continuously."
+                                        + " Expired partitions are: "
+                                        + expiredPartitions));
             }
         }
+        return Optional.empty();
     }
 
     static List<SimpleFileEntry> buildBaseEntriesWithDV(
@@ -421,7 +615,7 @@ public class ConflictDetection {
      * simplified exception), The simplified exception is generated when the entry length is larger
      * than the max limit.
      */
-    private Pair<RuntimeException, RuntimeException> createConflictException(
+    protected final Pair<RuntimeException, RuntimeException> createConflictException(
             String message,
             String baseCommitUser,
             List<SimpleFileEntry> baseEntries,
@@ -504,49 +698,8 @@ public class ConflictDetection {
         }
     }
 
-    private static class LevelIdentifier {
-
-        private final BinaryRow partition;
-        private final int bucket;
-        private final int level;
-
-        private LevelIdentifier(BinaryRow partition, int bucket, int level) {
-            this.partition = partition;
-            this.bucket = bucket;
-            this.level = level;
-        }
-
-        @Override
-        public boolean equals(Object o) {
-            if (!(o instanceof LevelIdentifier)) {
-                return false;
-            }
-            LevelIdentifier that = (LevelIdentifier) o;
-            return Objects.equals(partition, that.partition)
-                    && bucket == that.bucket
-                    && level == that.level;
-        }
-
-        @Override
-        public int hashCode() {
-            return Objects.hash(partition, bucket, level);
-        }
-    }
-
-    /** Should do conflict check. */
-    public interface ConflictCheck {
-        boolean shouldCheck(long latestSnapshot);
-    }
-
-    public static ConflictCheck hasConflictChecked(@Nullable Long checkedLatestSnapshotId) {
-        return latestSnapshot -> !Objects.equals(latestSnapshot, checkedLatestSnapshotId);
-    }
-
-    public static ConflictCheck noConflictCheck() {
-        return latestSnapshot -> false;
-    }
-
-    public static ConflictCheck mustConflictCheck() {
-        return latestSnapshot -> true;
+    /** Factory to create {@link ConflictDetection}. */
+    public interface Factory {
+        ConflictDetection create(CommitScanner scanner);
     }
 }

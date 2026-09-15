@@ -26,19 +26,26 @@ import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.local.LocalFileIO;
+import org.apache.paimon.predicate.Predicate;
+import org.apache.paimon.predicate.PredicateBuilder;
+import org.apache.paimon.reader.RecordReader;
+import org.apache.paimon.schema.FileSystemSchemaManager;
 import org.apache.paimon.schema.Schema;
-import org.apache.paimon.schema.SchemaManager;
 import org.apache.paimon.schema.SchemaUtils;
 import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.FileStoreTableFactory;
 import org.apache.paimon.table.TableTestBase;
+import org.apache.paimon.table.source.ReadBuilder;
 import org.apache.paimon.types.DataTypes;
+import org.apache.paimon.types.RowKind;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
@@ -69,7 +76,7 @@ public class PartitionsTableTest extends TableTestBase {
                         .option("bucket", "1")
                         .build();
         TableSchema tableSchema =
-                SchemaUtils.forceCommit(new SchemaManager(fileIO, tablePath), schema);
+                SchemaUtils.forceCommit(new FileSystemSchemaManager(fileIO, tablePath), schema);
         table = FileStoreTableFactory.create(LocalFileIO.create(), tablePath, tableSchema);
 
         Identifier filesTableId =
@@ -123,7 +130,7 @@ public class PartitionsTableTest extends TableTestBase {
 
     @Test
     void testPartitionAuditFieldsNull() throws Exception {
-        List<InternalRow> result = read(partitionsTable, new int[] {0, 5, 6, 7, 8});
+        List<InternalRow> result = read(partitionsTable, new int[] {0, 5, 6, 7, 8, 10});
         assertThat(result).hasSize(3);
 
         for (InternalRow row : result) {
@@ -131,7 +138,60 @@ public class PartitionsTableTest extends TableTestBase {
             assertThat(row.isNullAt(2)).isTrue(); //  created_by
             assertThat(row.isNullAt(3)).isTrue(); // updated_by
             assertThat(row.isNullAt(4)).isTrue(); // options
+            assertThat(row.getBoolean(5)).isFalse(); // done
         }
+    }
+
+    @Test
+    public void testPartitionTotalBuckets() throws Exception {
+        List<InternalRow> expectedRow = new ArrayList<>();
+        expectedRow.add(GenericRow.of(BinaryString.fromString("pt=1"), 1));
+        expectedRow.add(GenericRow.of(BinaryString.fromString("pt=2"), 1));
+        expectedRow.add(GenericRow.of(BinaryString.fromString("pt=3"), 1));
+
+        // Read partition and total_buckets columns; the table is configured with bucket=1.
+        List<InternalRow> result = read(partitionsTable, new int[] {0, 9});
+        assertThat(result).containsExactlyInAnyOrderElementsOf(expectedRow);
+    }
+
+    @Test
+    public void testPartitionDeletionNumWithoutDeletionVectors() throws Exception {
+        PredicateBuilder builder = new PredicateBuilder(PartitionsTable.TABLE_TYPE);
+
+        List<InternalRow> expectedRow = new ArrayList<>();
+        expectedRow.add(GenericRow.of(BinaryString.fromString("pt=1"), 0L));
+        expectedRow.add(GenericRow.of(BinaryString.fromString("pt=2"), 0L));
+        expectedRow.add(GenericRow.of(BinaryString.fromString("pt=3"), 0L));
+
+        assertThat(read(partitionsTable, new int[] {0, 11}))
+                .containsExactlyInAnyOrderElementsOf(expectedRow);
+        assertThat(
+                        readProjectedPartitions(
+                                partitionsTable, builder.greaterThan(11, 0L), new int[] {0}))
+                .isEmpty();
+        assertThat(readProjectedPartitions(partitionsTable, builder.equal(11, 0L), new int[] {0}))
+                .containsExactlyInAnyOrder("pt=1", "pt=2", "pt=3");
+    }
+
+    @Test
+    public void testPartitionDeletionNumWithDeletionVectors() throws Exception {
+        PartitionsTable deletionVectorPartitionsTable = createDeletionVectorPartitionsTable();
+        PredicateBuilder builder = new PredicateBuilder(PartitionsTable.TABLE_TYPE);
+
+        assertThat(readPartitionAndDeletionNum(deletionVectorPartitionsTable, null))
+                .containsExactlyInAnyOrder("pt=1-2", "pt=2-1", "pt=3-0");
+        assertThat(
+                        readProjectedPartitions(
+                                deletionVectorPartitionsTable,
+                                builder.greaterThan(11, 0L),
+                                new int[] {0}))
+                .containsExactlyInAnyOrder("pt=1", "pt=2");
+        assertThat(
+                        readProjectedPartitions(
+                                deletionVectorPartitionsTable,
+                                builder.equal(11, 0L),
+                                new int[] {0}))
+                .containsExactlyInAnyOrder("pt=3");
     }
 
     @Test
@@ -166,5 +226,129 @@ public class PartitionsTableTest extends TableTestBase {
 
         List<InternalRow> result = read(testPartitionsTable, new int[] {0, 1});
         assertThat(result).containsExactlyInAnyOrderElementsOf(expectedRow);
+    }
+
+    @Test
+    public void testReadWithPartitionEqualFilter() throws Exception {
+        PredicateBuilder builder = new PredicateBuilder(PartitionsTable.TABLE_TYPE);
+
+        assertThat(readPartitionAndRecordCount(builder.equal(0, BinaryString.fromString("pt=2"))))
+                .containsExactlyInAnyOrder("pt=2-1");
+
+        assertThat(readPartitionAndRecordCount(builder.equal(0, BinaryString.fromString("pt=99"))))
+                .isEmpty();
+    }
+
+    @Test
+    public void testReadWithPartitionInFilter() throws Exception {
+        PredicateBuilder builder = new PredicateBuilder(PartitionsTable.TABLE_TYPE);
+
+        assertThat(
+                        readPartitionAndRecordCount(
+                                builder.in(
+                                        0,
+                                        Arrays.asList(
+                                                (Object) BinaryString.fromString("pt=1"),
+                                                BinaryString.fromString("pt=3")))))
+                .containsExactlyInAnyOrder("pt=1-2", "pt=3-1");
+    }
+
+    @Test
+    public void testReadWithRecordCountFilter() throws Exception {
+        PredicateBuilder builder = new PredicateBuilder(PartitionsTable.TABLE_TYPE);
+
+        assertThat(readPartitionAndRecordCount(builder.greaterThan(1, 1L)))
+                .containsExactlyInAnyOrder("pt=1-2");
+    }
+
+    @Test
+    public void testReadWithFileCountFilter() throws Exception {
+        PredicateBuilder builder = new PredicateBuilder(PartitionsTable.TABLE_TYPE);
+
+        assertThat(readPartitionAndRecordCount(builder.equal(3, 1L)))
+                .containsExactlyInAnyOrder("pt=2-1", "pt=3-1");
+        assertThat(readPartitionAndRecordCount(builder.greaterOrEqual(3, 2L)))
+                .containsExactlyInAnyOrder("pt=1-2");
+    }
+
+    @Test
+    public void testReadWithNullFilterReturnsAll() throws Exception {
+        assertThat(readPartitionAndRecordCount(null))
+                .containsExactlyInAnyOrder("pt=1-2", "pt=2-1", "pt=3-1");
+    }
+
+    private List<String> readPartitionAndRecordCount(Predicate predicate) throws IOException {
+        ReadBuilder readBuilder = partitionsTable.newReadBuilder().withFilter(predicate);
+        List<String> rows = new ArrayList<>();
+        try (RecordReader<InternalRow> reader =
+                readBuilder.newRead().createReader(readBuilder.newScan().plan())) {
+            reader.forEachRemaining(
+                    row -> rows.add(row.getString(0).toString() + "-" + row.getLong(1)));
+        }
+        return rows;
+    }
+
+    private PartitionsTable createDeletionVectorPartitionsTable() throws Exception {
+        String testTableName = "DeletionVectorTable";
+        Schema testSchema =
+                Schema.newBuilder()
+                        .column("pk", DataTypes.INT())
+                        .column("pt", DataTypes.INT())
+                        .column("col1", DataTypes.INT())
+                        .partitionKeys("pt")
+                        .primaryKey("pk", "pt")
+                        .option(CoreOptions.CHANGELOG_PRODUCER.key(), "input")
+                        .option(CoreOptions.DELETION_VECTORS_ENABLED.key(), "true")
+                        .option("bucket", "1")
+                        .build();
+
+        Identifier testTableId = identifier(testTableName);
+        catalog.createTable(testTableId, testSchema, true);
+        FileStoreTable deletionVectorTable = (FileStoreTable) catalog.getTable(testTableId);
+
+        write(
+                deletionVectorTable,
+                ioManager,
+                GenericRow.of(1, 1, 1),
+                GenericRow.of(2, 1, 2),
+                GenericRow.of(3, 2, 3),
+                GenericRow.of(5, 1, 5),
+                GenericRow.of(6, 2, 6),
+                GenericRow.of(4, 3, 4));
+        write(
+                deletionVectorTable,
+                ioManager,
+                GenericRow.ofKind(RowKind.DELETE, 1, 1, 1),
+                GenericRow.ofKind(RowKind.DELETE, 2, 1, 2),
+                GenericRow.ofKind(RowKind.DELETE, 3, 2, 3));
+
+        Identifier partitionsTableId =
+                identifier(testTableName + SYSTEM_TABLE_SPLITTER + PartitionsTable.PARTITIONS);
+        return (PartitionsTable) catalog.getTable(partitionsTableId);
+    }
+
+    private List<String> readProjectedPartitions(
+            PartitionsTable table, Predicate predicate, int[] projection) throws IOException {
+        ReadBuilder readBuilder = table.newReadBuilder().withFilter(predicate);
+        readBuilder.withProjection(projection);
+        List<String> rows = new ArrayList<>();
+        try (RecordReader<InternalRow> reader =
+                readBuilder.newRead().createReader(readBuilder.newScan().plan())) {
+            reader.forEachRemaining(row -> rows.add(row.getString(0).toString()));
+        }
+        return rows;
+    }
+
+    private List<String> readPartitionAndDeletionNum(PartitionsTable table, Predicate predicate)
+            throws IOException {
+        ReadBuilder readBuilder = table.newReadBuilder().withFilter(predicate);
+        readBuilder.withProjection(new int[] {0, 11});
+        List<String> rows = new ArrayList<>();
+        try (RecordReader<InternalRow> reader =
+                readBuilder.newRead().createReader(readBuilder.newScan().plan())) {
+            reader.forEachRemaining(
+                    row -> rows.add(row.getString(0).toString() + "-" + row.getLong(1)));
+        }
+        return rows;
     }
 }

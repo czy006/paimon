@@ -8,7 +8,7 @@ This PyPi package contains the Python APIs for using Paimon.
 
 # Version
 
-Pypaimon requires Python 3.10+ version.
+Pypaimon requires Python 3.6+.
 
 # Dependencies
 
@@ -31,3 +31,350 @@ pip3 install dist/*.tar.gz
 
 The command will install the package and core dependencies to your local Python environment.
 
+# Native scan planning
+
+PyPaimon can plan splits with the optional `pypaimon-rust` package while retaining
+the Python reader:
+
+```python
+native_table = table.copy({"scan.native-plan.enabled": "true"})
+builder = native_table.new_read_builder()
+plan = builder.new_scan().plan()
+rows = builder.new_read().to_arrow(plan.splits())
+explanation = builder.explain()
+print(explanation.native_planned)
+```
+
+The adapter checks the installed binding's capabilities and falls back to the
+Python planner for unsupported scans. New bindings preserve `plan.snapshot_id`
+even when pruning removes every split. Native explain output includes snapshot
+and split metadata; native pruning counters are not exposed.
+
+Explicit row ranges on data-evolution tables require `ReadBuilder.with_row_ranges()`.
+Watermark time travel requires Rust 0.4 or newer. Branch reads require the
+branch-aware binding exposing `Table.branch()`, and the resolved branch is
+checked before planning. Deletion-vector scans require `pypaimon-rust>=0.4.0`,
+which includes schema-aware decoding of Python-written index manifests and
+legacy bucket-index path compatibility. The reader honors explicit paths, then
+bucket paths, and can read older Python files placed in `table/index`.
+Bucket paths use the partition field types and `partition.legacy-name` to match
+Java formatting, including timestamp precision and different JVM float spellings.
+New Python writes honor `index-file-in-data-file-dir` and retain explicit paths
+when Python and Java partition-directory formatting differs. Older releases
+and prereleases before 0.4.0 use the Python planner for deletion vectors.
+When using an unreleased 0.4.0 development wheel, rebuild it with these fixes;
+package version checks cannot distinguish local builds with identical versions.
+
+Append scans support `with_shard()` and `with_slice()` with Rust 0.4 or newer,
+which preserves the file order needed for positional selection; primary-key scans support
+bucket-based `with_shard()`. Data-evolution position selection requires the
+binding's `TableScan.with_row_position_slice()` and `with_row_position_shard()`.
+Selection occurs before reader filtering and deletion vectors, so surviving row
+counts can differ between shards. Limits are applied after shard/slice selection.
+
+Timestamp incremental scans require `ReadBuilder.new_incremental_scan()`.
+Python resolves `(start_timestamp, end_timestamp]` to snapshot IDs; Rust combines
+the selected APPEND deltas into one plan, including merging primary-key versions
+across commits. Other commit kinds are excluded, and the ending snapshot supplies
+snapshot metadata and deletion vectors even if it contributes no APPEND files.
+
+Chunk shuffle, query authorization, first-row merge, deletion-vector merge-on-read,
+dynamic or cross-partition primary-key buckets, and scored or primary-key
+global-index results still use the Python planner. Rust also rejects floating-point
+partition-directory formatting; these scans fall back to Python. Native planning
+remains optional and is disabled by default.
+
+# Load LeRobot Dataset v3
+
+Install the optional dependency, then import a local directory, FileIO URI, or
+Hugging Face repository:
+
+```commandline
+pip install 'pypaimon[lerobot]'
+```
+
+```python
+import pypaimon.multimodal as pmm
+
+connection = pmm.connect(options={"warehouse": "/tmp/warehouse"})
+connection.load_from_lerobot(
+    "robot_data",
+    "/data/lerobot_dataset",
+)
+```
+
+The source dataset must be non-empty. Its schema comes from `meta/info.json`.
+Each frame becomes one row; media uses BLOB columns. The import creates frame,
+Episode, task, info, and optional stats/subtask tables. Info and stats use
+`key STRING, value STRING` rows, with each value JSON-encoded to preserve
+nested metadata. Decode values with `json.loads`.
+
+Before training, pause writes and create a shared tag:
+
+```python
+connection.create_lerobot_tag("robot_data", "train-2026-09-07")
+frames = connection.get_table("robot_data").scan(
+    tag_name="train-2026-09-07").to_arrow()
+```
+
+Read every metadata component with the same tag. Use the tag only after creation
+succeeds; cross-table tagging is not atomic. Alternatively, pass `tag_name` to
+`load_from_lerobot` to tag the imported snapshots immediately.
+
+# HDF5 to multimodal tables
+
+HDF5 loading requires Python 3.8 or newer. Install the optional dependency and
+create the target multimodal table before loading local or remote HDF5 files as
+one or more Arrow batches:
+
+```commandline
+pip install 'pypaimon[hdf5,vortex]'
+```
+
+```python
+import pyarrow as pa
+import pypaimon.multimodal as pmm
+
+EMBEDDING_VECTOR_TYPE = pa.list_(pa.float32(), 3)
+IMAGE_BLOB_TYPE = pa.large_binary()
+
+schema = pa.schema([
+    pa.field("episode_id", pa.string(), nullable=False),
+    pa.field("frame_index", pa.int32(), nullable=False),
+    # Arrow fixed-size lists map to Paimon VECTOR columns.
+    pa.field("embedding", EMBEDDING_VECTOR_TYPE, nullable=False),
+    # Arrow binary and large-binary values map to Paimon BLOB columns.
+    pa.field("image", IMAGE_BLOB_TYPE),
+])
+
+
+def transform(h5, source):
+    episode_id = source.stem
+    for begin in range(0, len(h5["embedding"]), 128):
+        end = min(begin + 128, len(h5["embedding"]))
+        yield pa.RecordBatch.from_pydict({
+            "episode_id": [episode_id] * (end - begin),
+            "frame_index": list(range(begin, end)),
+            "embedding": h5["embedding"][begin:end].tolist(),
+            "image": [bytes(value) for value in h5["image"][begin:end]],
+        }, schema=schema)
+
+connection = pmm.connect(options={"warehouse": "/tmp/warehouse"})
+frames = connection.create_table(
+    "frames",
+    schema=schema,
+)
+result = connection.load_from_hdf5(
+    "frames", "/data/episodes", transform=transform)
+print(result.file_count, result.batch_count, result.row_count, result.snapshot_id)
+```
+
+`load_from_hdf5` accepts one `.h5`/`.hdf5` file, an iterable of paths, or
+directories that are searched recursively. Paths are resolved, duplicate
+files within the call are removed, and the remaining files are processed in
+sorted order. Every yielded batch must have exactly the target columns and be
+safely convertible to the table schema; missing or extra columns, nulls for
+non-nullable fields, incompatible types, and invalid fixed-size vector lengths
+fail the call.
+
+Remote `hdfs://`, `viewfs://`, `oss://`, `s3://`, and `gs://` sources use
+PyPaimon's FileIO abstraction. Pass source-only credentials and endpoints via
+`source_options={"fs.oss.endpoint": "...", ...}`; target warehouse FileIO
+settings are deliberately not reused. h5py reads the seekable FileIO stream
+directly without a local temporary download. Legacy OSS with PyArrow before 16
+supports explicit files but requires Jindo or a newer PyArrow for recursive
+directory discovery. In transforms, `source.local_path` returns a decoded
+`Path` for local sources (including spaces and Unicode) and `None` for remote
+sources.
+
+An empty path iterable or an existing directory without HDF5 files returns
+zero counts and `snapshot_id=None` without creating a writer or snapshot.
+Nonexistent paths, unsupported file suffixes, and discovered files whose
+transform produces no rows remain errors.
+
+All files in one call use one writer and one commit, so success creates one
+snapshot. The API is append-only: it does not add provenance columns, keep a
+source ledger, skip files, or detect drift. Repeating the same call appends the
+rows again. It is not retry-safe because an exception from the commit can have
+an unknown result; inspect table state before deciding whether to retry.
+
+# ROSBag to multimodal tables
+
+ROSBag loading requires Python 3.10 or newer:
+
+```commandline
+pip install 'pypaimon[rosbag]'
+```
+
+Create the target table, then map ROS messages with a user transform:
+
+```python
+import pyarrow as pa
+
+
+schema = pa.schema([
+    pa.field("source", pa.string(), nullable=False),
+    pa.field("timestamp", pa.int64(), nullable=False),
+    pa.field("value", pa.string(), nullable=False),
+])
+connection.create_table("messages", schema=schema)
+
+
+def transform(reader, source):
+    rows = []
+    for connection, timestamp, rawdata in reader.messages():
+        message = reader.deserialize(rawdata, connection.msgtype)
+        rows.append({
+            "source": source.name,
+            "timestamp": timestamp,
+            "value": message.data,
+        })
+    return pa.Table.from_pylist(rows)
+
+result = connection.load_from_rosbag(
+    "messages",
+    "s3://robot-data/recordings",
+    transform=transform,
+    source_options={"fs.s3.endpoint": "https://s3.example.com"},
+)
+```
+
+ROS1 `.bag`, ROS2 SQLite3/MCAP directories, and standalone ROS2 `.mcap`
+files are supported. OSS, S3, HDFS, ViewFS, and GCS URI sources use FileIO
+and are copied in bounded chunks to a local temporary directory because
+`rosbags` requires local paths. Standalone `.db3` files are rejected by
+default; `allow_storage_fragment=True` imports the one SQLite fragment without
+claiming that the complete recording is present.
+
+Every source is scanned to EOF before its transform runs. Transform output is
+strictly checked against the target Arrow schema and stored in a temporary
+Arrow IPC file. Paimon writers are created only after every source passes, so
+source, transform, and schema errors do not create Paimon data files. This
+front-loaded validation reads each recording twice and requires temporary disk
+space. A successful call commits all sources in one snapshot.
+
+Ray uses the same validation contract. Install both extras and call
+`pypaimon.ray.load_from_rosbag`; transformed output is fully materialized in
+Ray before `write_paimon` starts:
+
+```commandline
+pip install 'pypaimon[ray,rosbag]'
+```
+
+# HDFS without a local Hadoop install
+
+`pypaimon` supports HDFS through a pure-protocol client based on
+[`hdfs-native`](https://github.com/Kimahriman/hdfs-native) (Rust + PyO3).
+Use it when you want HDFS access **without** installing Hadoop, a JDK,
+`libhdfs`, or wrestling with `CLASSPATH` / `LD_LIBRARY_PATH`.
+
+Install with the optional extra:
+
+```commandline
+pip install 'pypaimon[hdfs]'
+```
+
+The native backend requires **Python 3.10+** (and is unavailable on Windows).
+On older interpreters the extra is skipped, so `pypaimon` still installs — keep
+using the legacy `pyarrow` (`libhdfs`/JVM) backend there via
+`hdfs.client.impl=pyarrow`.
+
+For `hdfs://` and `viewfs://` URIs this backend is now the default.
+Switch back to the legacy `libhdfs` (JNI) path with:
+
+```python
+catalog = CatalogFactory.create({
+    "warehouse": "hdfs://ns1/warehouse",
+    "hdfs.client.impl": "pyarrow",   # default: "native"
+})
+```
+
+## Sourcing the cluster wiring
+
+The client still needs to know about NameNode addresses, HA failover
+groups, and `viewfs` mount tables. Three options:
+
+1. **Local xml** — set `HADOOP_CONF_DIR` (or the `hdfs.conf-dir` option)
+   to a directory containing `core-site.xml` / `hdfs-site.xml`. Only the
+   xml is required; no Hadoop binaries or JDK.
+
+2. **Catalog options (REST-friendly)** — pass the original Hadoop
+   key/values directly in catalog options. Keys with prefixes `dfs.`,
+   `fs.`, `hadoop.`, `ipc.`, `io.` are forwarded as-is. A REST catalog
+   can deliver these in its response, giving a fully zero-file client
+   experience:
+
+   ```python
+   CatalogFactory.create({
+       "warehouse": "viewfs://cluster/warehouse",
+       "dfs.nameservices": "ns1",
+       "dfs.ha.namenodes.ns1": "nn1,nn2",
+       "dfs.namenode.rpc-address.ns1.nn1": "host-1:8020",
+       "dfs.namenode.rpc-address.ns1.nn2": "host-2:8020",
+       "fs.viewfs.mounttable.cluster.link./prod": "hdfs://ns1/prod",
+   })
+   ```
+
+3. **Namespaced overrides** — use `hdfs.config.<key>` to forward any
+   other Hadoop key not covered by the prefix whitelist.
+
+The three sources can be combined; catalog options take precedence over
+xml.
+
+## Kerberos
+
+A secured cluster still needs the GSSAPI system library
+(`libgssapi-krb5-2` on Debian/Ubuntu, `krb5` via Homebrew on macOS,
+`krb5-libs` on RHEL) plus a `krb5.conf`. Provide credentials by either:
+
+- Running `kinit` yourself and pointing `KRB5CCNAME` at the cache, or
+- Setting `security.kerberos.login.principal` and
+  `security.kerberos.login.keytab` in catalog options — `pypaimon` will
+  run `kinit` for you.
+
+## Fallback behaviour
+
+If the native backend fails to initialise (e.g. wheel missing on an
+unsupported platform such as Windows), `pypaimon` automatically falls
+back to the `pyarrow` (`libhdfs`/JVM) path and logs a warning. Disable
+the fallback with `hdfs.client.fallback-to-pyarrow=false` if you want
+hard failures instead.
+
+
+# Vector index range reads
+
+Native vector indexes (`ivf-flat`, `ivf-pq`, `ivf-sq`, `ivf-rq`, and `diskann`)
+read multiple file ranges concurrently when the input stream supports
+thread-safe positional reads. Set the table option `vindex.read.parallelism`
+to a positive integer to control the maximum number of concurrent reads per
+index reader, including reads from concurrent native query callbacks.
+
+The default is **4** for remote index paths and **1** for local paths (including
+`file://`). Setting it to **1** disables range-level concurrency. Streams that
+only support `seek` and `read` remain serialized. Workers are created lazily
+and released when the index reader closes; separate readers have separate
+budgets. This option controls index I/O, not shard search or native compute
+threads.
+
+
+# Native vector index training
+
+The native vector index writer submits training vectors in bounded batches.
+`<index-type>.train.sample-ratio` (or its field-level override) still selects
+the same evenly spaced non-null vectors in the same order. Native training
+receives the final corpus size for automatic IVF sizing. This bounds Python
+training buffers; native training and index construction have their own
+memory requirements.
+
+
+# Vector fallback scoring and refinement
+
+Raw vector fallback and refinement score regular FLOAT vectors in bounded
+blocks using NumPy. List, large-list and fixed-size-list Arrow arrays are
+supported, including slices and multiple chunks. Null or unsupported blocks
+use the scalar path. Candidate filters are applied before scoring.
+
+L2 and cosine retain scalar accumulation order. Inner product retains Python
+`sum` semantics, including its behavior on newer Python versions. Existing
+Top-K tie-breaking rules are preserved. The same scoring path is used for raw and
+refined primary-key vector results.

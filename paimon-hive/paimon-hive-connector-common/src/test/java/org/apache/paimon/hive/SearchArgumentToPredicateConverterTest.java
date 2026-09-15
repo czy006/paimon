@@ -31,6 +31,7 @@ import org.apache.hadoop.hive.common.type.HiveDecimal;
 import org.apache.hadoop.hive.ql.io.sarg.PredicateLeaf;
 import org.apache.hadoop.hive.ql.io.sarg.SearchArgument;
 import org.apache.hadoop.hive.ql.io.sarg.SearchArgumentFactory;
+import org.apache.hadoop.hive.ql.io.sarg.SearchArgumentImpl.PredicateLeafImpl;
 import org.apache.hadoop.hive.serde2.io.HiveDecimalWritable;
 import org.junit.jupiter.api.Test;
 
@@ -254,9 +255,30 @@ public class SearchArgumentToPredicateConverterTest {
         SearchArgument.Builder builder = SearchArgumentFactory.newBuilder();
         SearchArgument sarg =
                 builder.between("f_bigint", PredicateLeaf.Type.LONG, 100L, 200L).build();
-        Predicate expected =
-                PredicateBuilder.and(BUILDER.greaterOrEqual(1, 100L), BUILDER.lessOrEqual(1, 200L));
+        Predicate expected = BUILDER.between(1, 100L, 200L);
         assertExpected(sarg, expected);
+    }
+
+    @Test
+    public void testUnavailableBetween() {
+        SearchArgument.Builder builder = SearchArgumentFactory.newBuilder();
+        SearchArgument sarg =
+                builder.startAnd()
+                        .between("f_bigint", PredicateLeaf.Type.LONG, 100L, 200L)
+                        .lessThanEquals("f_int", PredicateLeaf.Type.LONG, 10L)
+                        .end()
+                        .build();
+        sarg.getLeaves()
+                .set(
+                        0,
+                        new PredicateLeafImpl(
+                                PredicateLeaf.Operator.BETWEEN,
+                                PredicateLeaf.Type.LONG,
+                                "f_bigint",
+                                null,
+                                Collections.emptyList()));
+
+        assertExpected(sarg, BUILDER.lessOrEqual(0, 10));
     }
 
     @Test
@@ -267,8 +289,7 @@ public class SearchArgumentToPredicateConverterTest {
                         .between("f_bigint", PredicateLeaf.Type.LONG, 100L, 200L)
                         .end()
                         .build();
-        Predicate expected =
-                PredicateBuilder.or(BUILDER.lessThan(1, 100L), BUILDER.greaterThan(1, 200L));
+        Predicate expected = BUILDER.between(1, 100L, 200L).negate().get();
         assertExpected(sarg, expected);
     }
 

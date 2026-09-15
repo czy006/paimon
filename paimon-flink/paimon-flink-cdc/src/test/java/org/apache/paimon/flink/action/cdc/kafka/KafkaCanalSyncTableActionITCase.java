@@ -841,6 +841,12 @@ public class KafkaCanalSyncTableActionITCase extends KafkaSyncTableActionITCase 
 
     @Test
     @Timeout(60)
+    public void testMetadataColumn() throws Exception {
+        testMetadataColumn(CANAL);
+    }
+
+    @Test
+    @Timeout(60)
     public void testTypeMappingToString() throws Exception {
         final String topic = "map-to-string";
         createTestTopic(topic, 1, 1);
@@ -1103,9 +1109,12 @@ public class KafkaCanalSyncTableActionITCase extends KafkaSyncTableActionITCase 
             createFileStoreTable(
                     RowType.of(
                             new DataType[] {
-                                DataTypes.INT().notNull(), DataTypes.DATE(), DataTypes.INT(),
+                                DataTypes.INT().notNull(),
+                                DataTypes.DATE(),
+                                DataTypes.INT(),
+                                DataTypes.STRING()
                             },
-                            new String[] {"_id", "_date", "_year"}),
+                            new String[] {"_id", "_date", "_year", "_date_str"}),
                     Collections.emptyList(),
                     Collections.singletonList("_id"),
                     Collections.emptyList(),
@@ -1123,7 +1132,9 @@ public class KafkaCanalSyncTableActionITCase extends KafkaSyncTableActionITCase 
                         .withCatalogConfig(
                                 Collections.singletonMap(
                                         CatalogOptions.CASE_SENSITIVE.key(), "false"))
-                        .withComputedColumnArgs("_YEAR=year(_DATE)")
+                        // the pattern literal must survive the case-insensitive handling
+                        .withComputedColumnArgs(
+                                "_YEAR=year(_DATE)", "_DATE_STR=date_format(_DATE,yyyy-MM-dd)")
                         .build();
         runActionWithDefaultEnv(action);
 
@@ -1134,11 +1145,14 @@ public class KafkaCanalSyncTableActionITCase extends KafkaSyncTableActionITCase 
         RowType rowType =
                 RowType.of(
                         new DataType[] {
-                            DataTypes.INT().notNull(), DataTypes.DATE(), DataTypes.INT()
+                            DataTypes.INT().notNull(),
+                            DataTypes.DATE(),
+                            DataTypes.INT(),
+                            DataTypes.STRING()
                         },
-                        new String[] {"_id", "_date", "_year"});
+                        new String[] {"_id", "_date", "_year", "_date_str"});
         waitForResult(
-                Arrays.asList("+I[1, 19439, 2023]", "+I[2, NULL, NULL]"),
+                Arrays.asList("+I[1, 19439, 2023, 2023-03-23]", "+I[2, NULL, NULL, NULL]"),
                 getFileStoreTable(tableName),
                 rowType,
                 Collections.singletonList("_id"));

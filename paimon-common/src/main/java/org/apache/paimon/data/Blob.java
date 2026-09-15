@@ -20,11 +20,16 @@ package org.apache.paimon.data;
 
 import org.apache.paimon.annotation.Public;
 import org.apache.paimon.fs.FileIO;
+import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.SeekableInputStream;
 import org.apache.paimon.fs.local.LocalFileIO;
 import org.apache.paimon.utils.UriReader;
+import org.apache.paimon.utils.UriReaderFactory;
+
+import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.function.Supplier;
 
 /**
@@ -40,6 +45,11 @@ public interface Blob {
     BlobDescriptor toDescriptor();
 
     SeekableInputStream newInputStream() throws IOException;
+
+    default String toPresignedUrl(FileIO fileIO, Path tableRoot, Duration validity)
+            throws IOException {
+        return fileIO.createBlobPresignedUrl(tableRoot, toDescriptor(), validity);
+    }
 
     static Blob fromData(byte[] data) {
         return new BlobData(data);
@@ -63,6 +73,74 @@ public interface Blob {
 
     static Blob fromDescriptor(UriReader reader, BlobDescriptor descriptor) {
         return new BlobRef(reader, descriptor);
+    }
+
+    static BlobView fromView(BlobViewStruct viewStruct) {
+        return new BlobView(viewStruct);
+    }
+
+    static Blob fromBytes(
+            byte[] bytes, @Nullable UriReaderFactory uriReaderFactory, @Nullable FileIO fileIO) {
+        return fromBytes(bytes, uriReaderFactory, fileIO, true);
+    }
+
+    static Blob fromBytes(
+            byte[] bytes,
+            @Nullable UriReaderFactory uriReaderFactory,
+            @Nullable FileIO fileIO,
+            boolean allowBlobData) {
+        if (bytes == null) {
+            return null;
+        }
+
+        if (BlobViewStruct.isBlobViewStruct(bytes)) {
+            return fromView(BlobViewStruct.deserialize(bytes));
+        }
+
+        if (BlobDescriptor.isSerializedDescriptor(bytes) || !allowBlobData) {
+            BlobDescriptor descriptor = BlobDescriptor.deserialize(bytes);
+            UriReader reader =
+                    uriReaderFactory != null
+                            ? uriReaderFactory.create(descriptor.uri())
+                            : UriReader.fromFile(fileIO);
+            return fromDescriptor(reader, descriptor);
+        }
+
+        return fromData(bytes);
+    }
+
+    static Blob fromBytesWithReader(
+            byte[] bytes, @Nullable UriReader uriReader, @Nullable FileIO fileIO) {
+        return fromBytesWithReader(bytes, uriReader, fileIO, true);
+    }
+
+    static Blob fromBytesWithReader(
+            byte[] bytes,
+            @Nullable UriReader uriReader,
+            @Nullable FileIO fileIO,
+            boolean allowBlobData) {
+        if (bytes == null) {
+            return null;
+        }
+
+        if (BlobViewStruct.isBlobViewStruct(bytes)) {
+            return fromView(BlobViewStruct.deserialize(bytes));
+        }
+
+        if (BlobDescriptor.isSerializedDescriptor(bytes) || !allowBlobData) {
+            BlobDescriptor descriptor = BlobDescriptor.deserialize(bytes);
+            UriReader reader = uriReader == null ? UriReader.fromFile(fileIO) : uriReader;
+            return fromDescriptor(reader, descriptor);
+        }
+
+        return fromData(bytes);
+    }
+
+    static byte[] serializeBlob(Blob blob) {
+        if (blob instanceof BlobView) {
+            return ((BlobView) blob).viewStruct().serialize();
+        }
+        return blob.toDescriptor().serialize();
     }
 
     static Blob fromInputStream(Supplier<SeekableInputStream> supplier) {

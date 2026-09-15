@@ -1,0 +1,699 @@
+---
+title: "Aggregation"
+sidebar_position: 3
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# Aggregation
+
+:::info
+
+NOTE: Always set `table.exec.sink.upsert-materialize` to `NONE` in Flink SQL TableConfig.
+
+:::
+
+Sometimes users only care about aggregated results. The `aggregation` merge engine aggregates each value field with the latest data one by one under the same primary key according to the aggregate function.
+
+For ordinary non-key fields, Paimon selects the function in this order:
+
+1. `fields.<field-name>.aggregate-function`, when configured for the field.
+2. `fields.default-aggregate-function`, when configured for the table.
+3. `last_non_null_value` otherwise.
+
+Sequence fields use `last_value`; primary-key fields are not value-aggregated.
+The following table keeps the maximum observed price and sums the sales contributions.
+
+<Tabs groupId="aggregation-merge-engine-example">
+
+<TabItem value="flink" label="Flink">
+
+```sql
+CREATE TABLE my_table (
+    product_id BIGINT,
+    price DOUBLE,
+    sales BIGINT,
+    PRIMARY KEY (product_id) NOT ENFORCED
+) WITH (
+    'merge-engine' = 'aggregation',
+    'fields.price.aggregate-function' = 'max',
+    'fields.sales.aggregate-function' = 'sum'
+);
+```
+
+</TabItem>
+
+</Tabs>
+
+Field `price` will be aggregated by the `max` function, and field `sales` will be aggregated by the `sum` function. Given two input records `<1, 23.0, 15>` and `<1, 30.2, 20>`, the final result will be `<1, 30.2, 35>`.
+
+## Streaming Reads
+
+For a stream of complete aggregated rows, use the `lookup` or `full-compaction`
+[changelog producer](../changelog-producer). The `input` producer forwards the input contributions,
+which are not necessarily the aggregated result.
+
+## Aggregation Functions
+
+Choose each function according to the meaning of its input contributions. Replaying a contribution
+can change results such as `sum`; this engine does not deduplicate events by a separate event ID.
+Check [Retraction](#retraction) before accepting `UPDATE_BEFORE` or `DELETE` records.
+
+| Need | Functions or recipe |
+| --- | --- |
+| Numeric aggregation | [sum](#sum), [product](#product), [max](#max), [min](#min), [counting with sum](#count) |
+| Retain a value | [last_value](#last_value), [last_non_null_value](#last_non_null_value), [first_value](#first_value), [first_non_null_value](#first_non_null_value) |
+| Strings and booleans | [listagg](#listagg), [bool_and](#bool_and), [bool_or](#bool_or) |
+| Arrays and maps | [collect](#collect), [merge_map](#merge_map), [merge_map_with_keytime](#merge_map_with_keytime) |
+| Nested rows | [nested_update](#nested_update), [nested_partial_update](#nested_partial_update) |
+| Bitmap union | [rbm32](#rbm32), [rbm64](#rbm64) |
+| Approximate distinct counts | [hll_sketch](#hll_sketch), [theta_sketch](#theta_sketch) |
+
+## Numeric Functions
+
+### sum
+
+  The sum function aggregates the values across multiple rows.
+  It supports DECIMAL, TINYINT, SMALLINT, INTEGER, BIGINT, FLOAT, and DOUBLE data types.
+
+### product
+  The product function can compute product values across multiple lines.
+  It supports DECIMAL, TINYINT, SMALLINT, INTEGER, BIGINT, FLOAT, and DOUBLE data types.
+
+### Counting with sum {#count}
+
+There is no `count` value for `fields.<field-name>.aggregate-function`. To count contributions,
+write `1` for a matching event and `0` for a non-matching event into a field configured with `sum`.
+For example, this Flink SQL table counts paid events per customer:
+
+```sql
+CREATE TABLE customer_counts (
+    customer_id BIGINT,
+    paid_events BIGINT,
+    PRIMARY KEY (customer_id) NOT ENFORCED
+) WITH (
+    'merge-engine' = 'aggregation',
+    'fields.paid_events.aggregate-function' = 'sum'
+);
+
+-- customer 1: matching event, non-matching event, matching event
+INSERT INTO customer_counts VALUES (1, 1), (1, 0), (1, 1);
+
+SELECT * FROM customer_counts;
+-- 1, 2
+```
+
+In a pipeline, derive the contribution with `CASE WHEN condition THEN 1 ELSE 0 END` in the input
+query. Replaying an event adds its contribution again; this is a count of contributions, not a
+count of distinct event IDs.
+
+### max
+  The max function identifies and retains the maximum value.
+  It supports BOOLEAN, CHAR, VARCHAR, BINARY, VARBINARY, DECIMAL, TINYINT, SMALLINT, INTEGER, BIGINT, FLOAT, DOUBLE, DATE, TIME, TIMESTAMP, and TIMESTAMP_LTZ data types.
+
+### min
+  The min function identifies and retains the minimum value.
+  It supports BOOLEAN, CHAR, VARCHAR, BINARY, VARBINARY, DECIMAL, TINYINT, SMALLINT, INTEGER, BIGINT, FLOAT, DOUBLE, DATE, TIME, TIMESTAMP, and TIMESTAMP_LTZ data types.
+
+## Value Selection
+
+### last_value
+  The last_value function replaces the previous value with the most recently imported value.
+  It supports all data types.
+
+### last_non_null_value
+  The last_non_null_value function replaces the previous value with the latest non-null value.
+  It supports all data types.
+
+### first_value
+  The first_value function retains the first value, including null.
+  It supports all data types.
+
+### first_non_null_value
+  The first_non_null_value function selects the first non-null value in a data set.
+  It supports all data types.
+
+## Strings and Booleans
+
+### listagg
+  The listagg function concatenates multiple string values into a single string.
+  It supports STRING data type.
+  Each field not part of the primary keys can be given a list agg delimiter, specified by the fields.\<field-name>.list-agg-delimiter table property, otherwise it will use "," as default.
+  You can use `fields.<field-name>.distinct=true` to deduplicate values split by the `fields.<field-name>.list-agg-delimiter`.
+
+### bool_and
+  The bool_and function evaluates whether all values in a boolean set are true.
+  It supports BOOLEAN data type.
+
+### bool_or
+  The bool_or function checks if at least one value in a boolean set is true.
+  It supports BOOLEAN data type.
+
+## Collections and Nested Rows
+
+### collect
+  The collect function collects elements into an Array. You can set `fields.<field-name>.distinct=true` to deduplicate elements.
+  It only supports ARRAY type.
+
+### merge_map
+  The merge_map function merge input maps. It only supports MAP type.
+
+### merge_map_with_keytime
+
+  The merge_map_with_keytime function merges input maps with key-level partial updates based on timestamps.
+  Each key in the map carries a string timestamp. During merging, the entry with the greater
+  timestamp in lexicographic order is retained. Use equally padded numeric strings or a consistent
+  sortable date/time format; the implementation reads this field as a string.
+  It only supports `MAP<key_type, ROW<value_field, ts_field>>` type, where the ROW must have at least 2 fields.
+
+  Use `fields.<field-name>.ts-field=<field_name_in_row>` to specify the timestamp field name in the ROW type.
+  If not specified, the last field of the ROW is used as the timestamp by default.
+
+  When merging into an existing map, a null incoming map value removes that key, and an entry
+  with a null timestamp is skipped. The first map is accepted directly when there is no existing
+  accumulator, so do not rely on the first input to remove null entries or null timestamps.
+
+  An example:
+
+  <Tabs groupId="merge-map-with-keytime-example">
+
+<TabItem value="flink" label="Flink">
+
+```sql
+  CREATE TABLE my_table (
+      biz_order_id STRING,
+      key_value_map MAP<STRING, ROW<`value` STRING, `ts` STRING>>,
+      PRIMARY KEY (biz_order_id) NOT ENFORCED
+  ) WITH (
+      'merge-engine' = 'aggregation',
+      'fields.key_value_map.aggregate-function' = 'merge_map_with_keytime',
+      'fields.key_value_map.ts-field' = 'ts'
+  );
+  ```
+
+</TabItem>
+
+</Tabs>
+
+  Given the following input records:
+
+  | biz_order_id | key_value_map |
+  |---|---|
+  | 1 | {'\{'}"product_name": ("iPhone", "100"), "color": ("Black", "100"){'\}'} |
+  | 1 | {'\{'}"product_name": ("iPad", "200"), "price": ("999", "200"){'\}'} |
+  | 1 | {'\{'}"color": ("White", "050"){'\}'} |
+
+  The final result will be:
+  `{"product_name": ("iPad", "200"), "color": ("Black", "100"), "price": ("999", "200")}`
+  Note that `color` remains "Black" because its existing timestamp "100" is greater than the incoming "050".
+
+### nested_update
+  The nested_update function collects multiple rows into one array\<row> (so-called 'nested table'). It supports ARRAY\<ROW> data types.
+
+  Use `fields.<field-name>.nested-key=pk0,pk1,...` to specify the primary keys of the nested table. If no keys, row will be appended to array\<row>.
+
+  Use `fields.<field-name>.nested-key-null-strategy=<merge|ignore|error>` to specify how rows are handled when the nested-key does not satisfy primary key semantics (e.g., primary key fields contain null values).
+
+   - `merge` (default): Merge rows even if the nested-key does not satisfy primary key semantics. This is the same behavior as when this option is not configured.
+   - `ignore`: Ignore rows whose nested-key contains null values because they do not satisfy primary key semantics.
+   - `error`: Throw an exception if the nested-key contains null values, because primary key fields must not be null.
+
+  Use `fields.<field-name>.nested-sequence-field=seq0,seq1,...` to control the update sequence of a nested table, you must configure `fields.<field-name>.nested-key` when using it.
+
+  Use `fields.<field-name>.count-limit=<Integer>` to specify the maximum number of rows in the nested table. When no nested-key, it will select data
+  sequentially up to limit; but if nested-key is specified, it cannot guarantee the correctness of the aggregation result. This option can be used to
+  avoid abnormal input.
+
+  An example:
+
+  <Tabs groupId="nested-update-example">
+
+<TabItem value="flink" label="Flink">
+
+```sql
+  -- orders table
+  CREATE TABLE orders (
+    order_id BIGINT PRIMARY KEY NOT ENFORCED,
+    user_name STRING,
+    address STRING
+  );
+
+  -- sub orders that have the same order_id
+  -- belongs to the same order
+  CREATE TABLE sub_orders (
+    order_id BIGINT,
+    sub_order_id INT,
+    product_name STRING,
+    price BIGINT,
+    PRIMARY KEY (order_id, sub_order_id) NOT ENFORCED
+  );
+
+  -- wide table
+  CREATE TABLE order_wide (
+    order_id BIGINT PRIMARY KEY NOT ENFORCED,
+    user_name STRING,
+    address STRING,
+    sub_orders ARRAY<ROW<sub_order_id BIGINT, product_name STRING, price BIGINT>>
+  ) WITH (
+    'merge-engine' = 'aggregation',
+    'fields.sub_orders.aggregate-function' = 'nested_update',
+    'fields.sub_orders.nested-key' = 'sub_order_id'
+  );
+
+  -- widen
+  INSERT INTO order_wide
+
+  SELECT
+    order_id,
+    user_name,
+    address,
+    CAST (NULL AS ARRAY<ROW<sub_order_id BIGINT, product_name STRING, price BIGINT>>)
+  FROM orders
+
+  UNION ALL
+
+  SELECT
+    order_id,
+    CAST (NULL AS STRING),
+    CAST (NULL AS STRING),
+    ARRAY[ROW(sub_order_id, product_name, price)]
+  FROM sub_orders;
+
+  -- query using UNNEST
+  SELECT order_id, user_name, address, sub_order_id, product_name, price
+  FROM order_wide, UNNEST(sub_orders) AS so(sub_order_id, product_name, price)
+  ```
+
+</TabItem>
+
+</Tabs>
+
+### nested_partial_update
+  The nested_partial_update function collects multiple rows into one array\<row\> (so-called 'nested table'). It supports
+  ARRAY\<ROW\> data types. You need to use `fields.<field-name>.nested-key=pk0,pk1,...` to specify the primary keys of the
+  nested table. The values in each row are written by partial updating some columns.
+
+  Use `fields.<field-name>.nested-key-null-strategy=<merge|ignore|error>` to specify how rows are handled when the nested-key does not satisfy primary key semantics (e.g., primary key fields contain null values).
+
+   - `merge` (default): Merge rows even if the nested-key does not satisfy primary key semantics. This is the same behavior as when this option is not configured.
+   - `ignore`: Ignore rows whose nested-key contains null values because they do not satisfy primary key semantics.
+   - `error`: Throw an exception if the nested-key contains null values, because primary key fields must not be null.
+
+## Bitmap Aggregation
+
+### rbm32
+  The rbm32 function aggregates multiple serialized 32-bit RoaringBitmap into a single RoaringBitmap.
+  It supports VARBINARY data type which must be serialized 32-bit RoaringBitmap.
+
+  RoaringBitmap is a compressed bitmap that efficiently represents sets of integers. The rbm32 aggregator is useful for scenarios where you need to merge multiple bitmap sets or use case requiring set union operations on large integer datasets.
+
+  **Example:**
+
+  ```sql
+  -- Create a table to store user visit data with bitmap aggregation
+  CREATE TABLE user_visits (
+    user_id INT PRIMARY KEY NOT ENFORCED,
+    visit_bitmap VARBINARY
+  ) WITH (
+    'merge-engine' = 'aggregation',
+    'fields.visit_bitmap.aggregate-function' = 'rbm32'
+  );
+
+  -- Register a UDF to create RoaringBitmap from user IDs
+  -- CREATE TEMPORARY FUNCTION TO_BITMAP AS 'BitmapUDF';
+
+  -- Insert data with bitmap representations
+  INSERT INTO user_visits VALUES
+    (1, TO_BITMAP(100, 101, 102)),  -- User 1 visited pages 100, 101, 102
+    (2, TO_BITMAP(101, 103)),       -- User 2 visited pages 101, 103
+    (3, TO_BITMAP(102, 104));       -- User 3 visited pages 102, 104
+
+  -- When the same user_id is inserted again, the bitmaps will be merged
+  INSERT INTO user_visits VALUES
+    (1, TO_BITMAP(103, 105)),       -- User 1 also visited pages 103, 105
+    (2, TO_BITMAP(104, 106));       -- User 2 also visited pages 104, 106
+
+  -- The final result will have merged bitmaps for each user
+  -- User 1: pages 100, 101, 102, 103, 105
+  -- User 2: pages 101, 103, 104, 106
+  -- User 3: pages 102, 104
+  ```
+
+### rbm64
+  The rbm64 function aggregates multiple serialized 64-bit Roaring64Bitmap into a single Roaring64Bitmap.
+  It supports VARBINARY data type which must be serialized 64-bit RoaringBitmap.
+
+  Similar to rbm32, but supports 64-bit integers, making it suitable for scenarios with very large integer values
+  or when identifiers require a 64-bit representation.
+
+  **Example:**
+
+  ```sql
+  -- Create a table to store large-scale user interaction data
+  CREATE TABLE user_interactions (
+    session_id BIGINT PRIMARY KEY NOT ENFORCED,
+    interaction_bitmap VARBINARY
+  ) WITH (
+    'merge-engine' = 'aggregation',
+    'fields.interaction_bitmap.aggregate-function' = 'rbm64'
+  );
+
+  -- Register a UDF to create Roaring64Bitmap from large user IDs
+  -- CREATE TEMPORARY FUNCTION TO_BITMAP64 AS 'Bitmap64UDF';
+
+  -- Insert data with 64-bit bitmap representations
+  INSERT INTO user_interactions VALUES
+    (1001, TO_BITMAP64(1000000001L, 1000000002L, 1000000003L)),
+    (1002, TO_BITMAP64(1000000002L, 1000000004L)),
+    (1003, TO_BITMAP64(1000000003L, 1000000005L));
+
+  -- Merge additional interactions
+  INSERT INTO user_interactions VALUES
+    (1001, TO_BITMAP64(1000000004L, 1000000006L)),
+    (1002, TO_BITMAP64(1000000005L, 1000000007L));
+
+  -- The final result will have merged 64-bit bitmaps for each session
+  ```
+
+The `rbm32` and `rbm64` aggregators work by:
+1. Deserializing the input VARBINARY data into RoaringBitmap objects
+2. Performing bitwise OR operations to merge the bitmaps
+3. Serializing the result back to VARBINARY format
+
+<details>
+<summary>Preparing bitmap inputs and implementing Flink UDFs</summary>
+
+Paimon currently does not provide built-in Flink UDFs for bitmap creation. You have two options:
+
+1. Create bitmaps programmatically: in your application code and insert serialized bytes
+2. Create custom Flink UDFs: to convert raw integers to serialized bitmap format
+
+The examples below illustrate both approaches. SQL names such as `TO_BITMAP`, `FROM_BITMAP`,
+and `BITMAP_CONTAINS` refer to user-supplied functions; they are not built-in Paimon functions.
+
+**Option 1: Programmatic Bitmap Creation (Java/Scala)**
+
+```java
+// Create bitmaps programmatically
+RoaringBitmap32 bitmap1 = RoaringBitmap32.bitmapOf(100, 101, 102);
+RoaringBitmap32 bitmap2 = RoaringBitmap32.bitmapOf(101, 103);
+RoaringBitmap32 bitmap3 = RoaringBitmap32.bitmapOf(102, 104);
+
+byte[] serialized1 = bitmap1.serialize();
+byte[] serialized2 = bitmap2.serialize();
+byte[] serialized3 = bitmap3.serialize();
+
+// Write serialized1, serialized2, and serialized3 as VARBINARY values through your writer API.
+```
+
+**Option 2: Custom Flink UDFs**
+
+```sql
+-- Create the aggregation table
+CREATE TABLE user_page_visits (
+    user_id INT PRIMARY KEY NOT ENFORCED,
+    page_visits VARBINARY
+) WITH (
+    'merge-engine' = 'aggregation',
+    'fields.page_visits.aggregate-function' = 'rbm32'
+);
+
+-- Register custom UDFs (you need to implement these)
+
+-- Use the UDFs
+INSERT INTO user_page_visits VALUES
+    (1, TO_BITMAP(100, 101, 102)),
+    (2, TO_BITMAP(101, 103)),
+    (3, TO_BITMAP(102, 104));
+
+-- Query with UDFs
+SELECT user_id, FROM_BITMAP(page_visits) as unique_pages
+FROM user_page_visits;
+
+SELECT user_id,
+       BITMAP_CONTAINS(page_visits, 101) as visited_page_101
+FROM user_page_visits
+WHERE user_id = 1;
+```
+
+**Sample UDF Implementation (Java):**
+
+```java
+// BitmapUDF - Converts integers to serialized RoaringBitmap
+public static class BitmapUDF extends ScalarFunction {
+    public byte[] eval(Integer... values) {
+        RoaringBitmap32 bitmap = new RoaringBitmap32();
+        for (Integer value : values) {
+            if (value != null) {
+                bitmap.add(value);
+            }
+        }
+        return bitmap.serialize();
+    }
+}
+
+// BitmapCountUDF - Gets cardinality from serialized RoaringBitmap
+public static class BitmapCountUDF extends ScalarFunction {
+    public Long eval(byte[] bitmapBytes) {
+        if (bitmapBytes == null) {
+            return 0L;
+        }
+        try {
+            RoaringBitmap32 bitmap = new RoaringBitmap32();
+            bitmap.deserialize(ByteBuffer.wrap(bitmapBytes));
+            return bitmap.getCardinality();
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to deserialize bitmap", e);
+        }
+    }
+}
+
+// BitmapContainsUDF - Checks if value exists in bitmap
+public static class BitmapContainsUDF extends ScalarFunction {
+    public Boolean eval(byte[] bitmapBytes, Integer value) {
+        if (bitmapBytes == null || value == null) {
+            return false;
+        }
+        try {
+            RoaringBitmap32 bitmap = new RoaringBitmap32();
+            bitmap.deserialize(ByteBuffer.wrap(bitmapBytes));
+            return bitmap.contains(value);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to deserialize bitmap", e);
+        }
+    }
+}
+```
+
+</details>
+
+## Types of cardinality sketches
+
+ Paimon uses the [Apache DataSketches](https://datasketches.apache.org/) library of stochastic streaming algorithms to implement sketch modules. The DataSketches library includes various types of sketches, each one designed to solve a different sort of problem. Paimon supports HyperLogLog (HLL) and Theta cardinality sketches.
+
+### HyperLogLog
+
+ The HyperLogLog (HLL) sketch aggregator is a very compact sketch algorithm for approximate distinct counting.  You can also use the HLL aggregator to calculate a union of HLL sketches.
+
+### Theta
+
+ The Theta sketch is a sketch algorithm for approximate distinct counting with set operations. Theta sketches let you count the overlap between sets, so that you can compute the union, intersection, or set difference between sketch objects.
+
+### Choosing a sketch type
+
+  HLL and Theta sketches both support approximate distinct counting; however, the HLL sketch produces more accurate results and consumes less storage space. Theta sketches are more flexible but require significantly more memory.
+
+When choosing an approximation algorithm for your use case, consider the following:
+
+If your use case entails distinct counting and merging sketch objects, use the HLL sketch.
+If you need to evaluate union, intersection, or difference set operations, use the Theta sketch.
+You cannot merge HLL sketches with Theta sketches. Paimon's `hll_sketch` and `theta_sketch`
+aggregate functions both perform **union**. Theta intersection and difference operations require
+separate application code or UDFs; they are not operations selectable on `theta_sketch`.
+
+### hll_sketch
+
+The hll_sketch function aggregates multiple serialized Sketch objects into a single Sketch.
+It supports VARBINARY data type.
+
+An example:
+
+<details>
+<summary>Flink SQL and HLL UDF example</summary>
+
+<Tabs groupId="hll-sketch-example">
+
+<TabItem value="flink" label="Flink">
+
+```sql
+  -- source table
+  CREATE TABLE VISITS (
+    id INT PRIMARY KEY NOT ENFORCED,
+    user_id STRING
+  );
+
+  -- agg table
+  CREATE TABLE UV_AGG (
+    id INT PRIMARY KEY NOT ENFORCED,
+    uv VARBINARY
+  ) WITH (
+    'merge-engine' = 'aggregation',
+    'fields.uv.aggregate-function' = 'hll_sketch'
+  );
+
+  -- Register the following class as a Flink function with the name "HLL_SKETCH"
+  -- for example: create TEMPORARY function HLL_SKETCH as  'HllSketchFunction';
+  -- which is used to transform input to sketch bytes array:
+  --
+  -- public static class HllSketchFunction extends ScalarFunction {
+  --   public byte[] eval(String user_id) {
+  --     HllSketch hllSketch = new HllSketch();
+  --     hllSketch.update(user_id);
+  --     return hllSketch.toCompactByteArray();
+  --   }
+  -- }
+  --
+  INSERT INTO UV_AGG SELECT id, HLL_SKETCH(user_id) FROM VISITS;
+
+  -- Register the following class as a Flink function with the name "HLL_SKETCH_COUNT"
+  -- for example: create TEMPORARY function HLL_SKETCH_COUNT as  'HllSketchCountFunction';
+  -- which is used to get cardinality from sketch bytes array:
+  --
+  -- public static class HllSketchCountFunction extends ScalarFunction {
+  --   public Double eval(byte[] sketchBytes) {
+  --     if (sketchBytes == null) {
+  --       return 0d;
+  --     }
+  --     return HllSketch.heapify(sketchBytes).getEstimate();
+  --   }
+  -- }
+  --
+  -- Then we can get user cardinality based on the aggregated field.
+  SELECT id, HLL_SKETCH_COUNT(UV) as uv FROM UV_AGG;
+  ```
+
+</TabItem>
+
+</Tabs>
+
+</details>
+
+
+### theta_sketch
+  The theta_sketch function aggregates multiple serialized Sketch objects into a single Sketch.
+  It supports VARBINARY data type.
+
+  An example:
+
+  <details>
+<summary>Flink SQL and Theta UDF example</summary>
+
+<Tabs groupId="theta-sketch-example">
+
+<TabItem value="flink" label="Flink">
+
+```sql
+  -- source table
+  CREATE TABLE VISITS (
+    id INT PRIMARY KEY NOT ENFORCED,
+    user_id STRING
+  );
+
+  -- agg table
+  CREATE TABLE UV_AGG (
+    id INT PRIMARY KEY NOT ENFORCED,
+    uv VARBINARY
+  ) WITH (
+    'merge-engine' = 'aggregation',
+    'fields.uv.aggregate-function' = 'theta_sketch'
+  );
+
+  -- Register the following class as a Flink function with the name "THETA_SKETCH"
+  -- for example: create TEMPORARY function THETA_SKETCH as  'ThetaSketchFunction';
+  -- which is used to transform input to sketch bytes array:
+  --
+  -- public static class ThetaSketchFunction extends ScalarFunction {
+  --   public byte[] eval(String user_id) {
+  --     UpdateSketch updateSketch = UpdateSketch.builder().build();
+  --     updateSketch.update(user_id);
+  --     return updateSketch.compact().toByteArray();
+  --   }
+  -- }
+  --
+  INSERT INTO UV_AGG SELECT id, THETA_SKETCH(user_id) FROM VISITS;
+
+  -- Register the following class as a Flink function with the name "THETA_SKETCH_COUNT"
+  -- for example: create TEMPORARY function THETA_SKETCH_COUNT as  'ThetaSketchCountFunction';
+  -- which is used to get cardinality from sketch bytes array:
+  --
+  -- public static class ThetaSketchCountFunction extends ScalarFunction {
+  --   public Double eval(byte[] sketchBytes) {
+  --     if (sketchBytes == null) {
+  --       return 0d;
+  --     }
+  --     return Sketches.wrapCompactSketch(Memory.wrap(sketchBytes)).getEstimate();
+  --   }
+  -- }
+  --
+  -- Then we can get user cardinality based on the aggregated field.
+  SELECT id, THETA_SKETCH_COUNT(UV) as uv FROM UV_AGG;
+  ```
+
+</TabItem>
+
+</Tabs>
+
+</details>
+
+## Retraction
+
+By default, `UPDATE_BEFORE` and `DELETE` retract individual field contributions. Only `sum`,
+`product`, `collect`, `merge_map`, `nested_update`, `last_value`, and `last_non_null_value` support
+this behavior. Other functions, including bitmap and sketch aggregators, reject field retractions
+unless `fields.<field-name>.ignore-retract = true` is configured.
+
+### Delete the Whole Row
+
+Set `aggregation.remove-record-on-delete = true` to remove the whole row on `DELETE`, bypassing
+per-field retraction. The default is `false`. `UPDATE_BEFORE` still retracts individual fields.
+This option cannot be combined with per-field `ignore-retract`.
+
+### Field Retraction Behavior
+
+`last_value` always clears the field on retraction. `last_non_null_value` clears it only when
+the retract record's field is non-null; a null retract leaves the accumulated value unchanged.
+Neither function restores an earlier historical value.
+
+The `product` will return null for retraction message when accumulator is null.
+
+The `collect` and `merge_map` make a best-effort attempt to handle retraction messages, but the results are not
+guaranteed to be accurate. The following behaviors may occur when processing retraction messages:
+
+1. It might fail to handle retraction messages if records are disordered. For example, the table uses `collect`, and the
+   upstreams send `+I['A', 'B']` and `-U['A']` respectively. If the table receives `-U['A']` first, it can do nothing; then it receives
+   `+I['A', 'B']`, the merge result will be `+I['A', 'B']` instead of `+I['B']`.
+
+2. The retract message from one upstream will retract the result merged from multiple upstreams. For example, the table
+   uses `merge_map`, and one upstream sends `+I[1->A]`, another upstream sends `+I[1->B]`, `-D[1->B]` later. The table will
+   merge two insert values to `+I[1->B]` first, and then the `-D[1->B]` will retract the whole result, so the final result
+   is an empty map instead of `+I[1->A]`

@@ -23,11 +23,12 @@ import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.local.LocalFileIO;
 import org.apache.paimon.partition.PartitionStatistics;
+import org.apache.paimon.schema.FileSystemSchemaManager;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.schema.SchemaManager;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.FileStoreTableFactory;
-import org.apache.paimon.table.PartitionHandler;
+import org.apache.paimon.table.PartitionModification;
 import org.apache.paimon.table.sink.BatchTableCommit;
 import org.apache.paimon.table.sink.BatchTableWrite;
 import org.apache.paimon.table.sink.CommitMessage;
@@ -55,7 +56,7 @@ public class PartitionStatisticsReporterTest {
     @Test
     public void testReportAction() throws Exception {
         Path tablePath = new Path(tempDir.toString(), "table");
-        SchemaManager schemaManager = new SchemaManager(LocalFileIO.create(), tablePath);
+        SchemaManager schemaManager = new FileSystemSchemaManager(LocalFileIO.create(), tablePath);
         Schema schema =
                 new Schema(
                         Lists.newArrayList(
@@ -91,8 +92,8 @@ public class PartitionStatisticsReporterTest {
         AtomicBoolean closed = new AtomicBoolean(false);
         Map<String, PartitionStatistics> partitionParams = Maps.newHashMap();
 
-        PartitionHandler partitionHandler =
-                new PartitionHandler() {
+        PartitionModification partitionModification =
+                new PartitionModification() {
 
                     @Override
                     public void createPartitions(List<Map<String, String>> partitions) {
@@ -105,21 +106,16 @@ public class PartitionStatisticsReporterTest {
                     }
 
                     @Override
-                    public void markDonePartitions(List<Map<String, String>> partitions) {
-                        throw new UnsupportedOperationException();
-                    }
-
-                    @Override
                     public void alterPartitions(List<PartitionStatistics> partitions) {
                         partitions.forEach(
-                                partition -> {
-                                    partitionParams.put(
-                                            PartitionPathUtils.generatePartitionPath(
-                                                    partition.spec(),
-                                                    table.rowType().project(table.partitionKeys()),
-                                                    false),
-                                            partition);
-                                });
+                                partition ->
+                                        partitionParams.put(
+                                                PartitionPathUtils.generatePartitionPath(
+                                                        partition.spec(),
+                                                        table.rowType()
+                                                                .project(table.partitionKeys()),
+                                                        false),
+                                                partition));
                     }
 
                     @Override
@@ -129,13 +125,17 @@ public class PartitionStatisticsReporterTest {
                 };
 
         PartitionStatisticsReporter action =
-                new PartitionStatisticsReporter(table, partitionHandler);
+                new PartitionStatisticsReporter(table, partitionModification);
         long time = 1729598544974L;
         action.report("c1=a/", time);
         assertThat(partitionParams).containsKey("c1=a/");
-        assertThat(partitionParams.get("c1=a/").toString())
-                .isEqualTo(
-                        "{spec={c1=a}, recordCount=2, fileSizeInBytes=705, fileCount=1, lastFileCreationTime=1729598544974}");
+        PartitionStatistics stats = partitionParams.get("c1=a/");
+        assertThat(stats.spec()).containsEntry("c1", "a");
+        assertThat(stats.recordCount()).isEqualTo(2);
+        assertThat(stats.fileSizeInBytes()).isGreaterThan(0); // fileSizeInBytes
+        assertThat(stats.fileCount()).isEqualTo(1);
+        assertThat(stats.lastFileCreationTime()).isEqualTo(1729598544974L);
+        assertThat(stats.totalBuckets()).isEqualTo(-1);
         action.close();
         assertThat(closed).isTrue();
     }

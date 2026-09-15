@@ -48,14 +48,11 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ConfigResponse'
-              example: {
-                "overrides": {
-                  "key": "value"
-                },
-                "defaults": {
-                  "prefix": "prefix"
-                }
-              }
+              example:
+                overrides:
+                  key: value
+                defaults:
+                  prefix: prefix
         "401":
           $ref: '#/components/responses/UnauthorizedErrorResponse'
         "500":
@@ -383,7 +380,7 @@ paths:
             type: string
         - name: databaseNamePattern
           description: A sql LIKE pattern (%) for database names. All databases will be returned if not set or empty. Currently, only prefix matching is supported.
-          in: path
+          in: query
           schema:
             type: string
         - name: tableNamePattern
@@ -410,6 +407,36 @@ paths:
                 $ref: '#/components/schemas/ListTablesGloballyResponse'
         "401":
           $ref: '#/components/responses/UnauthorizedErrorResponse'
+        "500":
+          $ref: '#/components/responses/ServerErrorResponse'
+  /v1/{prefix}/tables/id/{tableId}:
+    get:
+      tags:
+        - table
+      summary: Get table by id
+      operationId: getTableById
+      parameters:
+        - name: prefix
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: tableId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetTableResponse'
+        "401":
+          $ref: '#/components/responses/UnauthorizedErrorResponse'
+        "404":
+          $ref: '#/components/responses/TableNotExistErrorResponse'
         "500":
           $ref: '#/components/responses/ServerErrorResponse'
   /v1/{prefix}/databases/{database}/tables/{table}:
@@ -629,7 +656,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/responses/ResourceNotExistErrorResponse'
+                $ref: '#/components/schemas/ErrorResponse'
               examples:
                 TableNotExist:
                   $ref: '#/components/examples/TableNotExistError'
@@ -637,6 +664,42 @@ paths:
                   $ref: '#/components/examples/SnapshotNotExistError'
                 TagNotExist:
                   $ref: '#/components/examples/TagNotExistError'
+        "500":
+          $ref: '#/components/responses/ServerErrorResponse'
+  /v1/{prefix}/databases/{database}/tables/{table}/rollback-schema:
+    post:
+      tags:
+        - table
+      summary: Rollback table schema
+      operationId: rollbackSchema
+      parameters:
+        - name: prefix
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: database
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: table
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RollbackSchemaRequest'
+      responses:
+        "200":
+          description: Success, no content
+        "401":
+          $ref: '#/components/responses/UnauthorizedErrorResponse'
+        "404":
+          $ref: '#/components/responses/TableNotExistErrorResponse'
         "500":
           $ref: '#/components/responses/ServerErrorResponse'
   /v1/{prefix}/databases/{database}/tables/{table}/token:
@@ -719,7 +782,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/responses/ResourceNotExistErrorResponse'
+                $ref: '#/components/schemas/ErrorResponse'
               examples:
                 TableNotExist:
                   $ref: '#/components/examples/TableNotExistError'
@@ -764,7 +827,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/responses/ResourceNotExistErrorResponse'
+                $ref: '#/components/schemas/ErrorResponse'
               examples:
                 TableNotExist:
                   $ref: '#/components/examples/TableNotExistError'
@@ -816,7 +879,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/responses/ResourceNotExistErrorResponse'
+                $ref: '#/components/schemas/ErrorResponse'
               examples:
                 TableNotExist:
                   $ref: '#/components/examples/TableNotExistError'
@@ -917,6 +980,101 @@ paths:
           $ref: '#/components/responses/TableNotExistErrorResponse'
         "500":
           $ref: '#/components/responses/ServerErrorResponse'
+    post:
+      tags:
+        - partition
+      summary: Create partitions
+      description: >
+        Creates partitions with optional position-aligned options. The server validates and stores
+        the partitions, options, and statistics atomically.
+      operationId: createPartitions
+      parameters:
+        - name: prefix
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: database
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: table
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePartitionsRequest'
+      responses:
+        "200":
+          description: Partitions created or found to exist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatePartitionsResponse'
+        "400":
+          $ref: '#/components/responses/BadRequestErrorResponse'
+        "401":
+          $ref: '#/components/responses/UnauthorizedErrorResponse'
+        "404":
+          $ref: '#/components/responses/TableNotExistErrorResponse'
+        "409":
+          $ref: '#/components/responses/ResourceAlreadyExistErrorResponse'
+        "500":
+          $ref: '#/components/responses/ServerErrorResponse'
+        "501":
+          description: The catalog provider does not support partition options
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/{prefix}/databases/{database}/tables/{table}/partitions/drop:
+    post:
+      tags:
+        - partition
+      summary: Drop partitions
+      description: Unregisters partitions from the catalog. The server never deletes data files; for a format table with catalog-managed partitions, data deletion is performed by the client afterwards.
+      operationId: dropPartitions
+      parameters:
+        - name: prefix
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: database
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: table
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DropPartitionsRequest'
+      responses:
+        "200":
+          description: Partitions dropped or found missing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DropPartitionsResponse'
+        "401":
+          $ref: '#/components/responses/UnauthorizedErrorResponse'
+        "404":
+          $ref: '#/components/responses/TableNotExistErrorResponse'
+        "500":
+          $ref: '#/components/responses/ServerErrorResponse'
   /v1/{prefix}/databases/{database}/tables/{table}/partitions/mark:
     post:
       tags:
@@ -947,6 +1105,92 @@ paths:
       responses:
         "200":
           description: Success, no content
+        "401":
+          $ref: '#/components/responses/UnauthorizedErrorResponse'
+        "404":
+          $ref: '#/components/responses/TableNotExistErrorResponse'
+        "500":
+          $ref: '#/components/responses/ServerErrorResponse'
+  /v1/{prefix}/databases/{database}/tables/{table}/partitions/list-by-names:
+    post:
+      tags:
+        - partition
+      summary: List partitions by names
+      operationId: listPartitionsByNames
+      parameters:
+        - name: prefix
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: database
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: table
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ListPartitionsByNamesRequest'
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListPartitionsResponse'
+        "400":
+          $ref: '#/components/responses/BadRequestErrorResponse'
+        "401":
+          $ref: '#/components/responses/UnauthorizedErrorResponse'
+        "404":
+          $ref: '#/components/responses/TableNotExistErrorResponse'
+        "500":
+          $ref: '#/components/responses/ServerErrorResponse'
+  /v1/{prefix}/databases/{database}/tables/{table}/partitions/list-by-filter:
+    post:
+      tags:
+        - partition
+      summary: List partitions by filter
+      description: Lists a page of partitions using a serialized Paimon partition predicate. The response may be a superset of the matching partitions, so clients must re-evaluate the predicate and continue pagination while nextPageToken is non-empty, even if the current page contains no partitions.
+      operationId: listPartitionsByFilter
+      parameters:
+        - name: prefix
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: database
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: table
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ListPartitionsByFilterRequest'
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListPartitionsResponse'
+        "400":
+          $ref: '#/components/responses/BadRequestErrorResponse'
         "401":
           $ref: '#/components/responses/UnauthorizedErrorResponse'
         "404":
@@ -1029,7 +1273,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/responses/ResourceNotExistErrorResponse'
+                $ref: '#/components/schemas/ErrorResponse'
               examples:
                 TableNotExist:
                   $ref: '#/components/examples/TableNotExistError'
@@ -1073,6 +1317,49 @@ paths:
           $ref: '#/components/responses/UnauthorizedErrorResponse'
         "404":
           $ref: '#/components/responses/BranchNotExistErrorResponse'
+        "500":
+          $ref: '#/components/responses/ServerErrorResponse'
+  /v1/{prefix}/databases/{database}/tables/{table}/branches/{branch}/rename:
+    post:
+      tags:
+        - branch
+      summary: rename branch
+      operationId: renameBranch
+      parameters:
+        - name: prefix
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: database
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: table
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: branch
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RenameBranchRequest'
+      responses:
+        "200":
+          description: Success, no content
+        "401":
+          $ref: '#/components/responses/UnauthorizedErrorResponse'
+        "404":
+          $ref: '#/components/responses/BranchNotExistErrorResponse'
+        "409":
+          description: Branch already exists
         "500":
           $ref: '#/components/responses/ServerErrorResponse'
   /v1/{prefix}/databases/{database}/tables/{table}/branches/{branch}/forward:
@@ -1147,6 +1434,11 @@ paths:
           in: query
           schema:
             type: string
+        - name: tagNamePrefix
+          description: A prefix for tag names. All tags will be returned if not set or empty.
+          in: query
+          schema:
+            type: string
       responses:
         "200":
           description: OK
@@ -1201,7 +1493,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/responses/ResourceNotExistErrorResponse'
+                $ref: '#/components/schemas/ErrorResponse'
               examples:
                 TableNotExist:
                   $ref: '#/components/examples/TableNotExistError'
@@ -1284,6 +1576,86 @@ paths:
           $ref: '#/components/responses/UnauthorizedErrorResponse'
         "404":
           $ref: '#/components/responses/TagNotExistErrorResponse'
+        "500":
+          $ref: '#/components/responses/ServerErrorResponse'
+  /v1/{prefix}/databases/{database}/tables/{table}/consumers:
+    get:
+      tags:
+        - table
+      summary: List consumers
+      operationId: listConsumers
+      parameters:
+        - name: prefix
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: database
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: table
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: maxResults
+          in: query
+          schema:
+            type: integer
+            format: int32
+        - name: pageToken
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListConsumersResponse'
+        "401":
+          $ref: '#/components/responses/UnauthorizedErrorResponse'
+        "404":
+          $ref: '#/components/responses/TableNotExistErrorResponse'
+        "500":
+          $ref: '#/components/responses/ServerErrorResponse'
+  /v1/{prefix}/databases/{database}/tables/{table}/consumers/reset:
+    post:
+      tags:
+        - table
+      summary: Reset consumer
+      operationId: resetConsumer
+      parameters:
+        - name: prefix
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: database
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: table
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResetConsumerRequest'
+      responses:
+        "200":
+          description: Success, no content
+        "401":
+          $ref: '#/components/responses/UnauthorizedErrorResponse'
+        "404":
+          $ref: '#/components/responses/TableNotExistErrorResponse'
         "500":
           $ref: '#/components/responses/ServerErrorResponse'
   /v1/{prefix}/databases/{database}/views:
@@ -1423,7 +1795,7 @@ paths:
             type: string
         - name: databaseNamePattern
           description: A sql LIKE pattern (%) for database names. All databases will be returned if not set or empty. Currently, only prefix matching is supported.
-          in: path
+          in: query
           schema:
             type: string
         - name: viewNamePattern
@@ -1721,7 +2093,7 @@ paths:
             type: string
         - name: databaseNamePattern
           description: A sql LIKE pattern (%) for database names. All databases will be returned if not set or empty. Currently, only prefix matching is supported.
-          in: path
+          in: query
           schema:
             type: string
         - name: functionNamePattern
@@ -1865,10 +2237,9 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
-          example: {
-            "message": "Malformed request",
-            "code": 400
-          }
+          example:
+            message: Malformed request
+            code: 400
     UnauthorizedErrorResponse:
       description:
         Used for 401 errors.
@@ -1876,10 +2247,9 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
-          example: {
-            "message": "No auth for this resource",
-            "code": 401
-          }
+          example:
+            message: No auth for this resource
+            code: 401
     ForbiddenErrorResponse:
       description:
         Used for 403 errors.
@@ -1887,10 +2257,9 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
-          example: {
-            "message": "Table has no permission",
-            "code": 403
-          }
+          example:
+            message: Table has no permission
+            code: 403
     ResourceNotExistErrorResponse:
       description:
         Used for 404 errors, which means the resource does not exist.
@@ -1898,110 +2267,95 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
-          example: {
-            "message": "Resource is not exist",
-            "resourceType": "TABLE",
-            "resourceName": "user",
-            "code": 404
-          }
+          example:
+            message: Resource does not exist
+            resourceType: TABLE
+            resourceName: user
+            code: 404
     DatabaseNotExistErrorResponse:
       description:
         Not Found - DatabaseNotExistException, the database does not exist
       content:
         application/json:
           schema:
-            $ref: '#/components/responses/ResourceNotExistErrorResponse'
+            $ref: '#/components/schemas/ErrorResponse'
           example:
-            {
-              "message": "The given database does not exist",
-              "resourceType": "DATABASE",
-              "resourceName": "db",
-              "code": 404
-            }
+            message: The given database does not exist
+            resourceType: DATABASE
+            resourceName: db
+            code: 404
     TableNotExistErrorResponse:
       description:
         Not Found - TableNotExistException, the table does not exist
       content:
         application/json:
           schema:
-            $ref: '#/components/responses/ResourceNotExistErrorResponse'
+            $ref: '#/components/schemas/ErrorResponse'
           example:
-            {
-              "message": "The given table does not exist",
-              "resourceType": "TABLE",
-              "resourceName": "table",
-              "code": 404
-            }
+            message: The given table does not exist
+            resourceType: TABLE
+            resourceName: table
+            code: 404
     SnapshotNotExistErrorResponse:
       description:
         Not Found - SnapshotNotExistException, the snapshot does not exist
       content:
         application/json:
           schema:
-            $ref: '#/components/responses/ResourceNotExistErrorResponse'
+            $ref: '#/components/schemas/ErrorResponse'
           example:
-            {
-              "message": "The given snapshot does not exist",
-              "resourceType": "SNAPSHOT",
-              "resourceName": "1",
-              "code": 404
-            }
+            message: The given snapshot does not exist
+            resourceType: SNAPSHOT
+            resourceName: "1"
+            code: 404
     BranchNotExistErrorResponse:
       description:
         Not Found - BranchNotExistException, the branch does not exist
       content:
         application/json:
           schema:
-            $ref: '#/components/responses/ResourceNotExistErrorResponse'
+            $ref: '#/components/schemas/ErrorResponse'
           example:
-            {
-              "message": "The given branch does not exist",
-              "resourceType": "BRANCH",
-              "resourceName": "branch",
-              "code": 404
-            }
+            message: The given branch does not exist
+            resourceType: BRANCH
+            resourceName: branch
+            code: 404
     TagNotExistErrorResponse:
       description:
         Not Found - TagNotExistException, the tag does not exist
       content:
         application/json:
           schema:
-            $ref: '#/components/responses/ResourceNotExistErrorResponse'
+            $ref: '#/components/schemas/ErrorResponse'
           example:
-            {
-              "message": "The given tag does not exist",
-              "resourceType": "TAG",
-              "resourceName": "tag1",
-              "code": 404
-            }
+            message: The given tag does not exist
+            resourceType: TAG
+            resourceName: tag1
+            code: 404
     ViewNotExistErrorResponse:
       description:
         Not Found - ViewNotExistException, the view does not exist
       content:
         application/json:
           schema:
-            $ref: '#/components/responses/ResourceNotExistErrorResponse'
+            $ref: '#/components/schemas/ErrorResponse'
           example:
-            {
-              "message": "The given view does not exist",
-              "resourceType": "VIEW",
-              "resourceName": "view",
-              "code": 404
-            }
+            message: The given view does not exist
+            resourceType: VIEW
+            resourceName: view
+            code: 404
     FunctionNotExistErrorResponse:
       description:
         Not Found - FunctionNotExistException, the function does not exist
       content:
         application/json:
           schema:
-            $ref: '#/components/responses/ResourceNotExistErrorResponse'
+            $ref: '#/components/schemas/ErrorResponse'
           example:
-            {
-              "message": "The given function does not exist",
-              "resourceType": "FUNCTION",
-              "resourceName": "function",
-              "code": 404
-            }
+            message: The given function does not exist
+            resourceType: FUNCTION
+            resourceName: function
+            code: 404
     ResourceAlreadyExistErrorResponse:
       description:
         Used for 409 errors.
@@ -2009,90 +2363,77 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
-          example: {
-            "message": "Resource has exist",
-            "resourceType": "TABLE",
-            "resourceName": "account",
-            "code": 409
-          }
+          example:
+            message: Resource already exists
+            resourceType: TABLE
+            resourceName: account
+            code: 409
     DatabaseAlreadyExistErrorResponse:
       description: Conflict - The database already exists
       content:
         application/json:
           schema:
-            $ref: '#/components/responses/ResourceAlreadyExistErrorResponse'
+            $ref: '#/components/schemas/ErrorResponse'
           example:
-            {
-              "message": "The given database already exists",
-              "resourceType": "DATABASE",
-              "resourceName": "db",
-              "code": 409
-            }
+            message: The given database already exists
+            resourceType: DATABASE
+            resourceName: db
+            code: 409
     TableAlreadyExistErrorResponse:
       description: Conflict - The table already exists
       content:
         application/json:
           schema:
-            $ref: '#/components/responses/ResourceAlreadyExistErrorResponse'
+            $ref: '#/components/schemas/ErrorResponse'
           example:
-            {
-              "message": "The given table already exists",
-              "resourceType": "TABLE",
-              "resourceName": "table",
-              "code": 409
-            }
+            message: The given table already exists
+            resourceType: TABLE
+            resourceName: table
+            code: 409
     BranchAlreadyExistErrorResponse:
       description: Conflict - The branch already exists
       content:
         application/json:
           schema:
-            $ref: '#/components/responses/ResourceAlreadyExistErrorResponse'
+            $ref: '#/components/schemas/ErrorResponse'
           example:
-            {
-              "message": "The given branch already exists",
-              "resourceType": "BRANCH",
-              "resourceName": "branch",
-              "code": 409
-            }
+            message: The given branch already exists
+            resourceType: BRANCH
+            resourceName: branch
+            code: 409
     TagAlreadyExistErrorResponse:
       description: Conflict - The tag already exists
       content:
         application/json:
           schema:
-            $ref: '#/components/responses/ResourceAlreadyExistErrorResponse'
+            $ref: '#/components/schemas/ErrorResponse'
           example:
-            {
-              "message": "The given tag already exists",
-              "resourceType": "TAG",
-              "resourceName": "tag1",
-              "code": 409
-            }
+            message: The given tag already exists
+            resourceType: TAG
+            resourceName: tag1
+            code: 409
     ViewAlreadyExistErrorResponse:
       description: Conflict - The view already exists
       content:
         application/json:
           schema:
-            $ref: '#/components/responses/ResourceAlreadyExistErrorResponse'
+            $ref: '#/components/schemas/ErrorResponse'
           example:
-            {
-              "message": "The given view already exists",
-              "resourceType": "VIEW",
-              "resourceName": "view",
-              "code": 409
-            }
+            message: The given view already exists
+            resourceType: VIEW
+            resourceName: view
+            code: 409
     FunctionAlreadyExistErrorResponse:
       description: Conflict - The view already exists
       content:
         application/json:
           schema:
-            $ref: '#/components/responses/ResourceAlreadyExistErrorResponse'
+            $ref: '#/components/schemas/ErrorResponse'
           example:
-            {
-              "message": "The given function already exists",
-              "resourceType": "FUNCTION",
-              "resourceName": "function",
-              "code": 409
-            }
+            message: The given function already exists
+            resourceType: FUNCTION
+            resourceName: function
+            code: 409
     ServerErrorResponse:
       description:
         Used for server 5xx errors.
@@ -2100,10 +2441,9 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
-          example: {
-            "message": "Internal Server Error",
-            "code": 500
-          }
+          example:
+            message: Internal Server Error
+            code: 500
   schemas:
     CreateDatabaseRequest:
       type: object
@@ -2116,11 +2456,83 @@ components:
             type: string
     DropPartitionsRequest:
       type: object
+      required:
+        - partitionSpecs
       properties:
-        specs:
+        partitionSpecs:
           type: array
           items:
             type: object
+            additionalProperties:
+              type: string
+        ignoreIfNotExists:
+          type: boolean
+          default: true
+    DropPartitionsResponse:
+      type: object
+      required:
+        - dropped
+        - missing
+      properties:
+        dropped:
+          type: array
+          items:
+            type: object
+            additionalProperties:
+              type: string
+        missing:
+          type: array
+          items:
+            type: object
+            additionalProperties:
+              type: string
+    CreatePartitionsRequest:
+      type: object
+      required:
+        - partitionSpecs
+      properties:
+        partitionSpecs:
+          type: array
+          items:
+            type: object
+            additionalProperties:
+              type: string
+        ignoreIfExists:
+          type: boolean
+          default: true
+        partitionStatistics:
+          description: Statistics of the partitions being created, matched to partitionSpecs by their spec rather than by position, so they may cover only some of them. A field left negative was never measured, which is not the same as zero.
+          type: [ array, "null" ]
+          items:
+            $ref: '#/components/schemas/PartitionStatistics'
+        replaceStatistics:
+          description: Whether partitionStatistics replace the stored values rather than add to them; required whenever partitionStatistics is present, and absent otherwise. Replacing overwrites recordCount, fileSizeInBytes, fileCount and lastFileCreationTime; adding sums the three counts and keeps the later lastFileCreationTime, since two timestamps do not add. A field reported as unknown leaves the stored one alone either way, and totalBuckets is never combined. A client that reports only the files it just wrote adds; one that reports a whole partition, such as an overwrite or a directory rescan, replaces. An additive report is rejected for a Format Table partition that already has a custom path; registering a new custom path together with its first statistics is allowed.
+          type: [ boolean, "null" ]
+        partitionOptions:
+          description: Optional options aligned with partitionSpecs by position. The list must have the same length as partitionSpecs; use an empty object when a partition has no options. A custom location is stored under the path key. Omitting path keeps the stored location; a path outside the table location registers a custom location for a new partition and must equal the stored path for an existing one; the partition's own default directory under the table location returns the partition there, dropping the stored path without deleting data. Returning a partition to its default directory requires replaceStatistics=true and a partitionStatistics entry with the same spec, applied in the same request. Any other path under the table location is invalid, so a provider that does not implement this rejects the request instead of storing it.
+          type: [ array, "null" ]
+          items:
+            type: object
+            additionalProperties:
+              type: string
+    CreatePartitionsResponse:
+      type: object
+      required:
+        - created
+        - existed
+      properties:
+        created:
+          type: array
+          items:
+            type: object
+            additionalProperties:
+              type: string
+        existed:
+          type: array
+          items:
+            type: object
+            additionalProperties:
+              type: string
     AlterTableRequest:
       type: object
       properties:
@@ -2135,6 +2547,34 @@ components:
           type: array
           items:
             type: object
+    ListPartitionsByNamesRequest:
+      type: object
+      properties:
+        specs:
+          type: array
+          description: List of partition specs to query
+          items:
+            type: object
+            additionalProperties:
+              type: string
+    ListPartitionsByFilterRequest:
+      type: object
+      required:
+        - filter
+      properties:
+        filter:
+          type: string
+          description: JSON serialization of a Paimon Predicate tree over the partition columns.
+        partitionNamePattern:
+          type: string
+          description: A SQL LIKE pattern (%) for partition names. Currently, only prefix matching is supported.
+        maxResults:
+          type: integer
+          format: int32
+          description: Maximum number of matching partitions to return in this page. A missing or zero value uses the server default.
+        pageToken:
+          type: string
+          description: Token returned by the previous page. Omit for the first page.
     CreateDatabaseResponse:
       type: object
       properties:
@@ -2150,12 +2590,10 @@ components:
         message:
           type: string
         resourceType:
-          type: string
-          nullable: true
-          enum: [ "DATABASE", "TABLE", "COLUMN", "SNAPSHOT", "BRANCH", "TAG", "VIEW", "DIALECT", "UNKNOWN" ]
+          type: [ string, "null" ]
+          enum: [ "DATABASE", "TABLE", "PARTITION", "COLUMN", "SNAPSHOT", "BRANCH", "TAG", "VIEW", "DIALECT", "FUNCTION", "DEFINITION", "UNKNOWN", null ]
         resourceName:
-          type: string
-          nullable: true
+          type: [ string, "null" ]
         code:
           type: integer
           format: int32
@@ -2271,7 +2709,7 @@ components:
           type: string
           const: "updateComment"
         comment:
-          type: string
+          type: [ string, "null" ]
     AddDefinition:
       allOf:
         - $ref: '#/components/schemas/BaseFunctionChange'
@@ -2416,8 +2854,8 @@ components:
         action:
           type: string
           const: "updateComment"
-        key:
-          type: string
+        comment:
+          type: [ string, "null" ]
     AddDialect:
       allOf:
         - $ref: '#/components/schemas/BaseViewChange'
@@ -2461,6 +2899,8 @@ components:
           $ref: '#/components/schemas/DataType'
         description:
           type: string
+        defaultValue:
+          type: string
     DataType:
       oneOf:
         - $ref: '#/components/schemas/PrimitiveType'
@@ -2468,6 +2908,7 @@ components:
         - $ref: '#/components/schemas/MultisetType'
         - $ref: '#/components/schemas/MapType'
         - $ref: '#/components/schemas/RowType'
+        - $ref: '#/components/schemas/VectorType'
     PrimitiveType:
       type: string
     ArrayType:
@@ -2510,6 +2951,18 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/DataField'
+    VectorType:
+      type: object
+      properties:
+        type:
+          type: string
+          pattern: ^VECTOR.*
+          example: VECTOR
+        element:
+          $ref: '#/components/schemas/DataType'
+        length:
+          type: integer
+          format: int32
     Identifier:
       type: object
       properties:
@@ -2543,6 +2996,8 @@ components:
       properties:
         id:
           type: string
+        database:
+          type: string
         name:
           type: string
         path:
@@ -2557,10 +3012,12 @@ components:
         owner:
           type: string
         createdAt:
+          type: integer
           format: int64
         createdBy:
           type: string
         updatedAt:
+          type: integer
           format: int64
         updatedBy:
           type: string
@@ -2577,6 +3034,7 @@ components:
         - $ref: '#/components/schemas/UpdateColumnType'
         - $ref: '#/components/schemas/UpdateColumnPosition'
         - $ref: '#/components/schemas/UpdateColumnNullability'
+        - $ref: '#/components/schemas/DropPrimaryKey'
     BaseSchemaChange:
       discriminator:
         propertyName: action
@@ -2592,6 +3050,7 @@ components:
           updateColumnType: '#/components/schemas/UpdateColumnType'
           updateColumnPosition: '#/components/schemas/UpdateColumnPosition'
           updateColumnNullability: '#/components/schemas/UpdateColumnNullability'
+          dropPrimaryKey: '#/components/schemas/DropPrimaryKey'
       type: object
       required:
         - action
@@ -2626,7 +3085,7 @@ components:
           type: string
           const: "updateComment"
         comment:
-          type: string
+          type: [ string, "null" ]
     AddColumn:
       allOf:
         - $ref: '#/components/schemas/BaseSchemaChange'
@@ -2731,6 +3190,13 @@ components:
             type: string
         newNullability:
           type: boolean
+    DropPrimaryKey:
+      allOf:
+        - $ref: '#/components/schemas/BaseSchemaChange'
+      properties:
+        action:
+          type: string
+          const: "dropPrimaryKey"
     Move:
       type: object
       properties:
@@ -2752,6 +3218,8 @@ components:
       properties:
         tableId:
           type: string
+        baseSnapshotUuid:
+          type: [ string, "null" ]
         snapshot:
           $ref: '#/components/schemas/Snapshot'
         statistics:
@@ -2764,16 +3232,23 @@ components:
         instant:
           $ref: '#/components/schemas/Instant'
         fromSnapshot:
+          type: [ integer, "null" ]
+          format: int64
+    RollbackSchemaRequest:
+      type: object
+      required:
+        - schemaId
+      properties:
+        schemaId:
           type: integer
           format: int64
-          nullable: true
     Instant:
       anyOf:
         - $ref: '#/components/schemas/SnapshotInstant'
         - $ref: '#/components/schemas/TagInstant'
     BaseInstant:
       discriminator:
-        propertyName: action
+        propertyName: type
         mapping:
           snapshot: '#/components/schemas/SnapshotInstant'
           tag: '#/components/schemas/TagInstant'
@@ -2806,9 +3281,10 @@ components:
       type: object
       properties:
         version:
-          type: integer
+          type: [ integer, "null" ]
           format: int32
-          nullable: true
+        uuid:
+          type: [ string, "null" ]
         id:
           type: integer
           format: int64
@@ -2820,8 +3296,7 @@ components:
         deltaManifestList:
           type: string
         changelogManifestList:
-          type: string
-          nullable: true
+          type: [ string, "null" ]
         indexManifest:
           type: string
         commitUser:
@@ -2918,6 +3393,11 @@ components:
           type: array
           items:
             type: string
+        columnMasking:
+          type: object
+          description: Column masking rules as a map from column name to transform entry JSON string.
+          additionalProperties:
+            type: string
     AlterDatabaseRequest:
       type: object
       properties:
@@ -2969,10 +3449,12 @@ components:
         owner:
           type: string
         createdAt:
+          type: integer
           format: int64
         createdBy:
           type: string
         updatedAt:
+          type: integer
           format: int64
         updatedBy:
           type: string
@@ -3001,8 +3483,7 @@ components:
         tables:
           type: array
           items:
-            identifier:
-              $ref: '#/components/schemas/Identifier'
+            $ref: '#/components/schemas/Identifier'
         nextPageToken:
           type: string
     ConfigResponse:
@@ -3031,7 +3512,11 @@ components:
         branch:
           type: string
         fromTag:
-          nullable: true
+          type: [ string, "null" ]
+    RenameBranchRequest:
+      type: object
+      properties:
+        toBranch:
           type: string
     ForwardBranchRequest:
       type: object
@@ -3053,13 +3538,11 @@ components:
         tagName:
           type: string
         snapshotId:
-          type: integer
+          type: [ integer, "null" ]
           format: int64
-          nullable: true
           description: Optional snapshot id, if not provided uses latest snapshot
         timeRetained:
-          type: string
-          nullable: true
+          type: [ string, "null" ]
           description: Optional time retained as string (e.g., "1d", "12h", "30m")
         ignoreIfExists:
           type: boolean
@@ -3073,12 +3556,10 @@ components:
         snapshot:
           $ref: '#/components/schemas/Snapshot'
         tagCreateTime:
-          type: integer
+          type: [ integer, "null" ]
           format: int64
-          nullable: true
         tagTimeRetained:
-          type: string
-          nullable: true
+          type: [ string, "null" ]
     ListTagsResponse:
       type: object
       properties:
@@ -3097,12 +3578,10 @@ components:
           type: integer
           format: int64
         tagCreateTime:
-          type: integer
+          type: [ integer, "null" ]
           format: int64
-          nullable: true
         tagTimeRetained:
-          type: string
-          nullable: true
+          type: [ string, "null" ]
     GetViewResponse:
       type: object
       properties:
@@ -3115,10 +3594,12 @@ components:
         owner:
           type: string
         createdAt:
+          type: integer
           format: int64
         createdBy:
           type: string
         updatedAt:
+          type: integer
           format: int64
         updatedBy:
           type: string
@@ -3148,14 +3629,15 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Identifier'
+        nextPageToken:
+          type: string
     ListViewsGloballyResponse:
       type: object
       properties:
-        tables:
+        views:
           type: array
           items:
-            identifier:
-              $ref: '#/components/schemas/Identifier'
+            $ref: '#/components/schemas/Identifier'
         nextPageToken:
           type: string
     ListFunctionsResponse:
@@ -3179,6 +3661,8 @@ components:
     GetFunctionResponse:
       type: object
       properties:
+        uuid:
+          type: string
         name:
           type: string
         inputParams:
@@ -3204,13 +3688,47 @@ components:
         owner:
           type: string
         createdAt:
+          type: integer
           format: int64
         createdBy:
           type: string
         updatedAt:
+          type: integer
           format: int64
         updatedBy:
           type: string
+    ConsumerInfo:
+      type: object
+      properties:
+        consumerId:
+          type: string
+          description: The consumer identifier
+        nextSnapshot:
+          type: integer
+          format: int64
+          description: The next snapshot id of the consumer
+    ListConsumersResponse:
+      type: object
+      properties:
+        consumers:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConsumerInfo'
+        nextPageToken:
+          type: string
+          description: Token for the next page of results
+    ResetConsumerRequest:
+      type: object
+      properties:
+        consumerId:
+          type: string
+          description: The consumer identifier to be reset or deleted
+        nextSnapshotId:
+          type: integer
+          format: int64
+          description: The new next snapshot id of the consumer. If not provided, the consumer will be deleted
+      required:
+        - consumerId
     ViewSchema:
       type: object
       properties:
@@ -3247,6 +3765,9 @@ components:
         lastFileCreationTime:
           type: integer
           format: int64
+        totalBuckets:
+          type: integer
+          format: int32
         done:
           type: boolean
         createdAt:
@@ -3280,34 +3801,34 @@ components:
         lastFileCreationTime:
           type: integer
           format: int64
+        totalBuckets:
+          type: integer
+          format: int32
   #######################################
   # Examples of different values #
   #######################################
   examples:
     TableNotExistError:
       summary: The requested table does not exist
-      value: {
-        "message": "The given table does not exist",
-        "resourceType": "TABLE",
-        "resourceName": "table",
-        "code": 404
-      }
+      value:
+        message: The given table does not exist
+        resourceType: TABLE
+        resourceName: table
+        code: 404
     SnapshotNotExistError:
       summary: The requested snapshot does not exist
-      value: {
-        "message": "The given snapshot does not exist",
-        "resourceType": "SNAPSHOT",
-        "resourceName": "1",
-        "code": 404
-      }
+      value:
+        message: The given snapshot does not exist
+        resourceType: SNAPSHOT
+        resourceName: "1"
+        code: 404
     TagNotExistError:
       summary: The requested tag does not exist
-      value: {
-        "message": "The given tag does not exist",
-        "resourceType": "TAG",
-        "resourceName": "tag1",
-        "code": 404
-      }
+      value:
+        message: The given tag does not exist
+        resourceType: TAG
+        resourceName: tag1
+        code: 404
   securitySchemes:
     BearerAuth:
       type: http

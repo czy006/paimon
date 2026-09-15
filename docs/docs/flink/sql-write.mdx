@@ -1,0 +1,404 @@
+---
+title: "SQL Write"
+sidebar_position: 2
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# SQL Write
+
+Choose the operation by how it changes the table. Select a Paimon catalog before running these
+examples; see [SQL DDL](./sql-ddl).
+
+| Task | Operation | Requirements |
+| --- | --- | --- |
+| Append records or apply changes | [`INSERT INTO`](#insert-into) | Batch or streaming; enable checkpoints for streaming commits. |
+| Replace table or partition contents | [`INSERT OVERWRITE`](#overwriting-the-whole-table) | Check static versus dynamic partition behavior. |
+| Empty a table | [Truncate](#truncate-tables) | `TRUNCATE TABLE` requires Flink 1.18+; older versions use an empty overwrite. |
+| Update existing rows | [`UPDATE`](#updating-tables) | Flink 1.17+, batch mode, and a supported primary-key merge engine. |
+| Delete matching rows | [`DELETE`](#deleting-from-table) | Flink 1.17+, batch mode, and a supported table mode. |
+| Merge another table | [Merge procedure](./procedures/table-operations#merge_into) or [action](./action-jars#merging-into-table) | Check the merge operation's table and changelog restrictions. |
+
+## Syntax
+
+```sql
+INSERT { INTO | OVERWRITE } table_identifier [ part_spec ] [ column_list ] { value_expr | query };
+```
+
+For more information, please check the syntax document:
+
+[Flink INSERT Statement](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/table/sql/insert/)
+
+## INSERT INTO
+
+Use `INSERT INTO` to apply records and changes to tables.
+
+```sql
+CREATE TABLE order_totals (
+    order_id BIGINT PRIMARY KEY NOT ENFORCED,
+    amount BIGINT
+);
+
+SET 'execution.runtime-mode' = 'batch';
+INSERT INTO order_totals VALUES (1, 100), (2, 200);
+
+-- With the default deduplicate merge engine, replace order 1's amount.
+INSERT INTO order_totals VALUES (1, 150);
+```
+
+`INSERT INTO` supports both batch and streaming mode. Before submitting a streaming writer, enable checkpointing:
+
+```sql
+SET 'execution.runtime-mode' = 'streaming';
+SET 'execution.checkpointing.interval' = '10 s';
+```
+
+Data becomes visible through committed snapshots. See [Runtime Configuration](./configuration#checkpointing).
+The streaming sink also performs configured maintenance, including compaction, snapshot
+expiration, and partition expiration.
+
+For multiple jobs to write the same table, you can refer to [dedicated compaction job](../maintenance/dedicated-compaction#dedicated-compaction-job) for more info.
+
+### Clustering
+
+Clustering groups append-table rows by selected columns to improve data skipping. This write
+path requires **batch mode** and a bucket-unaware append table (`bucket = -1`).
+
+```sql
+SET 'execution.runtime-mode' = 'batch';
+
+CREATE TABLE clustered_events (
+    a STRING,
+    b STRING,
+    c STRING
+) WITH (
+    'bucket' = '-1',
+    'clustering.columns' = 'a,b'
+);
+
+INSERT INTO clustered_events VALUES ('a', 'x', 'first'), ('b', 'y', 'second');
+```
+
+Set `clustering.columns` in an `OPTIONS` hint to apply clustering to one write:
+
+```sql
+INSERT INTO clustered_events /*+ OPTIONS('clustering.columns' = 'a,b') */
+SELECT * FROM source_events;
+```
+
+The default strategy is chosen automatically. Set `clustering.strategy` to choose `order`,
+`zorder`, or `hilbert`. The older `sink.clustering.by-columns` and `sink.clustering.strategy`
+keys remain supported aliases. To reduce sampling or sorting work, tune
+`sink.clustering.sample-factor` or `sink.clustering.sort-in-cluster`.
+
+See [Append-table Query Performance](../append-table/query-performance) and
+[FlinkConnectorOptions](../maintenance/configurations#flinkconnectoroptions) for tuning details.
+
+## Overwriting the Whole Table
+
+Use `INSERT OVERWRITE` to replace the contents of an unpartitioned table. For example, continuing
+with `order_totals` from [INSERT INTO](#insert-into):
+
+```sql
+SET 'execution.runtime-mode' = 'batch';
+
+INSERT OVERWRITE order_totals VALUES (1, 300);
+SELECT * FROM order_totals;
+-- The table now contains only order 1 with amount 300.
+```
+
+For a partitioned table, choose the overwrite scope explicitly. The examples below use:
+
+```sql
+CREATE TABLE daily_orders (
+    order_id BIGINT,
+    amount BIGINT,
+    dt STRING
+) PARTITIONED BY (dt);
+
+INSERT INTO daily_orders VALUES
+    (1, 100, '2026-09-01'),
+    (2, 200, '2026-09-02');
+```
+
+### Overwriting a Partition
+
+Provide a partition specification and omit its fixed fields from the incoming row:
+
+```sql
+INSERT OVERWRITE daily_orders PARTITION (dt = '2026-09-02')
+SELECT CAST(3 AS BIGINT), CAST(300 AS BIGINT);
+```
+
+With this nonempty input, the September 2 partition is replaced and September 1 is retained.
+To clear a partition with empty input, use the static overwrite option described under
+[Purging Partitions](#purging-partitions).
+
+### Dynamic Overwrite
+
+For partitioned tables, dynamic overwrite is enabled by default. It replaces only partitions
+represented in the incoming data. Static overwrite replaces the selected partition scope, or
+the whole table if no partition specification is given.
+
+![With incoming rows for September 2 only, dynamic overwrite keeps September 1 while static whole-table overwrite removes it.](/img/flink-overwrite-scope.svg)
+
+| Configuration | Partitions replaced | Empty input |
+| --- | --- | --- |
+| Dynamic (default) | Partitions present in the incoming data. | No data is deleted, even with a `PARTITION (...)` clause. |
+| Static, with `PARTITION (...)` | Partitions matching the specification. | Clears that partition scope. |
+| Static, without `PARTITION (...)` | The whole table. | Clears the whole table. |
+
+These are alternative operations on the initial `daily_orders` data:
+
+```sql
+-- Dynamic: replace September 2; retain September 1.
+INSERT OVERWRITE daily_orders VALUES (3, 300, '2026-09-02');
+
+-- Static, without a partition specification: replace the whole table.
+INSERT OVERWRITE daily_orders /*+ OPTIONS('dynamic-partition-overwrite' = 'false') */
+VALUES (3, 300, '2026-09-02');
+```
+
+Streaming readers ignore overwrite commits by default. See [Read Overwrite](./sql-query#read-overwrite)
+before using overwrites in a table consumed by streaming jobs.
+
+## Truncate tables
+
+<Tabs groupId="truncate-tables-syntax">
+
+<TabItem value="flink-1-17" label="Flink 1.17-">
+
+You can use `INSERT OVERWRITE` to purge tables by inserting empty value.
+
+```sql
+INSERT OVERWRITE my_table /*+ OPTIONS('dynamic-partition-overwrite'='false') */ SELECT * FROM my_table WHERE false;
+```
+
+</TabItem>
+
+<TabItem value="flink-1-18" label="Flink 1.18+">
+
+```sql
+TRUNCATE TABLE my_table;
+```
+
+</TabItem>
+
+</Tabs>
+
+On a Format Table read through Paimon (`format-table.implementation = paimon`, the default),
+`TRUNCATE TABLE` deletes the data files and keeps the partitions: their directories remain, and
+with `metastore.partitioned-table = true` so do their catalog registrations, whose statistics are
+replaced with zero. That setting also makes the catalog the answer to which partitions the table
+has, so truncating empties those and leaves an unregistered directory alone. Flink has no
+`TRUNCATE TABLE ... PARTITION`; use Spark's.
+
+## Purging Partitions
+
+Use an empty `INSERT OVERWRITE` to clear the rows in selected partitions, as shown below.
+To drop one or more partitions, use [ALTER TABLE DROP PARTITION](./sql-alter#dropping-partitions).
+For command-line submission, see the [drop_partition action](./action-jars#drop-partition).
+
+```sql
+-- Syntax
+INSERT OVERWRITE my_table /*+ OPTIONS('dynamic-partition-overwrite'='false') */
+PARTITION (key1 = value1, key2 = value2, ...) SELECT selectSpec FROM my_table WHERE false;
+
+-- The following SQL is an example:
+-- table definition
+CREATE TABLE my_table (
+    k0 INT,
+    k1 INT,
+    v STRING
+) PARTITIONED BY (k0, k1);
+
+-- you can use
+INSERT OVERWRITE my_table /*+ OPTIONS('dynamic-partition-overwrite'='false') */
+PARTITION (k0 = 0) SELECT k1, v FROM my_table WHERE false;
+
+-- or
+INSERT OVERWRITE my_table /*+ OPTIONS('dynamic-partition-overwrite'='false') */
+PARTITION (k0 = 0, k1 = 0) SELECT v FROM my_table WHERE false;
+```
+
+## Updating tables
+
+:::info
+
+Important table properties setting:
+1. Only [primary key table](../primary-key-table/) supports this feature.
+2. [MergeEngine](../primary-key-table/merge-engine/) needs to be [deduplicate](../primary-key-table/merge-engine/#deduplicate)
+   or [partial-update](../primary-key-table/merge-engine/partial-update) to support this feature.
+3. Do not support updating primary keys.
+
+:::
+
+`UPDATE` requires Flink 1.17+ and batch mode. Set the runtime mode before submitting it:
+
+```sql
+SET 'execution.runtime-mode' = 'batch';
+```
+
+```sql
+-- Syntax
+UPDATE table_identifier SET column1 = value1, column2 = value2, ... WHERE condition;
+
+-- The following SQL is an example:
+-- table definition
+CREATE TABLE my_table (
+	a STRING,
+	b INT,
+	c INT,
+	PRIMARY KEY (a) NOT ENFORCED
+) WITH (
+	'merge-engine' = 'deduplicate'
+);
+
+-- you can use
+UPDATE my_table SET b = 1, c = 2 WHERE a = 'myTable';
+```
+
+## Deleting from table
+
+<Tabs groupId="delete-from-table">
+
+<TabItem value="flink-1-17" label="Flink 1.17+">
+
+:::info
+
+Important table properties setting:
+1. Primary key tables support this feature. The following [MergeEngine](../primary-key-table/merge-engine/) are supported:
+   * [deduplicate](../primary-key-table/merge-engine/#deduplicate).
+   * [partial-update](../primary-key-table/merge-engine/partial-update) with option 'partial-update.remove-record-on-delete' enabled.
+2. With Flink 1.17 or later, append tables in [Data Evolution](../multimodal-table/data-evolution) mode also support this feature when row tracking and deletion vectors are enabled and bucket is `-1`.
+3. Deleting from a table is not supported in streaming mode.
+
+:::
+
+```sql
+SET 'execution.runtime-mode' = 'batch';
+
+-- Syntax
+DELETE FROM table_identifier WHERE conditions;
+
+-- The following SQL is an example:
+-- table definition
+CREATE TABLE my_table (
+    id BIGINT NOT NULL,
+    currency STRING,
+    rate BIGINT,
+    dt String,
+    PRIMARY KEY (id, dt) NOT ENFORCED
+) PARTITIONED BY (dt) WITH (
+    'merge-engine' = 'deduplicate'
+);
+
+-- you can use
+DELETE FROM my_table WHERE currency = 'UNKNOWN';
+```
+
+</TabItem>
+
+</Tabs>
+
+## Partition Mark Done
+
+A partition can signal that it is ready for downstream batch processing after its time window
+has ended and it has been idle for the configured duration. This is a scheduling signal; late
+records may still arrive.
+
+### Configure the Completion Signal
+
+This example creates a `_SUCCESS` file for a completed daily partition:
+
+```sql
+CREATE TABLE daily_events (
+    event_id BIGINT,
+    payload STRING,
+    dt STRING
+) PARTITIONED BY (dt) WITH (
+    'partition.timestamp-formatter' = 'yyyyMMdd',
+    'partition.timestamp-pattern' = '$dt',
+    'partition.time-interval' = '1 d',
+    'partition.idle-time-to-done' = '15 m',
+    'partition.mark-done-action' = 'success-file'
+);
+```
+
+The timestamp pattern identifies the partition's time window; the idle time controls how long
+to wait without new data. The `_SUCCESS` JSON contains `creationTime` and `modificationTime`,
+which can help identify later changes.
+
+| Action | Result | Requirements |
+| --- | --- | --- |
+| `success-file` (default) | Write `_SUCCESS` in the partition directory. | Filesystem access to the table. |
+| `done-partition` | Add a completion partition such as `dt=20240501.done`. | A catalog with partition modification support and `metastore.partitioned-table = true`. |
+| `http-report` | Send an HTTP report to a configured endpoint. | Configure the URL and optional parameters below. |
+| `custom` | Invoke a user-defined Java action. | Make the implementation available to the Flink job. |
+
+For an explicit operation, see [mark_partition_done](./procedures/table-operations#mark_partition_done).
+
+### Report over HTTP
+
+Configure `partition.mark-done-action = http-report`, set `partition.mark-done-action.http.url`,
+and optionally set `partition.mark-done-action.http.params`. The action sends a JSON request:
+
+```json
+{
+    "table": "table fullName",
+    "path": "table location path",
+    "partition": "mark done partition",
+    "params": "custom params"
+}
+```
+
+The endpoint returns:
+
+```json
+{
+    "result": "success"
+}
+```
+
+### Implement a Custom Action
+
+Set `partition.mark-done-action = custom` and
+`partition.mark-done-action.custom.class = org.apache.paimon.CustomPartitionMarkDoneAction`.
+Package the implementation in a jar available to the job:
+
+```java
+package org.apache.paimon;
+
+import org.apache.paimon.partition.actions.PartitionMarkDoneAction;
+
+public class CustomPartitionMarkDoneAction implements PartitionMarkDoneAction {
+
+    @Override
+    public void markDone(String partition) {
+        // Notify the downstream scheduler.
+    }
+
+    @Override
+    public void close() {}
+}
+```

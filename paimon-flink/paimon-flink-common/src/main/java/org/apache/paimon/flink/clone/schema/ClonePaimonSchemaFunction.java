@@ -31,7 +31,10 @@ import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.functions.ProcessFunction;
 import org.apache.flink.util.Collector;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+import java.util.HashMap;
 import java.util.Map;
 
 import static org.apache.paimon.CoreOptions.BUCKET;
@@ -44,10 +47,13 @@ public class ClonePaimonSchemaFunction
         extends ProcessFunction<Tuple2<Identifier, Identifier>, CloneSchemaInfo> {
 
     private static final long serialVersionUID = 1L;
+    private static final Logger LOG = LoggerFactory.getLogger(ClonePaimonSchemaFunction.class);
 
     private final Map<String, String> sourceCatalogConfig;
     private final Map<String, String> targetCatalogConfig;
+    private final Map<String, String> targetTableConfig;
     private final String preferFileFormat;
+    private final boolean cloneIfExists;
 
     private transient Catalog sourceCatalog;
     private transient Catalog targetCatalog;
@@ -55,10 +61,14 @@ public class ClonePaimonSchemaFunction
     public ClonePaimonSchemaFunction(
             Map<String, String> sourceCatalogConfig,
             Map<String, String> targetCatalogConfig,
-            String preferFileFormat) {
+            Map<String, String> targetTableConfig,
+            String preferFileFormat,
+            boolean cloneIfExists) {
         this.sourceCatalogConfig = sourceCatalogConfig;
         this.targetCatalogConfig = targetCatalogConfig;
+        this.targetTableConfig = targetTableConfig;
         this.preferFileFormat = preferFileFormat;
+        this.cloneIfExists = cloneIfExists;
     }
 
     /**
@@ -95,16 +105,15 @@ public class ClonePaimonSchemaFunction
                         f -> builder.column(f.name(), f.type(), f.description(), f.defaultValue()));
         builder.partitionKeys(sourceTable.partitionKeys());
         builder.primaryKey(sourceTable.primaryKeys());
-        sourceTable
-                .options()
-                .forEach(
-                        (k, v) -> {
-                            if (k.equalsIgnoreCase(BUCKET.key())
-                                    || k.equalsIgnoreCase(PATH.key())) {
-                                return;
-                            }
-                            builder.option(k, v);
-                        });
+        Map<String, String> tableOptions = new HashMap<>(sourceTable.options());
+        tableOptions.putAll(targetTableConfig);
+        tableOptions.forEach(
+                (k, v) -> {
+                    if (k.equalsIgnoreCase(BUCKET.key()) || k.equalsIgnoreCase(PATH.key())) {
+                        return;
+                    }
+                    builder.option(k, v);
+                });
 
         if (sourceTable.primaryKeys().isEmpty()) {
             // for append table with bucket
@@ -119,6 +128,18 @@ public class ClonePaimonSchemaFunction
 
         if (!StringUtils.isNullOrWhitespaceOnly(preferFileFormat)) {
             builder.option(CoreOptions.FILE_FORMAT.key(), preferFileFormat);
+        }
+
+        try {
+            targetCatalog.getTable(tuple.f1);
+            if (!cloneIfExists) {
+                LOG.info(
+                        "Target table '{}' already exists and clone_if_exists is false, skipping clone operation.",
+                        tuple.f1);
+                return;
+            }
+        } catch (Catalog.TableNotExistException e) {
+            // Table does not exist, proceed to create
         }
 
         targetCatalog.createTable(tuple.f1, builder.build(), true);

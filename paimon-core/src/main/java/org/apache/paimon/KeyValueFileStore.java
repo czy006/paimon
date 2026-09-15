@@ -24,6 +24,7 @@ import org.apache.paimon.deletionvectors.BucketedDvMaintainer;
 import org.apache.paimon.format.FileFormatDiscover;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.index.DynamicBucketIndexMaintainer;
+import org.apache.paimon.index.pk.BucketedPrimaryKeyIndexMaintainer;
 import org.apache.paimon.io.KeyValueFileReaderFactory;
 import org.apache.paimon.mergetree.compact.MergeFunctionFactory;
 import org.apache.paimon.operation.AbstractFileStoreWrite;
@@ -32,8 +33,8 @@ import org.apache.paimon.operation.KeyValueFileStoreScan;
 import org.apache.paimon.operation.KeyValueFileStoreWrite;
 import org.apache.paimon.operation.MergeFileSplitRead;
 import org.apache.paimon.operation.RawFileSplitRead;
+import org.apache.paimon.options.Options;
 import org.apache.paimon.postpone.PostponeBucketFileStoreWrite;
-import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.schema.KeyValueFieldsExtractor;
 import org.apache.paimon.schema.SchemaManager;
 import org.apache.paimon.schema.TableSchema;
@@ -48,18 +49,12 @@ import javax.annotation.Nullable;
 
 import java.util.Comparator;
 import java.util.List;
-import java.util.Optional;
 import java.util.function.Supplier;
-
-import static org.apache.paimon.predicate.PredicateBuilder.and;
-import static org.apache.paimon.predicate.PredicateBuilder.pickTransformFieldMapping;
-import static org.apache.paimon.predicate.PredicateBuilder.splitAnd;
 
 /** {@link FileStore} for querying and updating {@link KeyValue}s. */
 public class KeyValueFileStore extends AbstractFileStore<KeyValue> {
 
     private final boolean crossPartitionUpdate;
-    private final RowType bucketKeyType;
     private final RowType keyType;
     private final RowType valueType;
     private final KeyValueFieldsExtractor keyValueFieldsExtractor;
@@ -74,7 +69,6 @@ public class KeyValueFileStore extends AbstractFileStore<KeyValue> {
             boolean crossPartitionUpdate,
             CoreOptions options,
             RowType partitionType,
-            RowType bucketKeyType,
             RowType keyType,
             RowType valueType,
             KeyValueFieldsExtractor keyValueFieldsExtractor,
@@ -83,7 +77,6 @@ public class KeyValueFileStore extends AbstractFileStore<KeyValue> {
             CatalogEnvironment catalogEnvironment) {
         super(fileIO, schemaManager, schema, tableName, options, partitionType, catalogEnvironment);
         this.crossPartitionUpdate = crossPartitionUpdate;
-        this.bucketKeyType = bucketKeyType;
         this.keyType = keyType;
         this.valueType = valueType;
         this.keyValueFieldsExtractor = keyValueFieldsExtractor;
@@ -129,8 +122,7 @@ public class KeyValueFileStore extends AbstractFileStore<KeyValue> {
                 valueType,
                 FileFormatDiscover.of(options),
                 pathFactory(),
-                options.fileIndexReadEnabled(),
-                false);
+                options);
     }
 
     public KeyValueFileReaderFactory.Builder newReaderFactoryBuilder() {
@@ -171,13 +163,36 @@ public class KeyValueFileStore extends AbstractFileStore<KeyValue> {
                     tableName,
                     writeId);
         }
+        return newFixedBucketWrite(commitUser, options);
+    }
+
+    /** Creates a merge-tree writer for fixed-bucket batch writes to a postpone-bucket table. */
+    public AbstractFileStoreWrite<KeyValue> newPostponeFixedBucketWrite(String commitUser) {
+        Options writeOptions = new Options(options.toMap());
+        writeOptions.set(CoreOptions.WRITE_ONLY, true);
+        return newFixedBucketWrite(commitUser, new CoreOptions(writeOptions));
+    }
+
+    private AbstractFileStoreWrite<KeyValue> newFixedBucketWrite(
+            String commitUser, CoreOptions writeOptions) {
         DynamicBucketIndexMaintainer.Factory indexFactory = null;
         if (bucketMode() == BucketMode.HASH_DYNAMIC) {
             indexFactory = new DynamicBucketIndexMaintainer.Factory(newIndexFileHandler());
         }
         BucketedDvMaintainer.Factory dvMaintainerFactory = null;
-        if (options.deletionVectorsEnabled()) {
+        if (writeOptions.deletionVectorsEnabled()) {
             dvMaintainerFactory = BucketedDvMaintainer.factory(newIndexFileHandler());
+        }
+        BucketedPrimaryKeyIndexMaintainer.Factory primaryKeyIndexMaintainerFactory = null;
+        if (writeOptions.primaryKeyVectorIndexEnabled()
+                || writeOptions.primaryKeyFullTextIndexEnabled()
+                || writeOptions.primaryKeyFMIndexEnabled()
+                || !writeOptions.primaryKeyBTreeIndexColumns().isEmpty()
+                || !writeOptions.primaryKeyBitmapIndexColumns().isEmpty()
+                || !writeOptions.primaryKeyMultiValueIndexColumns().isEmpty()) {
+            primaryKeyIndexMaintainerFactory =
+                    BucketedPrimaryKeyIndexMaintainer.Factory.create(
+                            newIndexFileHandler(), newReaderFactoryBuilder(), schema);
         }
         return new KeyValueFileStoreWrite(
                 fileIO,
@@ -188,7 +203,7 @@ public class KeyValueFileStore extends AbstractFileStore<KeyValue> {
                 keyType,
                 valueType,
                 keyComparatorSupplier,
-                () -> UserDefinedSeqComparator.create(valueType, options),
+                () -> UserDefinedSeqComparator.create(valueType, writeOptions),
                 logDedupEqualSupplier,
                 mfFactory,
                 pathFactory(),
@@ -197,32 +212,21 @@ public class KeyValueFileStore extends AbstractFileStore<KeyValue> {
                 newScan(),
                 indexFactory,
                 dvMaintainerFactory,
-                options,
+                primaryKeyIndexMaintainerFactory,
+                writeOptions,
                 keyValueFieldsExtractor,
                 tableName);
     }
 
     @Override
     public KeyValueFileStoreScan newScan() {
-        BucketMode bucketMode = bucketMode();
         BucketSelectConverter bucketSelectConverter =
-                keyFilter -> {
-                    if (bucketMode != BucketMode.HASH_FIXED
-                            && bucketMode != BucketMode.POSTPONE_MODE) {
-                        return Optional.empty();
-                    }
-
-                    List<Predicate> bucketFilters =
-                            pickTransformFieldMapping(
-                                    splitAnd(keyFilter),
-                                    keyType.getFieldNames(),
-                                    bucketKeyType.getFieldNames());
-                    if (!bucketFilters.isEmpty()) {
-                        return BucketSelectConverter.create(
-                                and(bucketFilters), bucketKeyType, options.bucketFunctionType());
-                    }
-                    return Optional.empty();
-                };
+                new BucketSelectConverter(
+                        bucketMode(),
+                        options.bucketFunctionType(),
+                        schema.logicalRowType(),
+                        partitionType,
+                        schema.logicalBucketKeyType());
 
         return new KeyValueFileStoreScan(
                 newManifestsReader(),

@@ -18,44 +18,42 @@
 
 package org.apache.paimon.s3;
 
+import org.apache.paimon.annotation.VisibleForTesting;
 import org.apache.paimon.fs.MultiPartUploadStore;
 
-import com.amazonaws.services.s3.model.CompleteMultipartUploadResult;
-import com.amazonaws.services.s3.model.PartETag;
-import com.amazonaws.services.s3.model.UploadPartRequest;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.s3a.S3AFileSystem;
 import org.apache.hadoop.fs.s3a.WriteOperationHelper;
-import org.apache.hadoop.fs.s3a.statistics.S3AStatisticsContext;
-import org.apache.hadoop.fs.store.audit.AuditSpan;
-import org.apache.hadoop.fs.store.audit.AuditSpanSource;
+import org.apache.hadoop.fs.s3a.impl.PutObjectOptions;
+import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadResponse;
+import software.amazon.awssdk.services.s3.model.CompletedPart;
+import software.amazon.awssdk.services.s3.model.UploadPartRequest;
+import software.amazon.awssdk.services.s3.model.UploadPartResponse;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.apache.paimon.utils.Preconditions.checkNotNull;
 
-/** Provides the multipart upload by Amazon S3. */
+/** Provides the multipart upload by Amazon S3 using Hadoop 3.4+ API (AWS SDK v2). */
 public class S3MultiPartUpload
-        implements MultiPartUploadStore<PartETag, CompleteMultipartUploadResult> {
+        implements MultiPartUploadStore<CompletedPart, CompleteMultipartUploadResponse> {
 
     private final S3AFileSystem s3a;
-
-    private final InternalWriteOperationHelper s3accessHelper;
+    private final WriteOperationHelper s3accessHelper;
 
     public S3MultiPartUpload(S3AFileSystem s3a, Configuration conf) {
-        checkNotNull(s3a);
-        this.s3accessHelper =
-                new InternalWriteOperationHelper(
-                        s3a,
-                        checkNotNull(conf),
-                        s3a.createStoreContext().getInstrumentation(),
-                        s3a.getAuditSpanSource(),
-                        s3a.getActiveAuditSpan());
-        this.s3a = s3a;
+        this.s3a = checkNotNull(s3a);
+        // Take the helper from the file system instead of building it by hand: the hand-built
+        // one left WriteOperationHelperCallbacks null, so uploadPart and completeMultipartUpload
+        // dereferenced null against a real backend. getWriteOperationHelper wires the same audit
+        // span and statistics plus the callbacks the AWS SDK v2 path needs.
+        this.s3accessHelper = s3a.getWriteOperationHelper();
     }
 
     @Override
@@ -65,41 +63,52 @@ public class S3MultiPartUpload
 
     @Override
     public String startMultiPartUpload(String objectName) throws IOException {
-        return s3accessHelper.initiateMultiPartUpload(objectName);
+        return s3accessHelper.initiateMultiPartUpload(objectName, PutObjectOptions.keepingDirs());
     }
 
     @Override
-    public CompleteMultipartUploadResult completeMultipartUpload(
-            String objectName, String uploadId, List<PartETag> partETags, long numBytesInParts)
+    public CompleteMultipartUploadResponse completeMultipartUpload(
+            String objectName, String uploadId, List<CompletedPart> parts, long numBytesInParts)
             throws IOException {
         return s3accessHelper.completeMPUwithRetries(
-                objectName, uploadId, partETags, numBytesInParts, new AtomicInteger(0));
+                objectName,
+                uploadId,
+                parts,
+                numBytesInParts,
+                new AtomicInteger(0),
+                PutObjectOptions.keepingDirs());
     }
 
     @Override
-    public PartETag uploadPart(
+    public CompletedPart uploadPart(
             String objectName, String uploadId, int partNumber, File file, int byteLength)
             throws IOException {
-        final UploadPartRequest uploadRequest =
-                s3accessHelper.newUploadPartRequest(
-                        objectName, uploadId, partNumber, byteLength, null, file, 0L);
-        return s3accessHelper.uploadPart(uploadRequest).getPartETag();
+        UploadPartRequest request =
+                newUploadPartRequest(objectName, uploadId, partNumber, byteLength);
+        RequestBody body = RequestBody.fromBytes(Files.readAllBytes(file.toPath()));
+        UploadPartResponse response = s3accessHelper.uploadPart(request, body, null);
+        return CompletedPart.builder().partNumber(partNumber).eTag(response.eTag()).build();
+    }
+
+    /**
+     * Builds the part request through the S3A request factory, the same way the multipart upload is
+     * initiated. Hand-assembling the request would drop the SSE-C encryption parameters, which S3
+     * requires on every part when the upload was initiated with a customer-provided key.
+     *
+     * <p>{@code isLastPart} is always {@code false}: the caller does not know in advance which part
+     * is the last one, and the factory only uses the flag to set {@code sdkPartType}, which the
+     * hand-assembled request never set either.
+     */
+    @VisibleForTesting
+    UploadPartRequest newUploadPartRequest(
+            String objectName, String uploadId, int partNumber, int byteLength) throws IOException {
+        return s3accessHelper
+                .newUploadPartRequestBuilder(objectName, uploadId, partNumber, false, byteLength)
+                .build();
     }
 
     @Override
     public void abortMultipartUpload(String destKey, String uploadId) throws IOException {
         s3accessHelper.abortMultipartUpload(destKey, uploadId, false, null);
-    }
-
-    private static final class InternalWriteOperationHelper extends WriteOperationHelper {
-
-        InternalWriteOperationHelper(
-                S3AFileSystem owner,
-                Configuration conf,
-                S3AStatisticsContext statisticsContext,
-                AuditSpanSource auditSpanSource,
-                AuditSpan auditSpan) {
-            super(owner, conf, statisticsContext, auditSpanSource, auditSpan);
-        }
     }
 }

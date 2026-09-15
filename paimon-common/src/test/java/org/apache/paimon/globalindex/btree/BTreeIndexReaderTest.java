@@ -21,35 +21,23 @@ package org.apache.paimon.globalindex.btree;
 import org.apache.paimon.globalindex.GlobalIndexIOMeta;
 import org.apache.paimon.globalindex.GlobalIndexReader;
 import org.apache.paimon.globalindex.GlobalIndexResult;
+import org.apache.paimon.memory.MemorySliceOutput;
 import org.apache.paimon.predicate.FieldRef;
+import org.apache.paimon.predicate.TopN;
 import org.apache.paimon.testutils.junit.parameterized.ParameterizedTestExtension;
-import org.apache.paimon.testutils.junit.parameterized.Parameters;
-import org.apache.paimon.types.BigIntType;
-import org.apache.paimon.types.BooleanType;
-import org.apache.paimon.types.CharType;
-import org.apache.paimon.types.DateType;
-import org.apache.paimon.types.DecimalType;
-import org.apache.paimon.types.DoubleType;
-import org.apache.paimon.types.FloatType;
-import org.apache.paimon.types.IntType;
-import org.apache.paimon.types.SmallIntType;
-import org.apache.paimon.types.TimestampType;
-import org.apache.paimon.types.TinyIntType;
-import org.apache.paimon.types.VarCharType;
-import org.apache.paimon.utils.Pair;
 
-import org.junit.jupiter.api.Assertions;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.TestTemplate;
 import org.junit.jupiter.api.extension.ExtendWith;
 
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
-import java.util.Objects;
-import java.util.Random;
-import java.util.TreeSet;
-import java.util.stream.Collectors;
+
+import static org.apache.paimon.predicate.SortValue.NullOrdering.NULLS_FIRST;
+import static org.apache.paimon.predicate.SortValue.NullOrdering.NULLS_LAST;
+import static org.apache.paimon.predicate.SortValue.SortDirection.ASCENDING;
+import static org.apache.paimon.predicate.SortValue.SortDirection.DESCENDING;
+import static org.apache.paimon.shade.guava30.com.google.common.util.concurrent.MoreExecutors.newDirectExecutorService;
+import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test for {@link BTreeIndexReader} to read a single file. */
 @ExtendWith(ParameterizedTestExtension.class)
@@ -59,126 +47,106 @@ public class BTreeIndexReaderTest extends AbstractIndexReaderTest {
         super(args);
     }
 
-    @SuppressWarnings("unused")
-    @Parameters(name = "dataType&recordNum-{0}")
-    public static List<List<Object>> getVarSeg() {
-        return Arrays.asList(
-                Arrays.asList(new IntType(), 10000),
-                Arrays.asList(new VarCharType(VarCharType.MAX_LENGTH), 10000),
-                Arrays.asList(new CharType(100), 10000),
-                Arrays.asList(new FloatType(), 10000),
-                Arrays.asList(new DecimalType(), 10000),
-                Arrays.asList(new DoubleType(), 10000),
-                Arrays.asList(new BooleanType(), 10000),
-                Arrays.asList(new TinyIntType(), 10000),
-                Arrays.asList(new SmallIntType(), 10000),
-                Arrays.asList(new BigIntType(), 10000),
-                Arrays.asList(new DateType(), 10000),
-                Arrays.asList(new TimestampType(), 10000));
-    }
-
-    @BeforeEach
-    public void setUp() throws Exception {
-        super.setUp();
+    @Override
+    protected GlobalIndexReader prepareDataAndCreateReader() throws Exception {
+        GlobalIndexIOMeta written = writeData(data);
+        return globalIndexer.createReader(
+                fileReader,
+                Collections.singletonList(written),
+                dataNum,
+                newDirectExecutorService());
     }
 
     @TestTemplate
-    public void testRangePredicate() throws Exception {
-        GlobalIndexIOMeta written = writeData(data);
+    public void testDescendingTopN() throws Exception {
+        int limit = 20;
         FieldRef ref = new FieldRef(1, "testField", dataType);
+        Object[] valuesByRowId = valuesByRowId();
 
-        try (GlobalIndexReader reader =
-                new BTreeIndexReader(keySerializer, fileReader, written, CACHE_MANAGER)) {
-            GlobalIndexResult result;
-            Random random = new Random();
+        try (GlobalIndexReader reader = prepareDataAndCreateReader()) {
+            GlobalIndexResult result =
+                    reader.visitTopN(new TopN(ref, DESCENDING, NULLS_LAST, limit)).join().get();
+            assertThat(result.results().getLongCardinality()).isEqualTo(limit);
 
-            for (int i = 0; i < 5; i++) {
-                Object literal = data.get(random.nextInt(dataNum)).getKey();
-
-                // 1. test <= literal
-                result = reader.visitLessOrEqual(ref, literal).get();
-                assertResult(result, filter(obj -> comparator.compare(obj, literal) <= 0));
-
-                // 2. test < literal
-                result = reader.visitLessThan(ref, literal).get();
-                assertResult(result, filter(obj -> comparator.compare(obj, literal) < 0));
-
-                // 3. test >= literal
-                result = reader.visitGreaterOrEqual(ref, literal).get();
-                assertResult(result, filter(obj -> comparator.compare(obj, literal) >= 0));
-
-                // 4. test > literal
-                result = reader.visitGreaterThan(ref, literal).get();
-                assertResult(result, filter(obj -> comparator.compare(obj, literal) > 0));
-
-                // 5. test equal
-                result = reader.visitEqual(ref, literal).get();
-                assertResult(result, filter(obj -> comparator.compare(obj, literal) == 0));
-
-                // 6. test not equal
-                result = reader.visitNotEqual(ref, literal).get();
-                assertResult(result, filter(obj -> comparator.compare(obj, literal) != 0));
+            Object boundary = data.get(dataNum - limit).getKey();
+            for (long rowId : result.results()) {
+                assertThat(comparator.compare(valuesByRowId[(int) rowId], boundary))
+                        .isGreaterThanOrEqualTo(0);
             }
 
-            // 7. test < min
-            Object literal7 = data.get(0).getKey();
-            result = reader.visitLessThan(ref, literal7).get();
-            Assertions.assertTrue(result.results().isEmpty());
+            GlobalIndexResult ascending =
+                    reader.visitTopN(new TopN(ref, ASCENDING, NULLS_LAST, limit)).join().get();
+            assertThat(ascending.results().getLongCardinality()).isEqualTo(limit);
+            boundary = data.get(limit - 1).getKey();
+            for (long rowId : ascending.results()) {
+                assertThat(comparator.compare(valuesByRowId[(int) rowId], boundary))
+                        .isLessThanOrEqualTo(0);
+            }
 
-            // 8. test > max
-            Object literal8 = data.get(dataNum - 1).getKey();
-            result = reader.visitGreaterThan(ref, literal8).get();
-            Assertions.assertTrue(result.results().isEmpty());
+            assertThat(
+                            reader.visitTopN(new TopN(ref, DESCENDING, NULLS_LAST, 0))
+                                    .join()
+                                    .get()
+                                    .results())
+                    .isEmpty();
         }
-    }
 
-    @TestTemplate
-    public void testIsNull() throws Exception {
-        // set nulls
-        for (int i = dataNum - 1; i >= dataNum * 0.9; i--) {
+        int nullCount = dataNum / 10;
+        for (int i = dataNum - nullCount; i < dataNum; i++) {
             data.get(i).setLeft(null);
         }
-        GlobalIndexIOMeta written = writeData(data);
-        FieldRef ref = new FieldRef(1, "testField", dataType);
+        valuesByRowId = valuesByRowId();
+        try (GlobalIndexReader reader = prepareDataAndCreateReader()) {
+            GlobalIndexResult nullsFirst =
+                    reader.visitTopN(new TopN(ref, DESCENDING, NULLS_FIRST, limit)).join().get();
+            assertThat(nullsFirst.results().getLongCardinality()).isEqualTo(limit);
+            for (long rowId : nullsFirst.results()) {
+                assertThat(valuesByRowId[(int) rowId]).isNull();
+            }
 
-        try (GlobalIndexReader reader =
-                new BTreeIndexReader(keySerializer, fileReader, written, CACHE_MANAGER)) {
-            GlobalIndexResult result;
+            GlobalIndexResult nullsLast =
+                    reader.visitTopN(new TopN(ref, DESCENDING, NULLS_LAST, limit)).join().get();
+            assertThat(nullsLast.results().getLongCardinality()).isEqualTo(limit);
+            Object boundary = data.get(dataNum - nullCount - limit).getKey();
+            for (long rowId : nullsLast.results()) {
+                Object value = valuesByRowId[(int) rowId];
+                assertThat(value).isNotNull();
+                assertThat(comparator.compare(value, boundary)).isGreaterThanOrEqualTo(0);
+            }
 
-            result = reader.visitIsNull(ref).get();
-            assertResult(result, filter(Objects::isNull));
+            GlobalIndexResult ascendingNullsFirst =
+                    reader.visitTopN(new TopN(ref, ASCENDING, NULLS_FIRST, limit)).join().get();
+            assertThat(ascendingNullsFirst.results().getLongCardinality()).isEqualTo(limit);
+            for (long rowId : ascendingNullsFirst.results()) {
+                assertThat(valuesByRowId[(int) rowId]).isNull();
+            }
 
-            result = reader.visitIsNotNull(ref).get();
-            assertResult(result, filter(Objects::nonNull));
+            GlobalIndexResult ascendingNullsLast =
+                    reader.visitTopN(new TopN(ref, ASCENDING, NULLS_LAST, limit)).join().get();
+            assertThat(ascendingNullsLast.results().getLongCardinality()).isEqualTo(limit);
+            boundary = data.get(limit - 1).getKey();
+            for (long rowId : ascendingNullsLast.results()) {
+                Object value = valuesByRowId[(int) rowId];
+                assertThat(value).isNotNull();
+                assertThat(comparator.compare(value, boundary)).isLessThanOrEqualTo(0);
+            }
         }
     }
 
     @TestTemplate
-    public void testInPredicate() throws Exception {
-        GlobalIndexIOMeta written = writeData(data);
-        FieldRef ref = new FieldRef(1, "testField", dataType);
+    public void testTopNOnlyDeserializesRemainingRowIds() {
+        MemorySliceOutput output = new MemorySliceOutput(16);
+        output.writeVarLenInt(3);
+        output.writeVarLenLong(10);
+        output.writeVarLenLong(20);
 
-        try (GlobalIndexReader reader =
-                new BTreeIndexReader(keySerializer, fileReader, written, CACHE_MANAGER)) {
-            GlobalIndexResult result;
-            for (int i = 0; i < 10; i++) {
-                Random random = new Random(System.currentTimeMillis());
-                List<Object> literals =
-                        data.stream().map(Pair::getKey).collect(Collectors.toList());
-                Collections.shuffle(literals, random);
-                literals = literals.subList(0, (int) (dataNum * 0.1));
+        assertThat(BTreeIndexReader.deserializeRowIds(output.toSlice(), 2))
+                .containsExactly(10L, 20L);
+    }
 
-                TreeSet<Object> set = new TreeSet<>(comparator);
-                set.addAll(literals);
-
-                // 1. test in
-                result = reader.visitIn(ref, literals).get();
-                assertResult(result, filter(set::contains));
-
-                // 2. test not in
-                result = reader.visitNotIn(ref, literals).get();
-                assertResult(result, filter(obj -> !set.contains(obj)));
-            }
-        }
+    private Object[] valuesByRowId() {
+        Object[] values = new Object[dataNum];
+        data.forEach(pair -> values[pair.getValue().intValue()] = pair.getKey());
+        return values;
     }
 }

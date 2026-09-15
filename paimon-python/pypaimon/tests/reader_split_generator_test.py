@@ -1,20 +1,19 @@
-################################################################################
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-################################################################################
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
 """
 Test cases for split generation logic, matching Java's SplitGeneratorTest.
@@ -51,7 +50,7 @@ class SplitGeneratorTest(unittest.TestCase):
                       deletion_vectors_enabled=False,
                       split_target_size=None, split_open_file_cost=None):
         pa_schema = pa.schema([
-            ('id', pa.int64()),
+            pa.field('id', pa.int64(), nullable=False),
             ('value', pa.string())
         ])
         options = {
@@ -81,7 +80,7 @@ class SplitGeneratorTest(unittest.TestCase):
     
     def _write_data(self, table, data_list):
         pa_schema = pa.schema([
-            ('id', pa.int64()),
+            pa.field('id', pa.int64(), nullable=False),
             ('value', pa.string())
         ])
         for data in data_list:
@@ -210,10 +209,17 @@ class SplitGeneratorTest(unittest.TestCase):
                     self.assertFalse(
                         split.raw_convertible,
                         "Multi-file split should not be raw_convertible when optimized path is not used")
+            
+            merged_count = split.merged_row_count()
+            if merged_count is not None:
+                self.assertGreaterEqual(merged_count, 0, "merged_row_count should be non-negative")
+                self.assertLessEqual(
+                    merged_count, split.row_count,
+                    "merged_row_count should be <= row_count")
 
     def test_shard_with_empty_partition(self):
         pa_schema = pa.schema([
-            ('id', pa.int64()),
+            pa.field('id', pa.int64(), nullable=False),
             ('value', pa.string())
         ])
         schema = Schema.from_pyarrow_schema(
@@ -243,6 +249,173 @@ class SplitGeneratorTest(unittest.TestCase):
         
         for split in splits_shard_0:
             self.assertGreater(len(split.files), 0, "Each split should have at least one file")
+            
+            merged_count = split.merged_row_count()
+            if merged_count is not None:
+                self.assertGreaterEqual(merged_count, 0, "merged_row_count should be non-negative")
+                self.assertLessEqual(
+                    merged_count, split.row_count,
+                    "merged_row_count should be <= row_count")
+            
+            from pypaimon.read.sliced_split import SlicedSplit
+            if isinstance(split, SlicedSplit):
+                sliced_merged = split.merged_row_count()
+                if split.shard_file_idx_map():
+                    self.assertEqual(
+                        sliced_merged, split.row_count,
+                        "SlicedSplit with shard_file_idx_map should return row_count as merged_row_count")
+                else:
+                    underlying_merged = split.data_split().merged_row_count()
+                    self.assertEqual(
+                        sliced_merged, underlying_merged,
+                        "SlicedSplit without shard_file_idx_map should delegate to underlying split")
+
+    def test_sliced_split_merged_row_count(self):
+        """Test merged_row_count() for SlicedSplit with explicit slicing."""
+        pa_schema = pa.schema([
+            pa.field('id', pa.int64(), nullable=False),
+            ('value', pa.string())
+        ])
+        schema = Schema.from_pyarrow_schema(
+            pa_schema,
+            primary_keys=['id'],
+            options={'bucket': '1'}  # Single bucket to ensure splits can be sliced
+        )
+        self.catalog.create_table('default.test_sliced_split', schema, False)
+        table = self.catalog.get_table('default.test_sliced_split')
+        
+        # Write enough data to create multiple files/splits
+        # Write in multiple batches to potentially create multiple files
+        for i in range(3):
+            self._write_data(table, [{'id': list(range(i * 10, (i + 1) * 10)),
+                                     'value': [f'v{j}' for j in range(i * 10, (i + 1) * 10)]}])
+        
+        read_builder = table.new_read_builder()
+        splits_all = read_builder.new_scan().plan().splits()
+        self.assertGreater(len(splits_all), 0, "Should have splits")
+        
+        # Use with_shard to potentially create SlicedSplit
+        # Using multiple shards increases chance of creating SlicedSplit
+        from pypaimon.read.sliced_split import SlicedSplit
+        
+        for shard_idx in range(3):
+            splits_shard = read_builder.new_scan().with_shard(shard_idx, 3).plan().splits()
+            for split in splits_shard:
+                # Test merged_row_count for all splits
+                merged_count = split.merged_row_count()
+                if merged_count is not None:
+                    self.assertGreaterEqual(merged_count, 0, "merged_row_count should be non-negative")
+                    self.assertLessEqual(
+                        merged_count, split.row_count,
+                        "merged_row_count should be <= row_count")
+                
+                # Explicitly test SlicedSplit if present
+                if isinstance(split, SlicedSplit):
+                    sliced_merged = split.merged_row_count()
+                    shard_map = split.shard_file_idx_map()
+                    if shard_map:
+                        # When shard_file_idx_map is present, merged_row_count should equal row_count
+                        self.assertEqual(
+                            sliced_merged, split.row_count,
+                            "SlicedSplit with shard_file_idx_map should return row_count as merged_row_count")
+                    else:
+                        # When shard_file_idx_map is empty, should delegate to underlying split
+                        underlying_merged = split.data_split().merged_row_count()
+                        self.assertEqual(
+                            sliced_merged, underlying_merged,
+                            "SlicedSplit without shard_file_idx_map should delegate to underlying split")
+        
+        # Note: SlicedSplit may or may not be created depending on data distribution
+        # This test ensures that if SlicedSplit is created, merged_row_count() works correctly
+
+
+class ApplyPushDownLimitUnitTest(unittest.TestCase):
+    """Mock-driven coverage of ``FileScanner._apply_push_down_limit``."""
+
+    @staticmethod
+    def _apply(
+            splits,
+            limit,
+            has_non_partition_filter=False,
+            data_evolution=False,
+            deletion_vectors_enabled=False):
+        from pypaimon.read.scanner.file_scanner import FileScanner
+
+        class _FakeScanner:
+            pass
+
+        scanner = _FakeScanner()
+        scanner.limit = limit
+        scanner.data_evolution = data_evolution
+        scanner.deletion_vectors_enabled = deletion_vectors_enabled
+        scanner.auth_has_non_partition_filter = False
+        scanner._has_non_partition_filter = lambda: has_non_partition_filter
+        return FileScanner._apply_push_down_limit(scanner, splits)
+
+    @staticmethod
+    def _split(raw_convertible, row_count, merged_row_count):
+        class _FakeSplit:
+            pass
+
+        s = _FakeSplit()
+        s.raw_convertible = raw_convertible
+        s.row_count = row_count
+        s._merged = merged_row_count
+        s.merged_row_count = lambda: s._merged
+        return s
+
+    def test_dv_aware_accumulator_uses_merged_row_count(self):
+        """DV-aware raw split + trailing non-raw splits, ``limit > merged``:
+        pre-fix (``+= row_count``) early-returns ``[raw]``; post-fix
+        (``+= merged_row_count``) leaves the budget at 4 < 5, the loop
+        completes, and the fall-through returns all three splits."""
+        s_raw = self._split(raw_convertible=True, row_count=10, merged_row_count=4)
+        s_nr1 = self._split(raw_convertible=False, row_count=10, merged_row_count=None)
+        s_nr2 = self._split(raw_convertible=False, row_count=10, merged_row_count=None)
+
+        result = self._apply([s_raw, s_nr1, s_nr2], limit=5)
+        self.assertEqual(len(result), 3)
+
+    def test_accumulator_skips_splits_with_unknown_merged_count(self):
+        """A split whose ``merged_row_count()`` returns ``None`` does not
+        contribute to the budget; the loop completes and returns the
+        input via the fall-through."""
+        s = self._split(raw_convertible=True, row_count=10, merged_row_count=None)
+        result = self._apply([s], limit=5)
+        self.assertEqual(result, [s])
+
+    def test_no_raw_splits_falls_through_to_full_list(self):
+        """No split contributes to the budget → fall-through returns all."""
+        s1 = self._split(raw_convertible=False, row_count=10, merged_row_count=None)
+        s2 = self._split(raw_convertible=False, row_count=10, merged_row_count=None)
+        result = self._apply([s1, s2], limit=5)
+        self.assertEqual(result, [s1, s2])
+
+    def test_empty_splits_returns_empty(self):
+        self.assertEqual(self._apply([], limit=5), [])
+
+    def test_no_limit_returns_input_unchanged(self):
+        s = self._split(raw_convertible=True, row_count=10, merged_row_count=10)
+        result = self._apply([s], limit=None)
+        self.assertEqual(result, [s])
+
+    def test_non_partition_filter_short_circuits_pushdown(self):
+        """Predicate touching a non-partition column → no pushdown,
+        regardless of how many DV-aware splits the plan contains."""
+        s_raw = self._split(raw_convertible=True, row_count=10, merged_row_count=10)
+        result = self._apply(
+            [s_raw, s_raw, s_raw], limit=5, has_non_partition_filter=True)
+        self.assertEqual(len(result), 3)
+
+    def test_data_evolution_deletion_vectors_disable_limit_pushdown(self):
+        s_raw = self._split(raw_convertible=True, row_count=10, merged_row_count=10)
+        result = self._apply(
+            [s_raw, s_raw, s_raw],
+            limit=5,
+            data_evolution=True,
+            deletion_vectors_enabled=True,
+        )
+        self.assertEqual(len(result), 3)
 
 
 if __name__ == '__main__':

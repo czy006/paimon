@@ -25,6 +25,7 @@ import org.apache.paimon.data.Decimal;
 import org.apache.paimon.data.GenericArray;
 import org.apache.paimon.data.GenericMap;
 import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.data.Timestamp;
 import org.apache.paimon.data.variant.GenericVariantUtil.Type;
 import org.apache.paimon.types.ArrayType;
 import org.apache.paimon.types.DataType;
@@ -44,7 +45,7 @@ public class VariantGet {
             GenericVariantBuilder builder = new GenericVariantBuilder(false);
             builder.appendVariant(v);
             GenericVariant result = builder.result();
-            return new GenericVariant(result.value(), result.metadata());
+            return new GenericVariant(result.valueBuffer(), result.metadataBuffer());
         }
 
         Type variantType = v.getType();
@@ -136,19 +137,29 @@ public class VariantGet {
                     inputType = DataTypes.DOUBLE();
                     break;
                 case DECIMAL:
-                    BigDecimal decimal = v.getDecimal();
-                    int precision = decimal.precision();
-                    int scale = decimal.scale();
-                    input = Decimal.fromBigDecimal(decimal, precision, scale);
-                    inputType = DataTypes.DECIMAL(precision, scale);
+                    Decimal decimal = normalizedDecimal(v.getDecimal());
+                    input = decimal;
+                    inputType = DataTypes.DECIMAL(decimal.precision(), decimal.scale());
                     break;
                 case DATE:
                     input = (int) v.getLong();
                     inputType = DataTypes.DATE();
                     break;
+                case TIMESTAMP:
+                    input = Timestamp.fromMicros(v.getLong());
+                    inputType = DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE();
+                    break;
+                case TIMESTAMP_NTZ:
+                    input = Timestamp.fromMicros(v.getLong());
+                    inputType = DataTypes.TIMESTAMP();
+                    break;
                 case FLOAT:
                     input = v.getFloat();
                     inputType = DataTypes.FLOAT();
+                    break;
+                case BINARY:
+                    input = v.getBinary();
+                    inputType = DataTypes.BYTES();
                     break;
                 default:
                     // todo: support other types
@@ -171,6 +182,27 @@ public class VariantGet {
 
             return invalidCast(v, dataType, castArgs);
         }
+    }
+
+    /**
+     * The decimal a variant scalar is cast from: trailing zeros stripped, the way {@code toJson}
+     * renders it, with a precision and scale that {@code DecimalType} accepts. The shredded reader
+     * applies the same normalization to a {@code typed_value} decimal, whose scale comes from the
+     * file schema, so that a cast yields the same result for a plain and a shredded file.
+     */
+    static Decimal normalizedDecimal(BigDecimal decimal) {
+        decimal = decimal.stripTrailingZeros();
+        if (decimal.scale() < 0) {
+            // stripTrailingZeros folds trailing zeros into a negative exponent, and a negative
+            // scale is not a Paimon decimal
+            decimal = decimal.setScale(0);
+        }
+        int scale = decimal.scale();
+        // precision() counts the digits of the unscaled value, so it is smaller than the scale
+        // for a value below 0.1, which DecimalType rejects. The variant writer caps both at
+        // MAX_DECIMAL16_PRECISION, so this stays in range.
+        int precision = Math.max(decimal.precision(), scale);
+        return Decimal.fromBigDecimal(decimal, precision, scale);
     }
 
     public static Object invalidCast(Variant v, DataType dataType, VariantCastArgs castArgs) {

@@ -21,6 +21,7 @@ package org.apache.paimon.predicate;
 import org.apache.paimon.utils.Range;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 
@@ -45,16 +46,29 @@ public class RowIdPredicateVisitor implements PredicateVisitor<Optional<List<Ran
 
     @Override
     public Optional<List<Range>> visit(LeafPredicate predicate) {
-        if (ROW_ID.name().equals(predicate.fieldName())) {
+        Optional<FieldRef> fieldRefOptional = predicate.fieldRefOptional();
+        if (!fieldRefOptional.isPresent()) {
+            return Optional.empty();
+        }
+        FieldRef fieldRef = fieldRefOptional.get();
+        if (ROW_ID.name().equals(fieldRef.name())) {
             LeafFunction function = predicate.function();
             if (function instanceof Equal || function instanceof In) {
                 ArrayList<Long> rowIds = new ArrayList<>();
                 for (Object literal : predicate.literals()) {
                     rowIds.add((Long) literal);
                 }
-                // The list output by getRangesFromList is already sorted,
-                // and has no overlap
                 return Optional.of(Range.toRanges(rowIds));
+            } else if (function instanceof Between) {
+                List<Object> literals = predicate.literals();
+                long from = (Long) literals.get(0);
+                long to = (Long) literals.get(1);
+                // BETWEEN with inverted bounds (SQL allows BETWEEN 10 AND 5) is empty.
+                if (from > to) {
+                    // Mutable: the Or union path accumulates into the returned list.
+                    return Optional.of(new ArrayList<>());
+                }
+                return Optional.of(Collections.singletonList(new Range(from, to)));
             }
         }
         return Optional.empty();
@@ -62,7 +76,7 @@ public class RowIdPredicateVisitor implements PredicateVisitor<Optional<List<Ran
 
     @Override
     public Optional<List<Range>> visit(CompoundPredicate predicate) {
-        CompoundPredicate.Function function = predicate.function();
+        CompoundFunction function = predicate.function();
         Optional<List<Range>> rowIds = Optional.empty();
         // `And` means we should get the intersection of all children.
         if (function instanceof And) {
@@ -98,11 +112,5 @@ public class RowIdPredicateVisitor implements PredicateVisitor<Optional<List<Ran
             return Optional.empty();
         }
         return rowIds;
-    }
-
-    @Override
-    public Optional<List<Range>> visit(TransformPredicate predicate) {
-        // do not support transform predicate now.
-        return Optional.empty();
     }
 }

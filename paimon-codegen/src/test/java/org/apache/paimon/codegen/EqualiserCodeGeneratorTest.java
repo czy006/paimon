@@ -18,18 +18,22 @@
 
 package org.apache.paimon.codegen;
 
+import org.apache.paimon.data.BinaryArray;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.BinaryRowWriter;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.BinaryWriter;
 import org.apache.paimon.data.BlobData;
 import org.apache.paimon.data.Decimal;
+import org.apache.paimon.data.GenericArray;
 import org.apache.paimon.data.GenericMap;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.Timestamp;
 import org.apache.paimon.data.serializer.InternalArraySerializer;
 import org.apache.paimon.data.serializer.InternalMapSerializer;
 import org.apache.paimon.data.serializer.InternalRowSerializer;
+import org.apache.paimon.data.serializer.InternalSerializers;
+import org.apache.paimon.data.serializer.InternalVectorSerializer;
 import org.apache.paimon.data.serializer.Serializer;
 import org.apache.paimon.data.variant.GenericVariant;
 import org.apache.paimon.types.DataType;
@@ -40,11 +44,13 @@ import org.apache.paimon.types.VarCharType;
 import org.apache.paimon.utils.Pair;
 
 import org.junit.jupiter.api.RepeatedTest;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ThreadLocalRandom;
@@ -77,6 +83,14 @@ public class EqualiserCodeGeneratorTest {
         TEST_DATA.put(
                 DataTypeRoot.VARBINARY,
                 new GeneratedData(DataTypes.VARBINARY(1), Pair.of("7".getBytes(), "8".getBytes())));
+        TEST_DATA.put(
+                DataTypeRoot.GEOMETRY,
+                new GeneratedData(
+                        DataTypes.GEOMETRY(), Pair.of("geom-1".getBytes(), "geom-2".getBytes())));
+        TEST_DATA.put(
+                DataTypeRoot.GEOGRAPHY,
+                new GeneratedData(
+                        DataTypes.GEOGRAPHY(), Pair.of("geog-1".getBytes(), "geog-2".getBytes())));
         TEST_DATA.put(
                 DataTypeRoot.DECIMAL,
                 new GeneratedData(
@@ -133,6 +147,16 @@ public class EqualiserCodeGeneratorTest {
                                 castFromString("[1,2,3]", DataTypes.ARRAY(new VarCharType())),
                                 castFromString("[4,5,6]", DataTypes.ARRAY(new VarCharType()))),
                         new InternalArraySerializer(DataTypes.VARCHAR(1))));
+        TEST_DATA.put(
+                DataTypeRoot.VECTOR,
+                new GeneratedData(
+                        DataTypes.VECTOR(3, DataTypes.FLOAT()),
+                        Pair.of(
+                                castFromString(
+                                        "[1.1,2.2,3.3]", DataTypes.VECTOR(3, DataTypes.FLOAT())),
+                                castFromString(
+                                        "[4.4,5.5,6.6]", DataTypes.VECTOR(3, DataTypes.FLOAT()))),
+                        new InternalVectorSerializer(DataTypes.FLOAT(), 3)));
         TEST_DATA.put(
                 DataTypeRoot.MULTISET,
                 new GeneratedData(
@@ -243,6 +267,332 @@ public class EqualiserCodeGeneratorTest {
                         GenericRow.of(field1.left(), field2.left()),
                         GenericRow.of(field1.right(), field2.right()));
         assertThat(result).isEqualTo(expected);
+    }
+
+    @Test
+    public void testFloatingPointEqualiserMatchesJdkComparison() {
+        RecordEqualiser doubleEqualiser =
+                new EqualiserCodeGenerator(new DataType[] {DataTypes.DOUBLE()})
+                        .generateRecordEqualiser("doubleFieldEquals")
+                        .newInstance(Thread.currentThread().getContextClassLoader());
+        double[] doubles = {
+            Double.NEGATIVE_INFINITY, -1.0d, -0.0d, 0.0d, 1.0d, Double.POSITIVE_INFINITY, Double.NaN
+        };
+        for (double a : doubles) {
+            for (double b : doubles) {
+                assertFloatingPointEqualiser(
+                        doubleEqualiser, DataTypes.DOUBLE(), a, b, Double.compare(a, b) == 0);
+            }
+        }
+        assertFloatingPointEqualiser(
+                doubleEqualiser,
+                DataTypes.DOUBLE(),
+                Double.longBitsToDouble(0x7ff8000000000001L),
+                Double.NaN,
+                true);
+
+        RecordEqualiser floatEqualiser =
+                new EqualiserCodeGenerator(new DataType[] {DataTypes.FLOAT()})
+                        .generateRecordEqualiser("floatFieldEquals")
+                        .newInstance(Thread.currentThread().getContextClassLoader());
+        float[] floats = {
+            Float.NEGATIVE_INFINITY, -1.0f, -0.0f, 0.0f, 1.0f, Float.POSITIVE_INFINITY, Float.NaN
+        };
+        for (float a : floats) {
+            for (float b : floats) {
+                assertFloatingPointEqualiser(
+                        floatEqualiser, DataTypes.FLOAT(), a, b, Float.compare(a, b) == 0);
+            }
+        }
+        assertFloatingPointEqualiser(
+                floatEqualiser,
+                DataTypes.FLOAT(),
+                Float.intBitsToFloat(0x7fc00001),
+                Float.NaN,
+                true);
+
+        RecordEqualiser doubleArrayEqualiser =
+                new EqualiserCodeGenerator(new DataType[] {DataTypes.ARRAY(DataTypes.DOUBLE())})
+                        .generateRecordEqualiser("doubleArrayFieldEquals")
+                        .newInstance(Thread.currentThread().getContextClassLoader());
+        assertFloatingPointEqualiser(
+                doubleArrayEqualiser,
+                DataTypes.ARRAY(DataTypes.DOUBLE()),
+                BinaryArray.fromPrimitiveArray(
+                        new double[] {Double.longBitsToDouble(0x7ff8000000000001L)}),
+                BinaryArray.fromPrimitiveArray(new double[] {Double.NaN}),
+                true);
+
+        RecordEqualiser floatArrayEqualiser =
+                new EqualiserCodeGenerator(new DataType[] {DataTypes.ARRAY(DataTypes.FLOAT())})
+                        .generateRecordEqualiser("floatArrayFieldEquals")
+                        .newInstance(Thread.currentThread().getContextClassLoader());
+        assertFloatingPointEqualiser(
+                floatArrayEqualiser,
+                DataTypes.ARRAY(DataTypes.FLOAT()),
+                BinaryArray.fromPrimitiveArray(new float[] {Float.intBitsToFloat(0x7fc00001)}),
+                BinaryArray.fromPrimitiveArray(new float[] {Float.NaN}),
+                true);
+
+        DataType doubleArrayType = DataTypes.ARRAY(DataTypes.DOUBLE());
+        RecordEqualiser nestedDoubleArrayEqualiser =
+                new EqualiserCodeGenerator(new DataType[] {DataTypes.ARRAY(doubleArrayType)})
+                        .generateRecordEqualiser("nestedDoubleArrayFieldEquals")
+                        .newInstance(Thread.currentThread().getContextClassLoader());
+        assertFloatingPointEqualiser(
+                nestedDoubleArrayEqualiser,
+                DataTypes.ARRAY(doubleArrayType),
+                new GenericArray(
+                        new Object[] {
+                            BinaryArray.fromPrimitiveArray(
+                                    new double[] {Double.longBitsToDouble(0x7ff8000000000001L)})
+                        }),
+                new GenericArray(
+                        new Object[] {BinaryArray.fromPrimitiveArray(new double[] {Double.NaN})}),
+                true);
+
+        DataType doubleRowType = DataTypes.ROW(DataTypes.DOUBLE());
+        RecordEqualiser doubleRowArrayEqualiser =
+                new EqualiserCodeGenerator(new DataType[] {DataTypes.ARRAY(doubleRowType)})
+                        .generateRecordEqualiser("doubleRowArrayFieldEquals")
+                        .newInstance(Thread.currentThread().getContextClassLoader());
+        assertFloatingPointEqualiser(
+                doubleRowArrayEqualiser,
+                DataTypes.ARRAY(doubleRowType),
+                new GenericArray(
+                        new Object[] {GenericRow.of(Double.longBitsToDouble(0x7ff8000000000001L))}),
+                new GenericArray(new Object[] {GenericRow.of(Double.NaN)}),
+                true);
+
+        DataType doubleRowMapType = DataTypes.MAP(doubleRowType, DataTypes.INT());
+        RecordEqualiser doubleRowMapEqualiser =
+                new EqualiserCodeGenerator(new DataType[] {doubleRowMapType})
+                        .generateRecordEqualiser("doubleRowMapFieldEquals")
+                        .newInstance(Thread.currentThread().getContextClassLoader());
+        Map<Object, Object> leftMap = new HashMap<>();
+        leftMap.put(GenericRow.of(Double.longBitsToDouble(0x7ff8000000000001L)), 1);
+        Map<Object, Object> rightMap = new HashMap<>();
+        rightMap.put(GenericRow.of(Double.NaN), 1);
+        assertFloatingPointEqualiser(
+                doubleRowMapEqualiser,
+                doubleRowMapType,
+                new GenericMap(leftMap),
+                new GenericMap(rightMap),
+                true);
+
+        Map<Object, Object> leftNullKeyMap = new HashMap<>();
+        leftNullKeyMap.put(null, 1);
+        Map<Object, Object> rightNullKeyMap = new HashMap<>();
+        rightNullKeyMap.put(null, 1);
+        assertFloatingPointEqualiser(
+                doubleRowMapEqualiser,
+                doubleRowMapType,
+                new GenericMap(leftNullKeyMap),
+                new GenericMap(rightNullKeyMap),
+                true);
+    }
+
+    private static void assertFloatingPointEqualiser(
+            RecordEqualiser equaliser,
+            DataType dataType,
+            Object left,
+            Object right,
+            boolean equal) {
+        Function<Object, BinaryRow> toBinaryRow =
+                value -> {
+                    BinaryRow row = new BinaryRow(1);
+                    BinaryRowWriter writer = new BinaryRowWriter(row);
+                    Serializer<?> serializer = InternalSerializers.create(dataType);
+                    BinaryWriter.write(writer, 0, value, dataType, serializer);
+                    writer.complete();
+                    return row;
+                };
+        assertThat(equaliser.equals(GenericRow.of(left), GenericRow.of(right)))
+                .as("equals(generic %s, generic %s)", left, right)
+                .isEqualTo(equal);
+        assertThat(equaliser.equals(toBinaryRow.apply(left), GenericRow.of(right)))
+                .as("equals(binary %s, generic %s)", left, right)
+                .isEqualTo(equal);
+        assertThat(equaliser.equals(GenericRow.of(left), toBinaryRow.apply(right)))
+                .as("equals(generic %s, binary %s)", left, right)
+                .isEqualTo(equal);
+        assertThat(equaliser.equals(toBinaryRow.apply(left), toBinaryRow.apply(right)))
+                .as("equals(binary %s, binary %s)", left, right)
+                .isEqualTo(equal);
+    }
+
+    @Test
+    public void testBinaryKeyMapEqualiser() {
+        DataType mapType = DataTypes.MAP(DataTypes.BYTES(), DataTypes.INT());
+        RecordEqualiser equaliser =
+                new EqualiserCodeGenerator(new DataType[] {mapType})
+                        .generateRecordEqualiser("binaryKeyMapFieldEquals")
+                        .newInstance(Thread.currentThread().getContextClassLoader());
+
+        // byte[] keys with equal content but distinct identity must compare equal
+        assertMapEqualiser(
+                equaliser,
+                mapType,
+                new GenericMap(singletonMap("k1".getBytes(), 1)),
+                new GenericMap(singletonMap("k1".getBytes(), 1)),
+                true);
+        assertMapEqualiser(
+                equaliser,
+                mapType,
+                new GenericMap(singletonMap("k1".getBytes(), 1)),
+                new GenericMap(singletonMap("k2".getBytes(), 1)),
+                false);
+        assertMapEqualiser(
+                equaliser,
+                mapType,
+                new GenericMap(singletonMap("k1".getBytes(), 1)),
+                new GenericMap(singletonMap("k1".getBytes(), 2)),
+                false);
+
+        // multiple keys: same insertion order on both sides so that the serialized
+        // BinaryRow bytes are identical for the BinaryRow/BinaryRow fast path
+        Map<Object, Object> leftMap = new LinkedHashMap<>();
+        leftMap.put("k1".getBytes(), 1);
+        leftMap.put("k2".getBytes(), 2);
+        Map<Object, Object> rightMap = new LinkedHashMap<>();
+        rightMap.put("k1".getBytes(), 1);
+        rightMap.put("k2".getBytes(), 2);
+        assertMapEqualiser(
+                equaliser, mapType, new GenericMap(leftMap), new GenericMap(rightMap), true);
+
+        // entry order must not matter for the element-wise comparison
+        Map<Object, Object> reversedMap = new LinkedHashMap<>();
+        reversedMap.put("k2".getBytes(), 2);
+        reversedMap.put("k1".getBytes(), 1);
+        assertThat(
+                        equaliser.equals(
+                                GenericRow.of(new GenericMap(leftMap)),
+                                GenericRow.of(new GenericMap(reversedMap))))
+                .isTrue();
+
+        Map<Object, Object> differentValueMap = new LinkedHashMap<>();
+        differentValueMap.put("k1".getBytes(), 1);
+        differentValueMap.put("k2".getBytes(), 3);
+        assertMapEqualiser(
+                equaliser,
+                mapType,
+                new GenericMap(leftMap),
+                new GenericMap(differentValueMap),
+                false);
+    }
+
+    @Test
+    public void testBinaryElementMultisetEqualiser() {
+        DataType multisetType = DataTypes.MULTISET(DataTypes.BYTES());
+        RecordEqualiser equaliser =
+                new EqualiserCodeGenerator(new DataType[] {multisetType})
+                        .generateRecordEqualiser("binaryMultisetFieldEquals")
+                        .newInstance(Thread.currentThread().getContextClassLoader());
+
+        assertMapEqualiser(
+                equaliser,
+                multisetType,
+                new GenericMap(singletonMap("e1".getBytes(), 2)),
+                new GenericMap(singletonMap("e1".getBytes(), 2)),
+                true);
+        assertMapEqualiser(
+                equaliser,
+                multisetType,
+                new GenericMap(singletonMap("e1".getBytes(), 2)),
+                new GenericMap(singletonMap("e2".getBytes(), 2)),
+                false);
+        assertMapEqualiser(
+                equaliser,
+                multisetType,
+                new GenericMap(singletonMap("e1".getBytes(), 2)),
+                new GenericMap(singletonMap("e1".getBytes(), 3)),
+                false);
+    }
+
+    @Test
+    public void testRowKeyMapEqualiserAcrossRowRepresentations() {
+        DataType mapType = DataTypes.MAP(DataTypes.ROW(DataTypes.INT()), DataTypes.INT());
+        RecordEqualiser equaliser =
+                new EqualiserCodeGenerator(new DataType[] {mapType})
+                        .generateRecordEqualiser("rowKeyMapFieldEquals")
+                        .newInstance(Thread.currentThread().getContextClassLoader());
+
+        // a binary side yields NestedRow keys while the generic side yields GenericRow keys
+        assertMapEqualiser(
+                equaliser,
+                mapType,
+                new GenericMap(singletonMap(GenericRow.of(1), 10)),
+                new GenericMap(singletonMap(GenericRow.of(1), 10)),
+                true);
+        assertMapEqualiser(
+                equaliser,
+                mapType,
+                new GenericMap(singletonMap(GenericRow.of(1), 10)),
+                new GenericMap(singletonMap(GenericRow.of(2), 10)),
+                false);
+        assertMapEqualiser(
+                equaliser,
+                mapType,
+                new GenericMap(singletonMap(GenericRow.of(1), 10)),
+                new GenericMap(singletonMap(GenericRow.of(1), 11)),
+                false);
+    }
+
+    @Test
+    public void testIntKeyMapEqualiserIgnoresEntryOrder() {
+        DataType mapType = DataTypes.MAP(DataTypes.INT(), DataTypes.INT());
+        RecordEqualiser equaliser =
+                new EqualiserCodeGenerator(new DataType[] {mapType})
+                        .generateRecordEqualiser("intKeyMapFieldEquals")
+                        .newInstance(Thread.currentThread().getContextClassLoader());
+
+        Map<Object, Object> leftMap = new LinkedHashMap<>();
+        leftMap.put(1, 10);
+        leftMap.put(2, 20);
+        Map<Object, Object> reversedMap = new LinkedHashMap<>();
+        reversedMap.put(2, 20);
+        reversedMap.put(1, 10);
+        assertThat(
+                        equaliser.equals(
+                                GenericRow.of(new GenericMap(leftMap)),
+                                GenericRow.of(new GenericMap(reversedMap))))
+                .isTrue();
+        assertMapEqualiser(
+                equaliser, mapType, new GenericMap(leftMap), new GenericMap(leftMap), true);
+
+        Map<Object, Object> differentValueMap = new LinkedHashMap<>();
+        differentValueMap.put(1, 10);
+        differentValueMap.put(2, 21);
+        assertMapEqualiser(
+                equaliser,
+                mapType,
+                new GenericMap(leftMap),
+                new GenericMap(differentValueMap),
+                false);
+    }
+
+    private static Map<Object, Object> singletonMap(Object key, Object value) {
+        Map<Object, Object> map = new HashMap<>();
+        map.put(key, value);
+        return map;
+    }
+
+    private static void assertMapEqualiser(
+            RecordEqualiser equaliser,
+            DataType mapType,
+            GenericMap left,
+            GenericMap right,
+            boolean equal) {
+        Serializer<?> serializer = InternalSerializers.create(mapType);
+        Function<GenericMap, BinaryRow> toBinaryRow =
+                value -> {
+                    BinaryRow row = new BinaryRow(1);
+                    BinaryRowWriter writer = new BinaryRowWriter(row);
+                    BinaryWriter.write(writer, 0, value, mapType, serializer);
+                    writer.complete();
+                    return row;
+                };
+        assertBoolean(equaliser, toBinaryRow, left, right, equal);
     }
 
     @RepeatedTest(100)

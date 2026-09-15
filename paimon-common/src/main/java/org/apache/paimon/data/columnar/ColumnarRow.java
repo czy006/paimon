@@ -20,17 +20,19 @@ package org.apache.paimon.data.columnar;
 
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.Blob;
-import org.apache.paimon.data.BlobData;
 import org.apache.paimon.data.DataSetters;
 import org.apache.paimon.data.Decimal;
 import org.apache.paimon.data.InternalArray;
 import org.apache.paimon.data.InternalMap;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.data.InternalVector;
 import org.apache.paimon.data.Timestamp;
 import org.apache.paimon.data.variant.Variant;
+import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.types.RowKind;
 
 import java.io.Serializable;
+import java.nio.ByteBuffer;
 
 /**
  * Columnar row to support access to vector column data. It is a row view in {@link
@@ -42,6 +44,7 @@ public final class ColumnarRow implements InternalRow, DataSetters, Serializable
 
     private RowKind rowKind = RowKind.INSERT;
     private VectorizedColumnBatch vectorizedColumnBatch;
+    private FileIO fileIO;
     private int rowId;
 
     public ColumnarRow() {}
@@ -58,6 +61,10 @@ public final class ColumnarRow implements InternalRow, DataSetters, Serializable
     public void setVectorizedColumnBatch(VectorizedColumnBatch vectorizedColumnBatch) {
         this.vectorizedColumnBatch = vectorizedColumnBatch;
         this.rowId = 0;
+    }
+
+    public void setFileIO(FileIO fileIO) {
+        this.fileIO = fileIO;
     }
 
     public VectorizedColumnBatch batch() {
@@ -143,6 +150,15 @@ public final class ColumnarRow implements InternalRow, DataSetters, Serializable
         return vectorizedColumnBatch.getBinary(rowId, pos);
     }
 
+    /** Returns a view of the binary value without copying its column-vector bytes. */
+    public ByteBuffer getBinaryBuffer(int pos) {
+        return vectorizedColumnBatch.getByteBuffer(rowId, pos);
+    }
+
+    BytesColumnVector.Bytes getByteArray(int pos) {
+        return vectorizedColumnBatch.getByteArray(rowId, pos);
+    }
+
     @Override
     public Variant getVariant(int pos) {
         return vectorizedColumnBatch.getVariant(rowId, pos);
@@ -150,7 +166,7 @@ public final class ColumnarRow implements InternalRow, DataSetters, Serializable
 
     @Override
     public Blob getBlob(int pos) {
-        return new BlobData(getBinary(pos));
+        return Blob.fromBytes(getBinary(pos), null, fileIO, false);
     }
 
     @Override
@@ -160,12 +176,25 @@ public final class ColumnarRow implements InternalRow, DataSetters, Serializable
 
     @Override
     public InternalArray getArray(int pos) {
-        return vectorizedColumnBatch.getArray(rowId, pos);
+        InternalArray array = vectorizedColumnBatch.getArray(rowId, pos);
+        if (array instanceof ColumnarArray) {
+            ((ColumnarArray) array).setFileIO(fileIO);
+        }
+        return array;
+    }
+
+    @Override
+    public InternalVector getVector(int pos) {
+        return vectorizedColumnBatch.getVector(rowId, pos);
     }
 
     @Override
     public InternalMap getMap(int pos) {
-        return vectorizedColumnBatch.getMap(rowId, pos);
+        InternalMap map = vectorizedColumnBatch.getMap(rowId, pos);
+        if (map instanceof ColumnarMap) {
+            ((ColumnarMap) map).setFileIO(fileIO);
+        }
+        return map;
     }
 
     @Override
@@ -233,6 +262,7 @@ public final class ColumnarRow implements InternalRow, DataSetters, Serializable
     public ColumnarRow copy(ColumnVector[] vectors) {
         VectorizedColumnBatch vectorizedColumnBatchCopy = vectorizedColumnBatch.copy(vectors);
         ColumnarRow columnarRow = new ColumnarRow(vectorizedColumnBatchCopy, rowId);
+        columnarRow.setFileIO(fileIO);
         columnarRow.setRowKind(rowKind);
         return columnarRow;
     }

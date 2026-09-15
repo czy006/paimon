@@ -20,6 +20,7 @@ package org.apache.paimon.fs;
 
 import org.apache.paimon.annotation.Public;
 import org.apache.paimon.catalog.CatalogContext;
+import org.apache.paimon.data.BlobDescriptor;
 import org.apache.paimon.fs.hadoop.HadoopFileIOLoader;
 import org.apache.paimon.fs.local.LocalFileIO;
 
@@ -38,6 +39,7 @@ import java.io.OutputStreamWriter;
 import java.io.Serializable;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -246,6 +248,27 @@ public interface FileIO extends Serializable, Closeable {
      */
     boolean rename(Path src, Path dst) throws IOException;
 
+    default Optional<Path> archive(Path path, StorageType type) throws IOException {
+        throw new UnsupportedOperationException(
+                getClass().getName() + " does not support archive.");
+    }
+
+    default void restoreArchive(Path path, Duration duration) throws IOException {
+        throw new UnsupportedOperationException(
+                getClass().getName() + " does not support restore archive.");
+    }
+
+    default Optional<Path> unarchive(Path path, StorageType type) throws IOException {
+        throw new UnsupportedOperationException(
+                getClass().getName() + " does not support unarchive.");
+    }
+
+    default String createBlobPresignedUrl(
+            Path tableRoot, BlobDescriptor descriptor, Duration validity) throws IOException {
+        throw new UnsupportedOperationException(
+                getClass().getName() + " does not support creating blob presigned URLs.");
+    }
+
     /**
      * Override this method to empty, many FileIO implementation classes rely on static variables
      * and do not have the ability to close them.
@@ -355,10 +378,29 @@ public interface FileIO extends Serializable, Closeable {
      * implementations.
      */
     default void overwriteFileUtf8(Path path, String content) throws IOException {
-        try (PositionOutputStream out = newOutputStream(path, true)) {
+        // Some FileIO implementations (e.g. HDFS) rethrow the exact same exception instance from
+        // close() that was already thrown from write(), which makes the try-with-resources
+        // suppression mechanism fail with "Self-suppression not permitted". Therefore close the
+        // stream manually and only add suppressed exceptions that differ from the primary one.
+        IOException primaryException = null;
+        PositionOutputStream out = newOutputStream(path, true);
+        try {
             OutputStreamWriter writer = new OutputStreamWriter(out, StandardCharsets.UTF_8);
             writer.write(content);
             writer.flush();
+        } catch (IOException e) {
+            primaryException = e;
+            throw e;
+        } finally {
+            try {
+                out.close();
+            } catch (IOException closeException) {
+                if (primaryException == null) {
+                    throw closeException;
+                } else if (primaryException != closeException) {
+                    primaryException.addSuppressed(closeException);
+                }
+            }
         }
     }
 

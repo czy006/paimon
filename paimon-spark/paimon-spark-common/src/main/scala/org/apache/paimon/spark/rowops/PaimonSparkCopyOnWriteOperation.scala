@@ -18,9 +18,10 @@
 
 package org.apache.paimon.spark.rowops
 
+import org.apache.paimon.Snapshot
 import org.apache.paimon.options.Options
 import org.apache.paimon.spark.PaimonBaseScanBuilder
-import org.apache.paimon.spark.schema.PaimonMetadataColumn.FILE_PATH_COLUMN
+import org.apache.paimon.spark.schema.PaimonMetadataColumn.{FILE_PATH_COLUMN, ROW_ID_COLUMN, SEQUENCE_NUMBER_COLUMN}
 import org.apache.paimon.spark.write.PaimonV2WriteBuilder
 import org.apache.paimon.table.FileStoreTable
 
@@ -42,8 +43,7 @@ class PaimonSparkCopyOnWriteOperation(table: FileStoreTable, info: RowLevelOpera
         PaimonSparkCopyOnWriteOperation.this.table.copy(options.asCaseSensitiveMap)
 
       override def build(): Scan = {
-        val scan =
-          PaimonCopyOnWriteScan(table, requiredSchema, pushedPartitionFilters, pushedDataFilters)
+        val scan = PaimonCopyOnWriteScan(table, requiredSchema)
         PaimonSparkCopyOnWriteOperation.this.copyOnWriteScan = Option(scan)
         scan
       }
@@ -53,11 +53,17 @@ class PaimonSparkCopyOnWriteOperation(table: FileStoreTable, info: RowLevelOpera
   override def newWriteBuilder(info: LogicalWriteInfo): WriteBuilder = {
     val options = Options.fromMap(info.options)
     val builder = new PaimonV2WriteBuilder(table, info.schema(), options)
+    builder.withOperationType(Snapshot.Operation.valueOf(command().toString))
     assert(copyOnWriteScan.isDefined)
     builder.overwriteFiles(copyOnWriteScan.get)
   }
 
   override def requiredMetadataAttributes(): Array[NamedReference] = {
-    Array(Expressions.column(FILE_PATH_COLUMN))
+    val base = Array(Expressions.column(FILE_PATH_COLUMN))
+    if (table.coreOptions().rowTrackingEnabled()) {
+      base ++ Array(Expressions.column(ROW_ID_COLUMN), Expressions.column(SEQUENCE_NUMBER_COLUMN))
+    } else {
+      base
+    }
   }
 }

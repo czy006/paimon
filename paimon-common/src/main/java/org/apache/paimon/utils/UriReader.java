@@ -51,6 +51,10 @@ public interface UriReader {
         public SeekableInputStream newInputStream(String uri) throws IOException {
             return fileIO.newInputStream(new Path(uri));
         }
+
+        public boolean exists(String uri) throws IOException {
+            return fileIO.exists(new Path(uri));
+        }
     }
 
     /** A {@link UriReader} reads http uri. */
@@ -59,6 +63,10 @@ public interface UriReader {
         @Override
         public SeekableInputStream newInputStream(String uri) throws IOException {
             return SeekableInputStream.wrap(HttpClientUtils.getAsInputStream(uri));
+        }
+
+        public boolean exists(String uri) throws IOException {
+            return HttpClientUtils.exists(uri);
         }
     }
 }
