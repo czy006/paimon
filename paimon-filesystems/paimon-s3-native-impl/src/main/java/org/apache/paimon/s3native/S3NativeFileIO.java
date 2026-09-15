@@ -535,13 +535,19 @@ public class S3NativeFileIO implements FileIO {
         if (head != null) {
             return new Classification(Kind.FILE, head);
         }
-        if (operations.headObjectOrNull(markerKey(key)) != null) {
-            return new Classification(Kind.MARKER_DIR, null);
+        // Single-listing probe replaces the marker HEAD + prefix LIST pair: one request decides
+        // marker-dir / prefix-dir / missing via self-marker membership (see
+        // S3NativeObjectOperations#probeDirectory). Directory and missing-path probes drop from
+        // 3 requests to 2, matching the Flink reference's shape.
+        switch (operations.probeDirectory(key)) {
+            case MARKER_DIR:
+                return new Classification(Kind.MARKER_DIR, null);
+            case PREFIX_DIR:
+                return new Classification(Kind.PREFIX_DIR, null);
+            case MISSING:
+            default:
+                return new Classification(Kind.MISSING, null);
         }
-        if (operations.hasObjectsUnder(markerKey(key))) {
-            return new Classification(Kind.PREFIX_DIR, null);
-        }
-        return new Classification(Kind.MISSING, null);
     }
 
     /** HeadObject for a plain-object key, or {@code null} when missing or a marker. */

@@ -351,6 +351,49 @@ final class S3NativeObjectOperations {
         return keys;
     }
 
+    /**
+     * Single-request directory probe: {@code ListObjectsV2(prefix = key + "/", maxKeys = 2)} with
+     * NO delimiter — the delimiter form does not return the prefix-equal marker itself (AWS
+     * ListObjectsV2 docs, Example 8). Marker-ness is decided by membership of the self-marker
+     * {@code key/} in the returned contents, not by sort order: general-purpose buckets and MinIO
+     * return keys sorted, but directory buckets are documented unsorted and remain unsupported
+     * (Spec §14.2). With sorted responses the marker is necessarily contents[0] when present, so
+     * absence from the maxKeys=2 window is conclusive.
+     *
+     * @return MARKER_DIR if the self-marker is listed, PREFIX_DIR if any other key is listed,
+     *     MISSING otherwise.
+     */
+    DirectoryProbe probeDirectory(String key) throws IOException {
+        String prefix = S3PathUtils.markerKey(key);
+        try {
+            ListObjectsV2Response response =
+                    client.listObjectsV2(
+                            ListObjectsV2Request.builder()
+                                    .bucket(bucket)
+                                    .prefix(prefix)
+                                    .maxKeys(2)
+                                    .build());
+            if (response.contents().isEmpty()) {
+                return DirectoryProbe.MISSING;
+            }
+            for (S3Object object : response.contents()) {
+                if (object.key().equals(prefix)) {
+                    return DirectoryProbe.MARKER_DIR;
+                }
+            }
+            return DirectoryProbe.PREFIX_DIR;
+        } catch (S3Exception e) {
+            throw toIOException("probeDirectory " + prefix, e);
+        }
+    }
+
+    /** Result of the single-listing directory probe. */
+    enum DirectoryProbe {
+        MARKER_DIR,
+        PREFIX_DIR,
+        MISSING
+    }
+
     /** Whether at least one object exists under the prefix. */
     boolean hasObjectsUnder(String prefix) throws IOException {
         try {
