@@ -25,7 +25,7 @@ import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.PluginFileIO;
 import org.apache.paimon.plugin.PluginLoader;
 
-import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 /**
@@ -62,10 +62,10 @@ public class S3NativeLoader implements FileIOLoader {
 
     @Override
     public List<String[]> requiredOptions() {
-        List<String[]> options = new ArrayList<>();
-        options.add(new String[] {"s3.access-key", "s3.access.key"});
-        options.add(new String[] {"s3.secret-key", "s3.secret.key"});
-        return options;
+        // No required options: unlike paimon-s3, static keys are optional so that IAM
+        // instance/task-role deployments are discovered by FileIO.get; with no credentials
+        // at all, the SDK's DefaultCredentialsProvider fails loud on first use.
+        return Collections.emptyList();
     }
 
     @Override

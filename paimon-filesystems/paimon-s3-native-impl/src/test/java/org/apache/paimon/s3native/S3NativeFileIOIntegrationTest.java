@@ -158,6 +158,28 @@ class S3NativeFileIOIntegrationTest {
     }
 
     @Test
+    void testCrossBucketSameKeyRenameFailsLoudly() throws Exception {
+        // Regression: the same-key shortcut used to run before the bucket guard and
+        // reported success without copying anything across buckets.
+        String otherBucket = createSecondBucket();
+        Path src = file("same-key");
+        writeFile(src, randomBytes(8, 31));
+
+        assertThat(fs.rename(src, new Path("s3://" + otherBucket + "/it/same-key"))).isFalse();
+        // Source untouched.
+        assertThat(fs.exists(src)).isTrue();
+        fs.delete(src, true);
+    }
+
+    @Test
+    void testBucketRootRecursiveDeleteRefused() throws Exception {
+        Path bucketRoot = new Path(MINIO_CONTAINER.getS3UriForDefaultBucket() + "/");
+        assertThatThrownBy(() -> fs.delete(bucketRoot, true))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("bucket root");
+    }
+
+    @Test
     void testCrossBucketRenameReturnsFalse() throws Exception {
         String otherBucket = createSecondBucket();
         Path src = file("cross-src");
