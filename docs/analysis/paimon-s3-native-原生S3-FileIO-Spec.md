@@ -139,7 +139,7 @@
 
 - **key**：S3 对象键，`s3://bucket/a/b` → bucket=`bucket`，key=`a/b`（去头部 `/`，与 Flink `extractKey` 一致）。
 - **directory marker**：key 为 `<dir>/`（以 `/` 结尾）的 0 字节对象，代表目录的存在性（S3A 兼容语义）。
-- **prefix 判定**：对 key 前缀 `p/` 执行 `ListObjectsV2(maxKeys=1)`，有结果即"目录有内容"。
+- **prefix 判定**（2026-09-15 优化后）：单次无 delimiter `ListObjectsV2(prefix=key+"/", maxKeys=2)`，以返回内容是否含 self-marker `key/` 判 MARKER_DIR/PREFIX_DIR/MISSING（成员判别不依赖排序；带 delimiter 的列表不返回 prefix-等于自身的 marker，见 AWS 文档 Example 8）。目录/缺失路径探测由 3 请求降为 2，listStatus 由 3+N 页降为 2+N。
 
 ### 5.1 方法映射总表
 
@@ -149,7 +149,7 @@
 | `configure(CatalogContext)` | — | `S3ConfigTranslator` 解析（含别名展开与未知键 WARN），存入实例；客户端缓存键含解析结果 |
 | `newInputStream(Path)` | HeadObject 取 `contentLength`，随后惰性 `GetObject` | 返回 `S3NativeSeekableInputStream`；文件不存在抛 `FileNotFoundException`（来自 HeadObject） |
 | `newOutputStream(Path, overwrite)` | 见 §6.5 | `overwrite=false` 且对象存在（HeadObject 命中非 marker key）→ `IOException("File already exists: ...")`（对齐 Flink `create(NO_OVERWRITE)` 行为）；`overwrite=true` 直接写（S3 PUT 天然覆盖，无需先删，比 Flink 的先 delete 少一次请求） |
-| `getFileStatus(Path)` | HeadObject(key) → HeadObject(key+"/") → prefix 判定 | 依序：①key 是非 marker 对象 → 文件状态（**0 字节也是文件**，D4）；②key+"/" 是 marker → 目录状态（len=0, isDir=true）；③prefix 有内容 → 目录状态；④否则 `FileNotFoundException` |
+| `getFileStatus(Path)` | HeadObject(key) → 单次 probeDirectory 列表（2026-09-15 起，marker 成员判别） | 依序：①key 是非 marker 对象 → 文件状态（**0 字节也是文件**，D4）；②probe 列表含 `key/` marker → 目录状态（len=0, isDir=true）；③probe 列表含其他 key → 目录状态；④否则 `FileNotFoundException` |
 | `listStatus(Path)` | ListObjectsV2(prefix=key+"/", delimiter="/") + continuationToken 分页 | `contents` 中 key 以 `/` 结尾的 marker **跳过**；其余为文件项；`commonPrefixes` 为目录项。路径是文件时返回单元素数组（先 getFileStatus 判定）。结果**不保证顺序** |
 | `exists(Path)` | 同 getFileStatus 的①②③ | 任一命中即 true |
 | `delete(Path, recursive)` | 见 5.2 | |
@@ -299,7 +299,7 @@ asyncClient = S3AsyncClient.builder()
 - `putObjectAsync(key, File)` → `CompletableFuture<String>`（eTag）：小文件捷径用。
 - `deleteBatch(List<String> keys)`：`DeleteObjects`（≤1000/批，D6）。
 - `copyObjectMultipart(srcKey, dstKey, length)`：`>5GB` 的 `UploadPartCopy` 链（D7）。
-- marker 工具：`putMarker(key)` / `headMarker(key)`。
+- marker 工具：`putMarker(key)`（探测走 probeDirectory 单列表，无 headMarker）。
 
 ### 6.5 `S3NativePositionOutputStream`（写路径核心）
 
@@ -516,6 +516,7 @@ mirror `paimon-s3/pom.xml` 的结构（dependency-plugin 把 impl jar unpack 进
 | S3 Analytics Accelerator | `$ICE/AnalyticsAcceleratorUtil.java:31-38`（`software.amazon.s3.analyticsaccelerator`） | Amazon 专用库，绑定 S3 Tables 元数据生态；引入即失去 MinIO 兼容 |
 | REST 远程签名（S3V4RestSignerClient） | `$ICE/signer/S3V4RestSignerClient.java` | 依赖 Iceberg REST catalog 生态，Paimon 无对应 |
 | CRT 传输 | `S3FileIOProperties.java:100-105`（`s3.crt.enabled`，默认关） | 与本 Spec D8 一致；Iceberg 亦默认关闭，佐证排除合理 |
+| S3 Express One Zone **directory bucket** | AWS 文档明确其 ListObjectsV2 不排序；marker 成员判别在无排序响应下唯一可能的影响是 MARKER_DIR→PREFIX_DIR 的标签差（无行为消费者可观测）。probeDirectory 依赖标准桶/MinIO 语义 |
 | Access Grants / 跨区域 ARN / 双栈 / 传输加速 | `S3FileIOProperties.java:74-123,424-444` | AWS 企业特性，fork 场景未提出需求 |
 
 ### 14.3 与现有实现的对照结论

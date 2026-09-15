@@ -212,8 +212,11 @@ public class S3NativeFileIO implements FileIO {
                     }
                     return true;
                 }
-                // [DEVIATION D6] Batch delete of every key under the prefix (markers included).
-                deleteBatchAll(operations, operations.listAllKeys(prefix));
+                // [DEVIATION D6] Stream the prefix into parallel batch deletes — bounded memory
+                // and list/delete overlap instead of materializing every key first.
+                S3NativeOptions options = resolvedOptions();
+                operations.deletePrefixStreaming(
+                        prefix, options.deleteBatchSize, options.deleteThreads);
                 return true;
         }
     }

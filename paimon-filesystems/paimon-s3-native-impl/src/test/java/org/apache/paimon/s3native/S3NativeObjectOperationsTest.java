@@ -22,6 +22,7 @@ import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.DeleteObjectsRequest;
 import software.amazon.awssdk.services.s3.model.DeleteObjectsResponse;
+import software.amazon.awssdk.services.s3.model.ObjectIdentifier;
 import software.amazon.awssdk.services.s3.model.S3Error;
 import software.amazon.awssdk.services.s3.model.S3Exception;
 
@@ -170,6 +171,126 @@ class S3NativeObjectOperationsTest {
     }
 
     @Test
+    void testDeletePrefixStreamingPaginatesAndBatches() throws IOException {
+        S3Client client = mock(S3Client.class);
+        // 3 pages x 3 unique keys = 9 keys, batch size 4 -> 3 DeleteObjects batches (4+4+1).
+        java.util.concurrent.atomic.AtomicInteger pageCalls =
+                new java.util.concurrent.atomic.AtomicInteger();
+        java.util.List<String> tokens = java.util.Arrays.asList("t1", "t2", null);
+        when(client.listObjectsV2(
+                        any(software.amazon.awssdk.services.s3.model.ListObjectsV2Request.class)))
+                .thenAnswer(
+                        invocation -> {
+                            int call = pageCalls.getAndIncrement();
+                            software.amazon.awssdk.services.s3.model.ListObjectsV2Request request =
+                                    invocation.getArgument(0);
+                            // Continuation token chained from page 2 onwards.
+                            if (call > 0) {
+                                org.assertj.core.api.Assertions.assertThat(
+                                                request.continuationToken())
+                                        .isEqualTo("t" + call);
+                            }
+                            // A real listing returns each key once; page-index the keys.
+                            java.util.List<software.amazon.awssdk.services.s3.model.S3Object>
+                                    uniquePage =
+                                            java.util.Arrays.asList(
+                                                    software.amazon.awssdk.services.s3.model
+                                                            .S3Object.builder()
+                                                            .key("k-" + call + "-0")
+                                                            .build(),
+                                                    software.amazon.awssdk.services.s3.model
+                                                            .S3Object.builder()
+                                                            .key("k-" + call + "-1")
+                                                            .build(),
+                                                    software.amazon.awssdk.services.s3.model
+                                                            .S3Object.builder()
+                                                            .key("k-" + call + "-2")
+                                                            .build());
+                            return software.amazon.awssdk.services.s3.model.ListObjectsV2Response
+                                    .builder()
+                                    .contents(uniquePage)
+                                    .nextContinuationToken(tokens.get(call))
+                                    .build();
+                        });
+        when(client.deleteObjects(any(DeleteObjectsRequest.class)))
+                .thenReturn(DeleteObjectsResponse.builder().build());
+
+        ops(client).deletePrefixStreaming("p/", 4, 4);
+
+        assertThat(pageCalls.get()).isEqualTo(3);
+        java.util.List<DeleteObjectsRequest> deletes =
+                org.mockito.Mockito.mockingDetails(client).getInvocations().stream()
+                        .filter(i -> i.getMethod().getName().equals("deleteObjects"))
+                        .map(i -> (DeleteObjectsRequest) i.getArgument(0))
+                        .collect(java.util.stream.Collectors.toList());
+        assertThat(deletes).hasSize(3);
+        // Keys must be partitioned without overlap and cover all 9.
+        java.util.Set<String> allKeys = new java.util.HashSet<>();
+        for (DeleteObjectsRequest request : deletes) {
+            for (ObjectIdentifier id : request.delete().objects()) {
+                allKeys.add(id.key());
+            }
+        }
+        assertThat(allKeys).hasSize(9);
+    }
+
+    @Test
+    void testDeletePrefixStreamingEmptyPrefixIsNoop() throws IOException {
+        S3Client client = mock(S3Client.class);
+        when(client.listObjectsV2(
+                        any(software.amazon.awssdk.services.s3.model.ListObjectsV2Request.class)))
+                .thenReturn(
+                        software.amazon.awssdk.services.s3.model.ListObjectsV2Response.builder()
+                                .build());
+
+        ops(client).deletePrefixStreaming("empty/", 1000, 4);
+        verify(client, times(1))
+                .listObjectsV2(
+                        any(software.amazon.awssdk.services.s3.model.ListObjectsV2Request.class));
+        verify(client, times(0)).deleteObjects(any(DeleteObjectsRequest.class));
+    }
+
+    @Test
+    void testDeletePrefixStreamingFailuresAggregate() {
+        S3Client client = mock(S3Client.class);
+        when(client.listObjectsV2(
+                        any(software.amazon.awssdk.services.s3.model.ListObjectsV2Request.class)))
+                .thenReturn(
+                        software.amazon.awssdk.services.s3.model.ListObjectsV2Response.builder()
+                                .contents(
+                                        software.amazon.awssdk.services.s3.model.S3Object.builder()
+                                                .key("a")
+                                                .build(),
+                                        software.amazon.awssdk.services.s3.model.S3Object.builder()
+                                                .key("b")
+                                                .build())
+                                .build());
+        S3Exception boom =
+                (S3Exception) S3Exception.builder().message("boom").statusCode(500).build();
+        when(client.deleteObjects(any(DeleteObjectsRequest.class))).thenThrow(boom);
+
+        // Both keys land in one batch whose whole request fails -> 2 keys failed, cause kept.
+        assertThatThrownBy(() -> ops(client).deletePrefixStreaming("p/", 10, 2))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("2 keys")
+                .hasRootCauseInstanceOf(S3Exception.class);
+    }
+
+    @Test
+    void testDeletePrefixStreamingListFailureFailsLoud() {
+        S3Client client = mock(S3Client.class);
+        when(client.listObjectsV2(
+                        any(software.amazon.awssdk.services.s3.model.ListObjectsV2Request.class)))
+                .thenThrow(
+                        (S3Exception)
+                                S3Exception.builder().message("list boom").statusCode(500).build());
+
+        assertThatThrownBy(() -> ops(client).deletePrefixStreaming("p/", 10, 2))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("deletePrefixStreaming");
+    }
+
+    @Test
     void testProbeDirectoryRequestShapeAndMembership() throws IOException {
         S3Client client = mock(S3Client.class);
         java.util.List<software.amazon.awssdk.services.s3.model.ListObjectsV2Request> requests =
@@ -217,7 +338,9 @@ class S3NativeObjectOperationsTest {
                         software.amazon.awssdk.services.s3.model.ListObjectsV2Response.builder()
                                 .contents(
                                         software.amazon.awssdk.services.s3.model.S3Object.builder()
-                                                .key("a/b/ z") // sorts before "a/b/" (' ' < '/')
+                                                .key("a/b/ z") // simulates an unsorted response
+                                                // (directory buckets); membership
+                                                // must not rely on order
                                                 .build(),
                                         software.amazon.awssdk.services.s3.model.S3Object.builder()
                                                 .key("a/b/")
