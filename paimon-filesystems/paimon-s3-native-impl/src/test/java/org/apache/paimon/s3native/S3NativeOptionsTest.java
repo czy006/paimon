@@ -90,6 +90,39 @@ class S3NativeOptionsTest {
     }
 
     @Test
+    void testClientKeyIgnoresStreamLevelOptions() throws Exception {
+        // Stream-level options must not fragment the client cache: part size, threshold,
+        // checksum, tags, storage class, ACL, SSE, delete tuning and tmp dir all differ here,
+        // yet the projection keys must be equal. A client-relevant difference (endpoint) must
+        // produce a different key.
+        java.lang.reflect.Method from =
+                S3NativeFileIO.ClientKey.class.getDeclaredMethod("from", S3NativeOptions.class);
+        from.setAccessible(true);
+
+        S3NativeOptions streamVariant =
+                parse(
+                        "s3.upload.min.part.size", "16 mb",
+                        "s3.multipart.threshold", "2.0",
+                        "s3.checksum-enabled", "true",
+                        "s3.write.tags", "a:1",
+                        "s3.write.storage-class", "GLACIER",
+                        "s3.acl", "public-read",
+                        "s3.sse.type", "kms",
+                        "s3.delete.batch-size", "17",
+                        "s3.delete.num-threads", "3",
+                        "s3.upload.tmp.dir", "/tmp/other");
+        S3NativeOptions plain = parse();
+        S3NativeOptions otherEndpoint = parse("s3.endpoint", "http://elsewhere:9000");
+
+        Object keyA = from.invoke(null, streamVariant);
+        Object keyB = from.invoke(null, plain);
+        org.assertj.core.api.Assertions.assertThat(keyA).isEqualTo(keyB);
+        org.assertj.core.api.Assertions.assertThat(keyA.hashCode()).isEqualTo(keyB.hashCode());
+        org.assertj.core.api.Assertions.assertThat(from.invoke(null, otherEndpoint))
+                .isNotEqualTo(keyA);
+    }
+
+    @Test
     void testSseValidation() {
         assertThat(parse().sse).isSameAs(S3NativeSse.NONE);
         assertThatThrownBy(() -> parse("s3.sse.type", "bogus"))
