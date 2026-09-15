@@ -692,11 +692,15 @@ public class S3NativeFileIO implements FileIO {
         if (normalized == null) {
             throw new IllegalStateException("S3NativeFileIO is not configured yet");
         }
+        S3NativeOptions options = resolvedOptions();
+        int sizeBefore = CLIENTS.size();
         S3NativeClientProvider provider =
                 CLIENTS.computeIfAbsent(
-                        ClientKey.from(resolvedOptions()),
-                        k -> S3NativeClientProvider.create(resolvedOptions()));
-        if (CLIENTS.size() > CLIENT_CACHE_WARN_THRESHOLD) {
+                        ClientKey.from(options), k -> S3NativeClientProvider.create(options));
+        // Warn once per new drifting configuration, not per operation — provider() runs on every
+        // FileIO call, so an unconditional size check would flood exactly the deployments the
+        // warning is meant to diagnose.
+        if (CLIENTS.size() > sizeBefore && CLIENTS.size() > CLIENT_CACHE_WARN_THRESHOLD) {
             LOG.warn(
                     "{} distinct S3 client configurations cached (threshold {}); each entry pins "
                             + "a connection pool and a Netty event-loop group — check for drifting "

@@ -90,15 +90,10 @@ class S3NativeOptionsTest {
     }
 
     @Test
-    void testClientKeyIgnoresStreamLevelOptions() throws Exception {
+    void testClientKeyIgnoresStreamLevelOptions() {
         // Stream-level options must not fragment the client cache: part size, threshold,
         // checksum, tags, storage class, ACL, SSE, delete tuning and tmp dir all differ here,
-        // yet the projection keys must be equal. A client-relevant difference (endpoint) must
-        // produce a different key.
-        java.lang.reflect.Method from =
-                S3NativeFileIO.ClientKey.class.getDeclaredMethod("from", S3NativeOptions.class);
-        from.setAccessible(true);
-
+        // yet the projection keys must be equal.
         S3NativeOptions streamVariant =
                 parse(
                         "s3.upload.min.part.size", "16 mb",
@@ -112,14 +107,42 @@ class S3NativeOptionsTest {
                         "s3.delete.num-threads", "3",
                         "s3.upload.tmp.dir", "/tmp/other");
         S3NativeOptions plain = parse();
-        S3NativeOptions otherEndpoint = parse("s3.endpoint", "http://elsewhere:9000");
 
-        Object keyA = from.invoke(null, streamVariant);
-        Object keyB = from.invoke(null, plain);
-        org.assertj.core.api.Assertions.assertThat(keyA).isEqualTo(keyB);
-        org.assertj.core.api.Assertions.assertThat(keyA.hashCode()).isEqualTo(keyB.hashCode());
-        org.assertj.core.api.Assertions.assertThat(from.invoke(null, otherEndpoint))
-                .isNotEqualTo(keyA);
+        org.assertj.core.api.Assertions.assertThat(S3NativeFileIO.ClientKey.from(streamVariant))
+                .isEqualTo(S3NativeFileIO.ClientKey.from(plain));
+        org.assertj.core.api.Assertions.assertThat(
+                        S3NativeFileIO.ClientKey.from(streamVariant).hashCode())
+                .isEqualTo(S3NativeFileIO.ClientKey.from(plain).hashCode());
+    }
+
+    @Test
+    void testClientKeyDiffersOnEveryClientLevelOption() {
+        // One differing client-construction option per case — a field dropped from
+        // equals/hashCode would silently share clients across differing configurations.
+        String[][] clientLevelVariants = {
+            {"s3.access-key", "other-ak"},
+            {"s3.secret-key", "other-sk"},
+            {"s3.region", "eu-west-1"},
+            {"s3.endpoint", "http://elsewhere:9000"},
+            {"s3.path-style-access", "true"},
+            {"s3.chunked-encoding.enabled", "false"},
+            {"s3.checksum-validation.enabled", "false"},
+            {"s3.connection.max", "99"},
+            {"s3.connection.timeout", "30s"},
+            {"s3.socket.timeout", "31s"},
+            {"s3.connection.max-idle-time", "32s"},
+            {"s3.retry.max-num-retries", "9"},
+            {"s3.retry.base-delay", "101ms"},
+            {"s3.retry.throttle.base-delay", "1001ms"},
+            {"s3.retry.max-backoff", "21s"},
+        };
+        for (String[] variant : clientLevelVariants) {
+            S3NativeOptions base = parse();
+            S3NativeOptions varied = parse(variant[0], variant[1]);
+            org.assertj.core.api.Assertions.assertThat(S3NativeFileIO.ClientKey.from(varied))
+                    .as("ClientKey must differ when %s changes", variant[0])
+                    .isNotEqualTo(S3NativeFileIO.ClientKey.from(base));
+        }
     }
 
     @Test
