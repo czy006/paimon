@@ -73,11 +73,108 @@ public class S3NativeFileIO implements FileIO {
     private static final long MAX_COPY_OBJECT_BYTES = 5L << 30;
 
     /**
-     * Cache of client providers keyed by the translated options. S3 clients are bucket-agnostic
-     * (the bucket is passed per request), so one provider per option set serves all buckets — same
-     * accept-no-eviction trade-off as {@code org.apache.paimon.s3.S3FileIO#CACHE}.
+     * Cache of client providers keyed by {@link ClientKey} — the exact projection of options that
+     * {@link S3NativeClientProvider#create} reads. Stream-level options (part size, SSE, write
+     * tags, delete tuning, ...) differ per catalog/table without fragmenting the cache: they are
+     * resolved per call via {@link #resolvedOptions()} and never reach client construction.
+     * Bucket-agnostic (bucket passed per request). Same accept-no-eviction trade-off as {@code
+     * org.apache.paimon.s3.S3FileIO#CACHE}; a size warning flags option drift (e.g. per-table
+     * credentials), since each entry pins a connection pool plus a Netty event-loop group.
      */
-    private static final Map<Options, S3NativeClientProvider> CLIENTS = new ConcurrentHashMap<>();
+    private static final Map<ClientKey, S3NativeClientProvider> CLIENTS = new ConcurrentHashMap<>();
+
+    private static final int CLIENT_CACHE_WARN_THRESHOLD = 16;
+
+    /**
+     * Client-construction key; must stay in lockstep with the fields {@link
+     * S3NativeClientProvider#create} reads — adding a create() input without extending this record
+     * silently shares a client across differing configurations.
+     */
+    static final class ClientKey {
+        final String accessKey;
+        final String secretKey;
+        final String region;
+        final String endpoint;
+        final boolean pathStyleAccess;
+        final boolean chunkedEncodingEnabled;
+        final boolean checksumValidationEnabled;
+        final int maxConnections;
+        final long connectionTimeoutMs;
+        final long socketTimeoutMs;
+        final long connectionMaxIdleTimeMs;
+        final int maxRetries;
+        final long retryBaseDelayMs;
+        final long retryThrottleBaseDelayMs;
+        final long retryMaxBackoffMs;
+
+        private ClientKey(S3NativeOptions options) {
+            this.accessKey = options.accessKey;
+            this.secretKey = options.secretKey;
+            this.region = options.region;
+            this.endpoint = options.endpoint;
+            this.pathStyleAccess = options.pathStyleAccess;
+            this.chunkedEncodingEnabled = options.chunkedEncodingEnabled;
+            this.checksumValidationEnabled = options.checksumValidationEnabled;
+            this.maxConnections = options.maxConnections;
+            this.connectionTimeoutMs = options.connectionTimeout.toMillis();
+            this.socketTimeoutMs = options.socketTimeout.toMillis();
+            this.connectionMaxIdleTimeMs = options.connectionMaxIdleTime.toMillis();
+            this.maxRetries = options.maxRetries;
+            this.retryBaseDelayMs = options.retryBaseDelay.toMillis();
+            this.retryThrottleBaseDelayMs = options.retryThrottleBaseDelay.toMillis();
+            this.retryMaxBackoffMs = options.retryMaxBackoff.toMillis();
+        }
+
+        static ClientKey from(S3NativeOptions options) {
+            return new ClientKey(options);
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            ClientKey that = (ClientKey) o;
+            return pathStyleAccess == that.pathStyleAccess
+                    && chunkedEncodingEnabled == that.chunkedEncodingEnabled
+                    && checksumValidationEnabled == that.checksumValidationEnabled
+                    && maxConnections == that.maxConnections
+                    && connectionTimeoutMs == that.connectionTimeoutMs
+                    && socketTimeoutMs == that.socketTimeoutMs
+                    && connectionMaxIdleTimeMs == that.connectionMaxIdleTimeMs
+                    && maxRetries == that.maxRetries
+                    && retryBaseDelayMs == that.retryBaseDelayMs
+                    && retryThrottleBaseDelayMs == that.retryThrottleBaseDelayMs
+                    && retryMaxBackoffMs == that.retryMaxBackoffMs
+                    && java.util.Objects.equals(accessKey, that.accessKey)
+                    && java.util.Objects.equals(secretKey, that.secretKey)
+                    && java.util.Objects.equals(region, that.region)
+                    && java.util.Objects.equals(endpoint, that.endpoint);
+        }
+
+        @Override
+        public int hashCode() {
+            return java.util.Objects.hash(
+                    accessKey,
+                    secretKey,
+                    region,
+                    endpoint,
+                    pathStyleAccess,
+                    chunkedEncodingEnabled,
+                    checksumValidationEnabled,
+                    maxConnections,
+                    connectionTimeoutMs,
+                    socketTimeoutMs,
+                    connectionMaxIdleTimeMs,
+                    maxRetries,
+                    retryBaseDelayMs,
+                    retryThrottleBaseDelayMs,
+                    retryMaxBackoffMs);
+        }
+    }
 
     /** Translated s3.* options; serialized so a deserialized FileIO can rebuild everything. */
     private volatile Options normalizedOptions;
@@ -595,7 +692,18 @@ public class S3NativeFileIO implements FileIO {
         if (normalized == null) {
             throw new IllegalStateException("S3NativeFileIO is not configured yet");
         }
-        return CLIENTS.computeIfAbsent(
-                normalized, k -> S3NativeClientProvider.create(resolvedOptions()));
+        S3NativeClientProvider provider =
+                CLIENTS.computeIfAbsent(
+                        ClientKey.from(resolvedOptions()),
+                        k -> S3NativeClientProvider.create(resolvedOptions()));
+        if (CLIENTS.size() > CLIENT_CACHE_WARN_THRESHOLD) {
+            LOG.warn(
+                    "{} distinct S3 client configurations cached (threshold {}); each entry pins "
+                            + "a connection pool and a Netty event-loop group — check for drifting "
+                            + "options such as per-table credentials",
+                    CLIENTS.size(),
+                    CLIENT_CACHE_WARN_THRESHOLD);
+        }
+        return provider;
     }
 }
