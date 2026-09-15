@@ -41,8 +41,10 @@ import software.amazon.awssdk.services.s3.model.S3Object;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -282,6 +284,110 @@ final class S3NativeObjectOperations {
                 });
     }
 
+    /**
+     * Streams a recursive delete: paginates the prefix with no delimiter and submits a batch delete
+     * every {@code batchSize} keys, waiting for the oldest in-flight batch whenever more than
+     * {@code 2 * threads} batches are outstanding (backpressure). Memory stays bounded at
+     * O(batchSize * 2 * threads) keys instead of materializing the whole listing, and deletion
+     * overlaps with pagination. Failure semantics match {@link #deleteBatch}: per-key NotFound is
+     * success (Spec D6), whole-request failures mark their keys failed with the first cause
+     * preserved, and any failed key throws one aggregated IOException.
+     */
+    void deletePrefixStreaming(String prefix, int batchSize, int threads) throws IOException {
+        Deque<Future<List<String>>> inFlight = new ArrayDeque<>();
+        List<String> failedKeys = new ArrayList<>();
+        AtomicReference<Exception> firstFailure = new AtomicReference<>();
+        ExecutorService pool = deletePool(threads);
+        List<String> batch = new ArrayList<>(batchSize);
+        String token = null;
+        try {
+            do {
+                ListObjectsV2Request.Builder request =
+                        ListObjectsV2Request.builder().bucket(bucket).prefix(prefix);
+                if (token != null) {
+                    request.continuationToken(token);
+                }
+                ListObjectsV2Response response = client.listObjectsV2(request.build());
+                token = response.nextContinuationToken();
+                for (S3Object object : response.contents()) {
+                    batch.add(object.key());
+                    if (batch.size() == batchSize) {
+                        submitBatch(inFlight, batch, firstFailure, pool);
+                        batch = new ArrayList<>(batchSize);
+                        drainIfCrowded(inFlight, failedKeys, threads);
+                    }
+                }
+            } while (token != null);
+            if (!batch.isEmpty()) {
+                submitBatch(inFlight, batch, firstFailure, pool);
+            }
+            collect(inFlight, failedKeys);
+        } catch (S3Exception e) {
+            throw toIOException("deletePrefixStreaming " + prefix, e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            for (Future<List<String>> outstanding : inFlight) {
+                outstanding.cancel(true);
+            }
+            throw new IOException("Interrupted while streaming batch deletions", e);
+        }
+        if (!failedKeys.isEmpty()) {
+            throw new IOException(
+                    "Batch delete failed for "
+                            + failedKeys.size()
+                            + " keys, first: "
+                            + failedKeys.get(0),
+                    firstFailure.get());
+        }
+    }
+
+    /** Snapshots the batch into a delete task; keeps the lambda capture effectively final. */
+    private void submitBatch(
+            Deque<Future<List<String>>> inFlight,
+            List<String> keys,
+            AtomicReference<Exception> firstFailure,
+            ExecutorService pool) {
+        inFlight.add(pool.submit(() -> deleteBatchQuietly(buildRequest(keys), keys, firstFailure)));
+    }
+
+    private DeleteObjectsRequest buildRequest(List<String> keys) {
+        List<ObjectIdentifier> identifiers = new ArrayList<>(keys.size());
+        for (String key : keys) {
+            identifiers.add(ObjectIdentifier.builder().key(key).build());
+        }
+        return DeleteObjectsRequest.builder()
+                .bucket(bucket)
+                .delete(Delete.builder().objects(identifiers).build())
+                .build();
+    }
+
+    /** Backpressure: waits for the oldest batches until at most {@code 2 * threads} remain. */
+    private static void drainIfCrowded(
+            Deque<Future<List<String>>> inFlight, List<String> failedKeys, int threads)
+            throws InterruptedException, IOException {
+        while (inFlight.size() > 2 * threads) {
+            failedKeys.addAll(join(inFlight.pollFirst()));
+        }
+    }
+
+    /** Joins one batch future, mapping task-level failures to IOException. */
+    private static List<String> join(Future<List<String>> future)
+            throws InterruptedException, IOException {
+        try {
+            return future.get();
+        } catch (ExecutionException e) {
+            // Unexpected: deleteBatchQuietly maps every failure to failed keys.
+            throw new IOException("Batch deletion task failed", e.getCause());
+        }
+    }
+
+    private static void collect(Deque<Future<List<String>>> inFlight, List<String> failedKeys)
+            throws InterruptedException, IOException {
+        while (!inFlight.isEmpty()) {
+            failedKeys.addAll(join(inFlight.pollFirst()));
+        }
+    }
+
     /** Result of a delimiter listing: immediate object keys and common prefixes. */
     static final class Children {
         final List<S3Object> objects = new ArrayList<>();
@@ -358,8 +464,10 @@ final class S3NativeObjectOperations {
      * {@code key/} in the returned contents, not by sort order: general-purpose buckets and MinIO
      * return keys sorted, but directory buckets are documented unsorted and remain unsupported
      * (Spec §14.2). With sorted responses the marker is necessarily contents[0] when present, so
-     * absence from the maxKeys=2 window is conclusive.
+     * absence from the maxKeys=2 window is conclusive. maxKeys=2 is a defensive margin: on sorted
+     * backends maxKeys=1 already suffices.
      *
+     * @param key non-empty object key (the bucket root short-circuits before the probe)
      * @return MARKER_DIR if the self-marker is listed, PREFIX_DIR if any other key is listed,
      *     MISSING otherwise.
      */
