@@ -181,6 +181,11 @@ public class S3NativeFileIO implements FileIO {
     @Override
     public boolean delete(Path path, boolean recursive) throws IOException {
         String key = key(path);
+        if (key.isEmpty() && recursive) {
+            // Deleting the bucket root would batch-delete every key in the bucket; refuse
+            // like S3A's root-delete guard instead of wiping on a stray tool call.
+            throw new IOException("Refusing recursive delete of the bucket root: " + path);
+        }
         S3NativeObjectOperations operations = ops(path);
         Classification classification = classify(path);
 
@@ -248,17 +253,20 @@ public class S3NativeFileIO implements FileIO {
     public boolean rename(Path src, Path dst) throws IOException {
         String srcKey = key(src);
         String dstKey = key(dst);
+        // Bucket check first: a cross-bucket rename with identical keys must fail loudly,
+        // not no-op with a success return (rename sits on Paimon's commit path).
+        if (!S3PathUtils.bucket(src).equals(S3PathUtils.bucket(dst))) {
+            // [ADAPTED] The Flink filesystem is bucket-scoped; this FileIO is bucket-agnostic, so
+            // the copy below would otherwise silently land in the source bucket.
+            return false;
+        }
         if (srcKey.equals(dstKey)) {
+            // [ADAPTED] No-op success for same-bucket same-key renames (Hadoop convention).
             return true;
         }
         if (srcKey.isEmpty()) {
             // Renaming the bucket root would recursively copy the entire bucket; refuse like
             // S3A instead of running a whole-bucket copy.
-            return false;
-        }
-        if (!S3PathUtils.bucket(src).equals(S3PathUtils.bucket(dst))) {
-            // [ADAPTED] The Flink filesystem is bucket-scoped; this FileIO is bucket-agnostic, so
-            // the copy below would otherwise silently land in the source bucket.
             return false;
         }
         S3NativeObjectOperations operations = ops(src);
@@ -355,6 +363,9 @@ public class S3NativeFileIO implements FileIO {
             copyObjectMultipart(operations, sse, srcKey, dstKey, length);
         } catch (S3Exception e) {
             throw new IOException("Failed to copy " + srcKey + " to " + dstKey, e);
+        } catch (RuntimeException e) {
+            // SdkClientException (network/credential) does not extend S3Exception.
+            throw new IOException("Failed to copy " + srcKey + " to " + dstKey, e);
         }
     }
 
@@ -422,8 +433,16 @@ public class S3NativeFileIO implements FileIO {
             } catch (S3Exception e) {
                 abortCopyQuietly(operations, dstKey, uploadId);
                 throw new IOException("Failed to multipart-copy " + srcKey + " to " + dstKey, e);
+            } catch (RuntimeException e) {
+                // SdkClientException during a part: abort so the uploadId does not leak
+                // orphaned billed parts until the lifecycle rule fires.
+                abortCopyQuietly(operations, dstKey, uploadId);
+                throw new IOException("Failed to multipart-copy " + srcKey + " to " + dstKey, e);
             }
         } catch (S3Exception e) {
+            abortCopyQuietly(operations, dstKey, uploadId);
+            throw new IOException("Failed to multipart-copy " + srcKey + " to " + dstKey, e);
+        } catch (RuntimeException e) {
             abortCopyQuietly(operations, dstKey, uploadId);
             throw new IOException("Failed to multipart-copy " + srcKey + " to " + dstKey, e);
         }
