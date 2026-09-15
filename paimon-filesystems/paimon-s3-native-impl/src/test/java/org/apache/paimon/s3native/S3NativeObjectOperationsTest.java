@@ -235,6 +235,54 @@ class S3NativeObjectOperationsTest {
     }
 
     @Test
+    void testDeletePrefixStreamingBackpressureDeletesEverythingOnce() throws IOException {
+        // threads=1, batchSize=2: 3 pages x 2 unique keys = 6 keys -> 3 batches; the drain
+        // threshold (2*threads=2) forces the pagination thread to join the oldest batch before
+        // submitting the third — the only setup in the suite exercising the backpressure loop.
+        S3Client client = mock(S3Client.class);
+        java.util.concurrent.atomic.AtomicInteger pageCalls =
+                new java.util.concurrent.atomic.AtomicInteger();
+        java.util.List<String> tokens = java.util.Arrays.asList("t1", "t2", null);
+        when(client.listObjectsV2(
+                        any(software.amazon.awssdk.services.s3.model.ListObjectsV2Request.class)))
+                .thenAnswer(
+                        invocation -> {
+                            int call = pageCalls.getAndIncrement();
+                            return software.amazon.awssdk.services.s3.model.ListObjectsV2Response
+                                    .builder()
+                                    .contents(
+                                            software.amazon.awssdk.services.s3.model.S3Object
+                                                    .builder()
+                                                    .key("k-" + call + "-a")
+                                                    .build(),
+                                            software.amazon.awssdk.services.s3.model.S3Object
+                                                    .builder()
+                                                    .key("k-" + call + "-b")
+                                                    .build())
+                                    .nextContinuationToken(tokens.get(call))
+                                    .build();
+                        });
+        when(client.deleteObjects(any(DeleteObjectsRequest.class)))
+                .thenReturn(DeleteObjectsResponse.builder().build());
+
+        ops(client).deletePrefixStreaming("p/", 2, 1);
+
+        assertThat(pageCalls.get()).isEqualTo(3);
+        java.util.List<String> deletedKeys = new ArrayList<>();
+        org.mockito.Mockito.mockingDetails(client).getInvocations().stream()
+                .filter(i -> i.getMethod().getName().equals("deleteObjects"))
+                .map(i -> (DeleteObjectsRequest) i.getArgument(0))
+                .forEach(
+                        request -> {
+                            for (ObjectIdentifier id : request.delete().objects()) {
+                                deletedKeys.add(id.key());
+                            }
+                        });
+        assertThat(deletedKeys).hasSize(6);
+        assertThat(new java.util.HashSet<>(deletedKeys)).hasSize(6); // exactly once each
+    }
+
+    @Test
     void testDeletePrefixStreamingEmptyPrefixIsNoop() throws IOException {
         S3Client client = mock(S3Client.class);
         when(client.listObjectsV2(
@@ -438,7 +486,12 @@ class S3NativeObjectOperationsTest {
                                 .isTruncated(false)
                                 .build());
 
-        assertThat(ops(client).listAllKeys("prefix/"))
+        java.util.List<String> keys = new ArrayList<>();
+        for (software.amazon.awssdk.services.s3.model.S3Object object :
+                ops(client).listAllObjects("prefix/")) {
+            keys.add(object.key());
+        }
+        org.assertj.core.api.Assertions.assertThat(keys)
                 .containsExactly("k-0", "k-1", "k-2", "k-3", "k-4", "k-5");
         verify(client, times(3))
                 .listObjectsV2(

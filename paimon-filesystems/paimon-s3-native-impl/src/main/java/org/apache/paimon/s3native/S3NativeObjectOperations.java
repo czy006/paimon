@@ -287,11 +287,12 @@ final class S3NativeObjectOperations {
     /**
      * Streams a recursive delete: paginates the prefix with no delimiter and submits a batch delete
      * every {@code batchSize} keys, waiting for the oldest in-flight batch whenever more than
-     * {@code 2 * threads} batches are outstanding (backpressure). Memory stays bounded at
-     * O(batchSize * 2 * threads) keys instead of materializing the whole listing, and deletion
-     * overlaps with pagination. Failure semantics match {@link #deleteBatch}: per-key NotFound is
-     * success (Spec D6), whole-request failures mark their keys failed with the first cause
-     * preserved, and any failed key throws one aggregated IOException.
+     * {@code 2 * threads} batches are outstanding (backpressure; at most {@code 2 * threads + 1} in
+     * flight at any instant). Memory stays bounded at O(batchSize * threads) keys instead of
+     * materializing the whole listing, and deletion overlaps with pagination. Failure semantics
+     * match {@link #deleteBatch}: per-key NotFound is success (Spec D6), whole-request failures
+     * mark their keys failed with the first cause preserved, and any failed key throws one
+     * aggregated IOException.
      */
     void deletePrefixStreaming(String prefix, int batchSize, int threads) throws IOException {
         Deque<Future<List<String>>> inFlight = new ArrayDeque<>();
@@ -445,16 +446,6 @@ final class S3NativeObjectOperations {
             throw toIOException("listAllObjects " + prefix, e);
         }
         return objects;
-    }
-
-    /** Lists all keys under a prefix; convenience over {@link #listAllObjects(String)}. */
-    List<String> listAllKeys(String prefix) throws IOException {
-        List<S3Object> objects = listAllObjects(prefix);
-        List<String> keys = new ArrayList<>(objects.size());
-        for (S3Object object : objects) {
-            keys.add(object.key());
-        }
-        return keys;
     }
 
     /**

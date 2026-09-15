@@ -483,6 +483,18 @@ mirror `paimon-s3/pom.xml` 的结构（dependency-plugin 把 impl jar unpack 进
 | T8 | 输出流单次大 write 产生超阈值大 part（阈值语义，与 Flink writer 一致），不在单次 write 内切分 | 与参考实现行为一致；真实写入方（Parquet）分块写 |
 | T9 | 基准首跑（本地 MinIO，同盘同参）：大文件写 2.48×（322 vs 130 MB/s）、小文件写 1.73×、向量读 1185-1455 MB/s（S3A 无此能力）、顺序读 ~0.92×（页缓存主导、噪声内） | 详见 `docs/analysis/benchmarks/s3-native-benchmark.md`；真实 S3 验收数字待客户 staging |
 
+## 15. 性能优化记录（2026-09-15，生产审计 Top 3 实施）
+
+依据三路源码审计（完整性/性能/生产就绪）实施三个优化，各自独立提交并经审查：
+
+| # | 优化 | 提交 | 量化收益 |
+| --- | --- | --- | --- |
+| P-1 | **classify 单列表合并**：marker HEAD + prefix LIST 两步并为一次无 delimiter `ListObjectsV2(maxKeys=2)`，marker 属性由**成员判别**（不依赖排序；带 delimiter 的列表不返回 prefix-等于自身的 marker，AWS 文档 Example 8） | `3773a93` | 目录/缺失路径探测 3→2 请求（对齐 Flink 参考形状）；listStatus 3+N→2+N 页；probe 无 SSE-C 头，消除 marker-HEAD×SSE-C 耦合 |
+| P-2 | **递归删除流式化**：分页边列边删、每凑满 batchSize 提交并行批、在途 >2×threads 时 join 最老批（背压）；失败聚合语义与 deleteBatch 一致 | `43720ec` | 内存 O(全量 keys)→O(batchSize×threads)（百万 key 过期 ≈0.5GB 堆 → ~KB 级）；列表与删除重叠，消除先列后删的串行 RTT |
+| P-3 | **CLIENTS 缓存键收窄**：键从完整 Options 投影为 `ClientKey`（create() 读取的 15 个客户端字段；流级选项经 resolvedOptions() 逐调用解析、不入键） | `a8e7e10e` | 流级选项差异（part size/SSE/tags/删除调优…）不再各固定一套 50 连接池+Netty event loop；超阈值（16）时按新增漂移告警一次 |
+
+审查加固（随优化 3 后提交）：WARN 改为增长触发（防每操作刷屏）、列表失败取消在途批、删除生产死码 `listAllKeys`、背压路径真实验证测试（threads=1）、ClientKey 逐字段不等断言（15 字段防漏）。**登记**：directory bucket（无排序列表）在 §14.2 登记不支持——probe 依赖标准桶/MinIO 语义，无排序下唯一影响是 MARKER_DIR→PREFIX_DIR 的无消费者标签差。
+
 **遗留（非本 Spec 验收项）**：真实 S3 端点基准（客户 staging）；Flink/Spark 真机部署冒烟；上游化提 PR。
 
 ---
