@@ -170,6 +170,81 @@ class S3NativeObjectOperationsTest {
     }
 
     @Test
+    void testProbeDirectoryRequestShapeAndMembership() throws IOException {
+        S3Client client = mock(S3Client.class);
+        java.util.List<software.amazon.awssdk.services.s3.model.ListObjectsV2Request> requests =
+                java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+
+        // Marker listed first (sorted order) -> MARKER_DIR.
+        when(client.listObjectsV2(
+                        any(software.amazon.awssdk.services.s3.model.ListObjectsV2Request.class)))
+                .thenAnswer(
+                        invocation -> {
+                            requests.add(invocation.getArgument(0));
+                            return software.amazon.awssdk.services.s3.model.ListObjectsV2Response
+                                    .builder()
+                                    .contents(
+                                            software.amazon.awssdk.services.s3.model.S3Object
+                                                    .builder()
+                                                    .key("a/b/")
+                                                    .build(),
+                                            software.amazon.awssdk.services.s3.model.S3Object
+                                                    .builder()
+                                                    .key("a/b/c")
+                                                    .build())
+                                    .build();
+                        });
+        assertThat(ops(client).probeDirectory("a/b"))
+                .isEqualTo(S3NativeObjectOperations.DirectoryProbe.MARKER_DIR);
+
+        // Other keys only -> PREFIX_DIR.
+        when(client.listObjectsV2(
+                        any(software.amazon.awssdk.services.s3.model.ListObjectsV2Request.class)))
+                .thenReturn(
+                        software.amazon.awssdk.services.s3.model.ListObjectsV2Response.builder()
+                                .contents(
+                                        software.amazon.awssdk.services.s3.model.S3Object.builder()
+                                                .key("a/b/c")
+                                                .build())
+                                .build());
+        assertThat(ops(client).probeDirectory("a/b"))
+                .isEqualTo(S3NativeObjectOperations.DirectoryProbe.PREFIX_DIR);
+
+        // Membership check must not depend on order: marker appearing second still wins.
+        when(client.listObjectsV2(
+                        any(software.amazon.awssdk.services.s3.model.ListObjectsV2Request.class)))
+                .thenReturn(
+                        software.amazon.awssdk.services.s3.model.ListObjectsV2Response.builder()
+                                .contents(
+                                        software.amazon.awssdk.services.s3.model.S3Object.builder()
+                                                .key("a/b/ z") // sorts before "a/b/" (' ' < '/')
+                                                .build(),
+                                        software.amazon.awssdk.services.s3.model.S3Object.builder()
+                                                .key("a/b/")
+                                                .build())
+                                .build());
+        assertThat(ops(client).probeDirectory("a/b"))
+                .isEqualTo(S3NativeObjectOperations.DirectoryProbe.MARKER_DIR);
+
+        // Empty -> MISSING.
+        when(client.listObjectsV2(
+                        any(software.amazon.awssdk.services.s3.model.ListObjectsV2Request.class)))
+                .thenReturn(
+                        software.amazon.awssdk.services.s3.model.ListObjectsV2Response.builder()
+                                .build());
+        assertThat(ops(client).probeDirectory("a/b"))
+                .isEqualTo(S3NativeObjectOperations.DirectoryProbe.MISSING);
+
+        // Request shape: prefix "a/b/", maxKeys=2, and NO delimiter (the delimiter form omits
+        // the self-marker per AWS docs Example 8).
+        assertThat(requests).isNotEmpty();
+        software.amazon.awssdk.services.s3.model.ListObjectsV2Request request = requests.get(0);
+        assertThat(request.prefix()).isEqualTo("a/b/");
+        assertThat(request.maxKeys()).isEqualTo(2);
+        assertThat(request.delimiter()).isNull();
+    }
+
+    @Test
     void testSseCustomerHeadersOnHeadObject() {
         S3Client client = mock(S3Client.class);
         when(client.headObject(
