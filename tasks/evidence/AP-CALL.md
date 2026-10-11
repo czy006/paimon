@@ -170,4 +170,3 @@ SparkProcedures.class与common编译class也相同：
 初次交付时原checkout两份MD的SHA-256保持原值，源码在独立worktree，无业务表/业务MinIO变更，当时未commit/push/发布。用户随后授权本地提交，现有提交和审查修正以AP-REVIEW记录为准；仍不push/发布。
 
 最终收尾：6份修改Markdown已解析，22个相对链接和8段guide/证据Shell语法通过；git diff --check通过（公开procedure文档原有行尾空白未作无关修改）。21模块构建经过Checkstyle/Spotless和Java/Scala编译；JDK11根目录apache-rat:check通过，4678资源、Unapproved=0、unknown=0，日志/tmp/paimon-archive-final-license.log。所有测试会话已结束，Testcontainers标签容器清单为空。实现、测试和文档保留在当前worktree供审查。
-

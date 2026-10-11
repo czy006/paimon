@@ -147,4 +147,3 @@ local-red.log 的初始测试编译错误及 local-red-assertion.log 的格式�
 - 组合方式依据本checkout的 FileIO.copyFile、DataFileMeta.rename/newExternalPath、CompactIncrement、FileStoreCommit、FileStoreScan 和 DataFilePathFactory 源码；它不是官方已提供的 archive_partitions 功能。
 
 未验证：完整入口参数/URI登记/历史门槛、sidecar/embedded index谓词、并发维护、提交UNKNOWN恢复、pin释放/GC/drop、streaming/cache刷新、S3→另一个bucket或反向迁移、跨进程崩溃、分布式Spark。test-only helper不允许直接接为生产入口。MinIO/Local临时数据随各自夹具结束清理；故障测试删除的冷对象在finally恢复，没有移动真实业务表。下一正式开发任务仍是AP-01完整安全入口。
-

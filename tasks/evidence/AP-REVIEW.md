@@ -109,4 +109,3 @@ PartitionArchiver.class：30e6ba6ab5166c68207730cfbc1657a0af68015add029535be0847
 源码修正提交：abee90821（fix: preserve archive protection and require partition inactivity）。文档后续独立提交，避免把未通过的候选记录成最终代码。
 
 收尾验证：8份Markdown解析、27个相对链接、11段shell语法通过；git diff --check通过。RAT根检查4680资源，Unapproved=0、unknown=0，日志/tmp/paimon-archive-review-final-license.log。结束时org.testcontainers标签容器清单为空，原checkout两份MD SHA复核未变。所有Maven/Docker验证会话已完成。
-
