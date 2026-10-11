@@ -38,6 +38,22 @@ This section introduce all available spark procedures about paimon.
     </thead>
     <tbody style="font-size: 12px; ">
     <tr>
+      <td>archive_partitions</td>
+      <td>
+        Copy full partitions to an online external root, verify the copied bytes and replace file references in one COMPACT snapshot per partition, without rewriting data files.
+        <li>table: required table identifier in this catalog.</li>
+        <li>partitions: required full partition specs; separate keys with commas and partitions with semicolons. Typed duplicate specs run once. No implicit whole-table selection.</li>
+        <li>target_path: required absolute URI of a persistently registered, table-exclusive external root.</li>
+        <li>partition_idle_time: optional inactivity duration, default '1d'. Uses compact's manifest-derived last file creation time across all partition buckets. A partition is eligible at or beyond the threshold. '0s' disables this check; negative/invalid durations are rejected.</li>
+        Return one result STRING per deduplicated partition: ARCHIVED, NOOP, FAILED, UNKNOWN, INCOMPLETE or NOT_ATTEMPTED.
+        Active partitions return NOOP with code PARTITION_ACTIVE without creating objects, pins or snapshots. This eligibility check does not freeze writers.
+        Freeze writers and pause expiration/orphan cleanup throughout the CALL. Enable resolving-file-io before loading the catalog, install the required FileIO plugins on every reader and keep data-file.external-paths.strategy=none.
+        Only ordinary partitioned main-branch tables with append fixed/unaware or PK fixed buckets are admitted. PK merge engines are deduplicate, partial-update and aggregation; first-row is excluded. Snapshot publication must be filesystem-managed; catalogs with external version management (including RESTCatalog) are rejected. DV, independent indexes/changelog, row tracking/evolution, metadata mirrors, callback side effects and FILE_MONITOR are excluded.
+        Source files remain available to retained snapshots/tags. Do not delete them after copying. UNKNOWN/INCOMPLETE preserve the operation pin and stop later partitions; confirm publication before retrying or cleaning up. Cross-storage lifecycle and deployment certification are separate requirements.
+      </td>
+      <td>CALL paimon.sys.archive_partitions(table =&gt; 'db.orders', partitions =&gt; 'dt=20240101;dt=20240102', target_path =&gt; 's3://cold-bucket/paimon/db/orders', partition_idle_time =&gt; '7d')</td>
+    </tr>
+    <tr>
       <td>compact</td>
       <td>
          To compact files. Argument:
