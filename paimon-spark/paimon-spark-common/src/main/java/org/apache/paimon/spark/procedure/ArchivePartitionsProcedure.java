@@ -22,6 +22,7 @@ import org.apache.paimon.operation.PartitionArchiver;
 import org.apache.paimon.spark.SparkCatalog;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.utils.Preconditions;
+import org.apache.paimon.utils.TimeUtils;
 
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.catalog.Identifier;
@@ -30,6 +31,8 @@ import org.apache.spark.sql.types.Metadata;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.unsafe.types.UTF8String;
+
+import java.time.Duration;
 
 import static org.apache.spark.sql.types.DataTypes.StringType;
 
@@ -44,7 +47,8 @@ public class ArchivePartitionsProcedure extends BaseProcedure {
             new ProcedureParameter[] {
                 ProcedureParameter.required("table", StringType),
                 ProcedureParameter.required("partitions", StringType),
-                ProcedureParameter.required("target_path", StringType)
+                ProcedureParameter.required("target_path", StringType),
+                ProcedureParameter.optional("partition_idle_time", StringType)
             };
 
     private static final StructType OUTPUT_TYPE =
@@ -69,13 +73,17 @@ public class ArchivePartitionsProcedure extends BaseProcedure {
 
     @Override
     public InternalRow[] call(InternalRow args) {
-        for (int i = 0; i < PARAMETERS.length; i++) {
+        for (int i = 0; i < 3; i++) {
             Preconditions.checkArgument(
                     !args.isNullAt(i), "archive_partitions arguments must not be null");
         }
         Identifier identifier = toIdentifier(args.getString(0), PARAMETERS[0].name());
         String partitions = args.getString(1);
         String target = args.getString(2);
+        Duration partitionIdleTime =
+                args.isNullAt(3) || args.getString(3).trim().isEmpty()
+                        ? PartitionArchiver.DEFAULT_PARTITION_IDLE_TIME
+                        : TimeUtils.parseDuration(args.getString(3));
         Preconditions.checkArgument(
                 tableCatalog() instanceof SparkCatalog,
                 "archive_partitions requires a Paimon SparkCatalog");
@@ -88,7 +96,8 @@ public class ArchivePartitionsProcedure extends BaseProcedure {
                     return new PartitionArchiver(
                                     (FileStoreTable) table,
                                     target,
-                                    ((SparkCatalog) tableCatalog()).paimonCatalog())
+                                    ((SparkCatalog) tableCatalog()).paimonCatalog(),
+                                    partitionIdleTime)
                             .archive(partitions).stream()
                                     .map(result -> newInternalRow(UTF8String.fromString(result)))
                                     .toArray(InternalRow[]::new);

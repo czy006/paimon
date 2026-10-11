@@ -24,6 +24,7 @@ import org.apache.paimon.table.FileStoreTable;
 import org.apache.spark.sql.Row;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.List;
@@ -50,7 +51,7 @@ public class ArchivePartitionsProcedureTest extends LocalPartitionRelocationTest
                 "CALL paimon.sys.archive_partitions(table => 'db.T', "
                         + "partitions => 'pt=cold;pt=cold', target_path => '"
                         + targetRoot()
-                        + "')";
+                        + "', partition_idle_time => '0s')";
         List<Row> archived = sparkSession().sql(call).collectAsList();
         assertThat(archived).hasSize(1);
         assertThat(archived.get(0).getString(0)).contains("state=ARCHIVED");
@@ -165,6 +166,123 @@ public class ArchivePartitionsProcedureTest extends LocalPartitionRelocationTest
         assertThat(call("pt=cold").get(0).getString(0)).contains("state=NOOP");
     }
 
+    @ParameterizedTest
+    @CsvSource({"partial-update,5,20,7,8", "aggregation,15,20,22,28"})
+    void preservesNonDefaultPrimaryKeyMergeSemantics(
+            String engine, int beforeA, int beforeB, int afterA, int afterB) throws Exception {
+        String aggregates =
+                "aggregation".equals(engine)
+                        ? ",'fields.a.aggregate-function'='sum','fields.b.aggregate-function'='sum'"
+                        : "";
+        sparkSession()
+                .sql(
+                        "CREATE TABLE paimon.db.T (id INT,a INT,b INT,pt STRING) USING paimon "
+                                + "PARTITIONED BY (pt) TBLPROPERTIES ('bucket'='2','primary-key'='pt,id',"
+                                + "'write-only'='true','merge-engine'='"
+                                + engine
+                                + "',"
+                                + "'data-file.external-paths'='"
+                                + targetRoot()
+                                + "'"
+                                + aggregates
+                                + ")");
+        sparkSession().sql("INSERT INTO paimon.db.T VALUES (1,10,20,'cold'),(2,30,40,'hot')");
+        sparkSession().sql("INSERT INTO paimon.db.T VALUES (1,5,NULL,'cold')");
+        FileStoreTable table = freshTable();
+        long before = table.snapshotManager().latestSnapshot().id();
+        table.createTag("before_merge_archive", before, null);
+        String expectedBefore = "[1," + beforeA + "," + beforeB + "]";
+        assertThat(
+                        sparkSession()
+                                .sql("SELECT id,a,b FROM paimon.db.T WHERE pt='cold'")
+                                .collectAsList())
+                .extracting(Row::toString)
+                .containsExactly(expectedBefore);
+        assertThat(call("pt=cold").get(0).getString(0)).contains("state=ARCHIVED");
+        sparkSession().sql("INSERT INTO paimon.db.T VALUES (1,7,8,'cold')");
+        assertThat(
+                        sparkSession()
+                                .newSession()
+                                .sql("SELECT id,a,b FROM paimon.db.T WHERE pt='cold'")
+                                .collectAsList())
+                .extracting(Row::toString)
+                .containsExactly("[1," + afterA + "," + afterB + "]");
+        assertThat(
+                        sparkSession()
+                                .newSession()
+                                .sql(
+                                        "SELECT id,a,b FROM paimon.db.T "
+                                                + "VERSION AS OF 'before_merge_archive' WHERE pt='cold'")
+                                .collectAsList())
+                .extracting(Row::toString)
+                .containsExactly(expectedBefore);
+    }
+
+    @Test
+    void defaultIdleDaySkipsNewDataEvenWithOldPartitionValue() throws Exception {
+        createTable("id INT, pt STRING", "pt", "");
+        sparkSession().sql("INSERT INTO paimon.db.T VALUES (1,'20200101')");
+        long before = freshTable().snapshotManager().latestSnapshot().id();
+        String command =
+                "CALL paimon.sys.archive_partitions(table => 'db.T', partitions => 'pt=20200101',"
+                        + "target_path => '"
+                        + targetRoot()
+                        + "')";
+        assertThat(sparkSession().sql(command).collectAsList().get(0).getString(0))
+                .contains("state=NOOP", "PARTITION_ACTIVE");
+        assertThat(freshTable().snapshotManager().latestSnapshot().id()).isEqualTo(before);
+        assertThat(freshTable().tagManager().allTagNames()).isEmpty();
+        assertThat(freshTable().fileIO().exists(targetRoot())).isFalse();
+        assertThat(
+                        sparkSession()
+                                .sql(
+                                        command.substring(0, command.length() - 1)
+                                                + ", partition_idle_time => '0s')")
+                                .collectAsList()
+                                .get(0)
+                                .getString(0))
+                .contains("state=ARCHIVED");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"1d", "12h", "15m"})
+    void acceptsExplicitIdleDurationAndSkipsActiveData(String duration) throws Exception {
+        createTable("id INT, pt STRING", "pt", "");
+        sparkSession().sql("INSERT INTO paimon.db.T VALUES (1,'cold')");
+        List<Row> rows =
+                sparkSession()
+                        .sql(
+                                "CALL paimon.sys.archive_partitions('db.T','pt=cold','"
+                                        + targetRoot()
+                                        + "','"
+                                        + duration
+                                        + "')")
+                        .collectAsList();
+        assertThat(rows.get(0).getString(0)).contains("PARTITION_ACTIVE");
+        assertThat(freshTable().snapshotManager().latestSnapshot().id()).isEqualTo(1);
+        assertThat(freshTable().tagManager().allTagNames()).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"-1d", "not-a-duration"})
+    void rejectsInvalidIdleDurationBeforeCopy(String duration) throws Exception {
+        createTable("id INT, pt STRING", "pt", "");
+        sparkSession().sql("INSERT INTO paimon.db.T VALUES (1,'cold')");
+        assertThatThrownBy(
+                        () ->
+                                sparkSession()
+                                        .sql(
+                                                "CALL paimon.sys.archive_partitions('db.T','pt=cold','"
+                                                        + targetRoot()
+                                                        + "','"
+                                                        + duration
+                                                        + "')")
+                                        .collectAsList())
+                .isInstanceOf(Exception.class);
+        assertThat(freshTable().fileIO().exists(targetRoot())).isFalse();
+        assertThat(freshTable().tagManager().allTagNames()).isEmpty();
+    }
+
     private void createTable(String columns, String partitions, String extraOptions) {
         sparkSession()
                 .sql(
@@ -190,7 +308,7 @@ public class ArchivePartitionsProcedureTest extends LocalPartitionRelocationTest
                                 + partitions
                                 + "', target_path => '"
                                 + targetRoot()
-                                + "')")
+                                + "', partition_idle_time => '0s')")
                 .collectAsList();
     }
 }

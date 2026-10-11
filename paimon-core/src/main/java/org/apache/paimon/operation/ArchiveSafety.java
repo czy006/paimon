@@ -73,6 +73,9 @@ final class ArchiveSafety {
                 !table.partitionKeys().isEmpty(),
                 "archive_partitions requires a partitioned table");
         checkArgument(
+                !table.catalogEnvironment().supportsVersionManagement(),
+                "archive_partitions currently requires filesystem-managed snapshots");
+        checkArgument(
                 table.bucketMode() == BucketMode.HASH_FIXED
                         || (table.primaryKeys().isEmpty()
                                 && table.bucketMode() == BucketMode.BUCKET_UNAWARE),
@@ -172,6 +175,12 @@ final class ArchiveSafety {
 
     private static void validateOptions(TableSchema schema) {
         CoreOptions options = CoreOptions.fromMap(schema.options());
+        checkArgument(
+                schema.primaryKeys().isEmpty()
+                        || options.mergeEngine() == CoreOptions.MergeEngine.DEDUPLICATE
+                        || options.mergeEngine() == CoreOptions.MergeEngine.PARTIAL_UPDATE
+                        || options.mergeEngine() == CoreOptions.MergeEngine.AGGREGATE,
+                "archive_partitions does not support this primary-key merge engine");
         checkArgument(
                 !options.deletionVectorsEnabled()
                         && !options.rowTrackingEnabled()

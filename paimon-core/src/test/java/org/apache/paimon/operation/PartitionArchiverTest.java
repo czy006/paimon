@@ -27,14 +27,21 @@ import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.PositionOutputStream;
 import org.apache.paimon.fs.ResolvingFileIO;
+import org.apache.paimon.io.CompactIncrement;
+import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.io.DataIncrement;
+import org.apache.paimon.manifest.ManifestCommittable;
 import org.apache.paimon.manifest.ManifestEntry;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.schema.SchemaChange;
+import org.apache.paimon.table.CatalogEnvironment;
 import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.FileStoreTableFactory;
 import org.apache.paimon.table.sink.BatchTableCommit;
 import org.apache.paimon.table.sink.BatchTableWrite;
 import org.apache.paimon.table.sink.BatchWriteBuilder;
+import org.apache.paimon.table.sink.CommitMessageImpl;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.IntType;
 import org.apache.paimon.types.VarCharType;
@@ -42,13 +49,21 @@ import org.apache.paimon.types.VarCharType;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -115,7 +130,7 @@ class PartitionArchiverTest {
                     }
                 };
         List<String> results =
-                new PartitionArchiver(table, cold.toString(), catalog)
+                new PartitionArchiver(table, cold.toString(), catalog, Duration.ZERO)
                         .archive("pt=cold;pt=missing");
         assertThat(results.get(0)).contains("MAINTENANCE_VIOLATION", "recovery_required=true");
         assertThat(results.get(1)).contains("NOT_ATTEMPTED");
@@ -128,7 +143,7 @@ class PartitionArchiverTest {
     void retainsPinWhenBranchAppearsDuringCopy() throws Exception {
         io.afterColdClose = () -> table.createBranch("concurrent");
         List<String> results =
-                new PartitionArchiver(table, cold.toString(), catalog)
+                new PartitionArchiver(table, cold.toString(), catalog, Duration.ZERO)
                         .archive("pt=cold;pt=missing");
         assertThat(results.get(0)).contains("MAINTENANCE_VIOLATION", "recovery_required=true");
         assertThat(results.get(1)).contains("NOT_ATTEMPTED");
@@ -139,7 +154,7 @@ class PartitionArchiverTest {
     void reportsUnknownAndRetainsObjectsWhenConfirmationCannotRead() throws Exception {
         io.hidePublishedReads = true;
         List<String> results =
-                new PartitionArchiver(table, cold.toString(), catalog)
+                new PartitionArchiver(table, cold.toString(), catalog, Duration.ZERO)
                         .archive("pt=cold;pt=missing");
         assertThat(results.get(0)).contains("state=UNKNOWN", "recovery_required=true");
         assertThat(results.get(1)).contains("NOT_ATTEMPTED");
@@ -198,7 +213,7 @@ class PartitionArchiverTest {
             commit.commit(write.prepareCommit());
         }
         assertThat(
-                        new PartitionArchiver(table, cold.toString(), catalog)
+                        new PartitionArchiver(table, cold.toString(), catalog, Duration.ZERO)
                                 .archive("pt=a/b: c")
                                 .get(0))
                 .contains("state=ARCHIVED");
@@ -220,7 +235,8 @@ class PartitionArchiverTest {
                 .anyMatch(e -> !e.file().extraFiles().isEmpty());
         long before = table.snapshotManager().latestSnapshot().id();
         assertThat(
-                        new PartitionArchiver(table, escaped.toUri().toString(), catalog)
+                        new PartitionArchiver(
+                                        table, escaped.toUri().toString(), catalog, Duration.ZERO)
                                 .archive("pt=cold")
                                 .get(0))
                 .contains("state=FAILED");
@@ -240,7 +256,7 @@ class PartitionArchiverTest {
                     }
                 };
         List<String> results =
-                new PartitionArchiver(table, cold.toString(), catalog)
+                new PartitionArchiver(table, cold.toString(), catalog, Duration.ZERO)
                         .archive("pt=cold;pt=missing");
         assertThat(results.get(0)).contains("state=INCOMPLETE", "committed_snapshot=");
         assertThat(results.get(1)).contains("NOT_ATTEMPTED");
@@ -266,7 +282,8 @@ class PartitionArchiverTest {
                     }
                 };
         List<String> results =
-                new PartitionArchiver(stale, cold.toString(), cached).archive("pt=cold;pt=missing");
+                new PartitionArchiver(stale, cold.toString(), cached, Duration.ZERO)
+                        .archive("pt=cold;pt=missing");
         assertThat(results.get(0)).contains("MAINTENANCE_VIOLATION");
         assertThat(results.get(1)).contains("NOT_ATTEMPTED");
         assertThat(table.tagManager().allTagNames()).hasSize(1);
@@ -280,7 +297,10 @@ class PartitionArchiverTest {
                 Identifier.create("db", "T"),
                 SchemaChange.setOption("archive.test.marker", "before-planning"),
                 false);
-        assertThat(new PartitionArchiver(stale, cold.toString(), cached).archive("pt=cold").get(0))
+        assertThat(
+                        new PartitionArchiver(stale, cold.toString(), cached, Duration.ZERO)
+                                .archive("pt=cold")
+                                .get(0))
                 .contains("state=ARCHIVED");
         assertThat(table.tagManager().allTagNames()).isEmpty();
     }
@@ -293,7 +313,8 @@ class PartitionArchiverTest {
             write.write(GenericRow.of(2, BinaryString.fromString("hot")));
             commit.commit(write.prepareCommit());
         }
-        PartitionArchiver archiver = new PartitionArchiver(table, cold.toString(), catalog);
+        PartitionArchiver archiver =
+                new PartitionArchiver(table, cold.toString(), catalog, Duration.ZERO);
         io.hidePublishedReads = true;
         assertThat(archiver.archive("pt=cold").get(0)).contains("state=UNKNOWN");
         io.hidePublishedReads = false;
@@ -343,8 +364,329 @@ class PartitionArchiverTest {
         assertThat(io.exists(cold)).isFalse();
     }
 
+    @Test
+    void rejectsCatalogManagedVersionAuthorityBeforeCopy() throws Exception {
+        CatalogEnvironment managed =
+                new CatalogEnvironment(
+                        table.catalogEnvironment().identifier(),
+                        table.uuid(),
+                        null,
+                        null,
+                        null,
+                        true);
+        FileStoreTable candidate =
+                FileStoreTableFactory.create(io, table.location(), table.schema(), managed);
+        assertThatThrownBy(
+                        () ->
+                                ArchiveSafety.validate(
+                                        candidate, ArchivePath.parseRoot(cold.toString())))
+                .hasMessageContaining("filesystem-managed snapshots");
+        assertThat(io.exists(cold)).isFalse();
+        assertThat(table.tagManager().allTagNames()).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"delete", "retarget", "ttl"})
+    void stopsWhenSourcePinChangesDuringCopy(String action) throws Exception {
+        write(2);
+        io.afterColdClose =
+                () -> {
+                    String pin = table.tagManager().allTagNames().get(0);
+                    if ("delete".equals(action)) {
+                        table.deleteTag(pin);
+                    } else if ("retarget".equals(action)) {
+                        table.replaceTag(pin, 1L, null);
+                    } else {
+                        table.replaceTag(pin, 2L, Duration.ofMinutes(1));
+                    }
+                };
+        List<String> results =
+                new PartitionArchiver(table, cold.toString(), catalog, Duration.ZERO)
+                        .archive("pt=cold;pt=missing");
+        assertThat(results.get(0)).contains("MAINTENANCE_VIOLATION");
+        assertThat(results.get(1)).contains("NOT_ATTEMPTED");
+        assertThat(table.snapshotManager().latestSnapshot().id()).isEqualTo(2);
+    }
+
+    @Test
+    void stopsWhenProtectedSnapshotExpiresDuringCopy() throws Exception {
+        write(2);
+        io.afterColdClose = () -> table.snapshotManager().deleteSnapshot(1L);
+        List<String> results =
+                new PartitionArchiver(table, cold.toString(), catalog, Duration.ZERO)
+                        .archive("pt=cold;pt=missing");
+        assertThat(results.get(0)).contains("MAINTENANCE_VIOLATION");
+        assertThat(results.get(1)).contains("NOT_ATTEMPTED");
+        assertThat(table.snapshotManager().latestSnapshot().id()).isEqualTo(2);
+        assertThat(table.tagManager().allTagNames()).hasSize(1);
+    }
+
+    @Test
+    void retainsProtectionWhenPinDisappearsAfterPublication() throws Exception {
+        io.afterArchivePublication = () -> table.deleteTag(table.tagManager().allTagNames().get(0));
+        List<String> results =
+                new PartitionArchiver(table, cold.toString(), catalog, Duration.ZERO)
+                        .archive("pt=cold;pt=missing");
+        assertThat(results.get(0)).contains("state=INCOMPLETE", "committed_snapshot=2");
+        assertThat(results.get(1)).contains("NOT_ATTEMPTED");
+    }
+
+    @Test
+    void classifiesNativeConflictBeforePublicationAsMaintenanceViolation() throws Exception {
+        ManifestEntry before = table.store().newScan().keepStats().plan().files().get(0);
+        io.beforeArchivePublication = () -> rewrite(before);
+        List<String> results =
+                new PartitionArchiver(table, cold.toString(), catalog, Duration.ZERO)
+                        .archive("pt=cold;pt=missing");
+        assertThat(results.get(0)).contains("state=FAILED", "MAINTENANCE_VIOLATION");
+        assertThat(results.get(1)).contains("NOT_ATTEMPTED");
+        assertThat(table.tagManager().allTagNames()).hasSize(1);
+    }
+
+    @Test
+    void confirmsCopiedPublicationWhenSkippedFileIsReplaced() throws Exception {
+        assertThat(archive().get(0)).contains("state=ARCHIVED");
+        ManifestEntry skipped = table.store().newScan().keepStats().plan().files().get(0);
+        write(2);
+        io.beforeArchivePublication = () -> rewrite(skipped);
+        List<String> results =
+                new PartitionArchiver(table, cold.toString(), catalog, Duration.ZERO)
+                        .archive("pt=cold;pt=missing");
+        assertThat(results.get(0)).contains("state=INCOMPLETE", "committed_snapshot=5");
+        assertThat(results.get(1)).contains("NOT_ATTEMPTED");
+        assertThat(table.tagManager().allTagNames()).hasSize(1);
+    }
+
+    private void rewrite(ManifestEntry entry) {
+        try {
+            Path source =
+                    table.store()
+                            .pathFactory()
+                            .createDataFilePathFactory(entry.partition(), entry.bucket())
+                            .toPath(entry.file());
+            String name = "data-" + UUID.randomUUID() + "-" + entry.file().fileName();
+            Path destination = new Path(source.getParent(), name);
+            io.copyFile(source, destination, false);
+            DataFileMeta after =
+                    entry.file()
+                            .rename(name)
+                            .newExternalPath(
+                                    entry.file().externalPath().isPresent()
+                                            ? destination.toString()
+                                            : null);
+            ManifestCommittable committable = new ManifestCommittable(0);
+            committable.addFileCommittable(
+                    new CommitMessageImpl(
+                            entry.partition(),
+                            entry.bucket(),
+                            entry.totalBuckets(),
+                            DataIncrement.emptyIncrement(),
+                            new CompactIncrement(
+                                    Collections.singletonList(entry.file()),
+                                    Collections.singletonList(after),
+                                    Collections.emptyList())));
+            try (FileStoreCommit commit =
+                    table.store().newCommit("review-rewrite-" + UUID.randomUUID(), table)) {
+                commit.ignoreEmptyCommit(true).commit(committable, false);
+            }
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"non-partitioned", "pk-dynamic", "pk-key-dynamic", "first-row"})
+    void rejectsUnsupportedTableModes(String mode) throws Exception {
+        Map<String, String> options = new HashMap<>(table.options());
+        options.remove("path");
+        boolean pk = !"non-partitioned".equals(mode);
+        options.put("bucket", "first-row".equals(mode) ? "2" : "-1");
+        if ("first-row".equals(mode)) {
+            options.put("merge-engine", "first-row");
+        }
+        List<String> partitions = pk ? table.partitionKeys() : Collections.emptyList();
+        List<String> keys =
+                !pk
+                        ? Collections.emptyList()
+                        : "pk-key-dynamic".equals(mode)
+                                ? Collections.singletonList("id")
+                                : Arrays.asList("pt", "id");
+        Identifier id = Identifier.create("db", "unsupported");
+        catalog.createTable(
+                id, new Schema(table.schema().fields(), partitions, keys, options, ""), false);
+        FileStoreTable candidate = (FileStoreTable) catalog.getTable(id);
+        assertThatThrownBy(
+                        () ->
+                                ArchiveSafety.validate(
+                                        candidate, ArchivePath.parseRoot(cold.toString())))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThat(io.exists(cold)).isFalse();
+    }
+
+    @Test
+    void rejectsPinMissingFromCapturedBaseline() throws Exception {
+        io.removePinAtTagListing = true;
+        List<String> results =
+                new PartitionArchiver(table, cold.toString(), catalog, Duration.ZERO)
+                        .archive("pt=cold;pt=missing");
+        assertThat(results.get(0)).contains("SOURCE_PROTECTION_UNCONFIRMED");
+        assertThat(results.get(1)).contains("NOT_ATTEMPTED");
+        assertThat(table.snapshotManager().latestSnapshot().id()).isEqualTo(1);
+        assertThat(io.exists(cold)).isFalse();
+    }
+
+    @Test
+    void doesNotTreatFailedReleaseVerificationAsSuccessfulPinDeletion() throws Exception {
+        io.afterArchivePublication = () -> io.removePinAtRead = 4;
+        List<String> results =
+                new PartitionArchiver(table, cold.toString(), catalog, Duration.ZERO)
+                        .archive("pt=cold;pt=missing");
+        assertThat(results.get(0)).contains("state=INCOMPLETE", "committed_snapshot=2");
+        assertThat(results.get(1)).contains("NOT_ATTEMPTED");
+    }
+
+    @Test
+    void stopsWhenUserTagChangesEvenIfOwnedPinIsIntact() throws Exception {
+        table.createTag("customer", 1L, null);
+        write(2);
+        io.afterColdClose = () -> table.deleteTag("customer");
+        List<String> results =
+                new PartitionArchiver(table, cold.toString(), catalog, Duration.ZERO)
+                        .archive("pt=cold;pt=missing");
+        assertThat(results.get(0)).contains("MAINTENANCE_VIOLATION");
+        assertThat(results.get(1)).contains("NOT_ATTEMPTED");
+        assertThat(table.tagManager().allTagNames()).hasSize(1);
+        assertThat(table.snapshotManager().latestSnapshot().id()).isEqualTo(2);
+    }
+
+    @Test
+    void defaultIdleDaySkipsFreshPartitionWithoutPinOrSnapshot() throws Exception {
+        List<String> result =
+                new PartitionArchiver(table, cold.toString(), catalog).archive("pt=cold");
+        assertThat(result.get(0)).contains("state=NOOP", "PARTITION_ACTIVE");
+        assertThat(table.snapshotManager().latestSnapshot().id()).isEqualTo(1);
+        assertThat(table.tagManager().allTagNames()).isEmpty();
+        assertThat(io.exists(cold)).isFalse();
+    }
+
+    @Test
+    void idleThresholdIncludesExactBoundaryWithoutRefreshingActivity() throws Exception {
+        long activity =
+                table.store().newScan().readPartitionEntries().get(0).lastFileCreationTime();
+        Duration threshold = Duration.ofHours(2);
+        Clock before =
+                Clock.fixed(
+                        Instant.ofEpochMilli(activity + threshold.toMillis() - 1), ZoneOffset.UTC);
+        assertThat(
+                        new PartitionArchiver(table, cold.toString(), catalog, threshold, before)
+                                .archive("pt=cold")
+                                .get(0))
+                .contains("PARTITION_ACTIVE");
+        assertThat(io.exists(cold)).isFalse();
+        Clock exact =
+                Clock.fixed(Instant.ofEpochMilli(activity + threshold.toMillis()), ZoneOffset.UTC);
+        assertThat(
+                        new PartitionArchiver(table, cold.toString(), catalog, threshold, exact)
+                                .archive("pt=cold")
+                                .get(0))
+                .contains("state=ARCHIVED");
+        assertThat(table.store().newScan().readPartitionEntries().get(0).lastFileCreationTime())
+                .isEqualTo(activity);
+        assertThat(
+                        new PartitionArchiver(table, cold.toString(), catalog, threshold, exact)
+                                .archive("pt=cold")
+                                .get(0))
+                .contains("state=NOOP");
+        assertThat(table.snapshotManager().latestSnapshot().id()).isEqualTo(2);
+    }
+
+    @ParameterizedTest
+    @CsvSource({"2,false", "-1,false", "2,true"})
+    void idleEligibilityUsesLatestActivityAcrossAllBuckets(int buckets, boolean primaryKey)
+            throws Exception {
+        Identifier id = Identifier.create("db", "idle_table");
+        Path root = new Path(temp.resolve("idle-root").toUri());
+        Map<String, String> options = new HashMap<>(table.options());
+        options.remove("path");
+        options.put("bucket", String.valueOf(buckets));
+        options.put("data-file.external-paths", root.toString());
+        if (buckets > 0) {
+            options.put("bucket-key", "id");
+            options.put("bucket-function.type", "mod");
+        }
+        catalog.createTable(
+                id,
+                new Schema(
+                        table.schema().fields(),
+                        table.partitionKeys(),
+                        primaryKey ? Arrays.asList("pt", "id") : Collections.emptyList(),
+                        options,
+                        ""),
+                false);
+        FileStoreTable candidate = (FileStoreTable) catalog.getTable(id);
+        BatchWriteBuilder builder = candidate.newBatchWriteBuilder();
+        try (BatchTableWrite write = builder.newWrite();
+                BatchTableCommit commit = builder.newCommit()) {
+            write.write(GenericRow.of(1, BinaryString.fromString("cold")));
+            write.write(GenericRow.of(2, BinaryString.fromString("cold")));
+            commit.commit(write.prepareCommit());
+        }
+        List<ManifestEntry> live = candidate.store().newScan().keepStats().plan().files();
+        assertThat(live.stream().map(ManifestEntry::bucket).distinct())
+                .hasSize(buckets > 0 ? buckets : 1);
+        long activity =
+                candidate.store().newScan().readPartitionEntries().get(0).lastFileCreationTime();
+        assertThat(activity)
+                .isEqualTo(
+                        live.stream()
+                                .mapToLong(e -> e.file().creationTimeEpochMillis())
+                                .max()
+                                .getAsLong());
+        Clock eligible =
+                Clock.fixed(
+                        Instant.ofEpochMilli(activity + Duration.ofDays(1).toMillis()),
+                        ZoneOffset.UTC);
+        assertThat(
+                        new PartitionArchiver(
+                                        candidate,
+                                        root.toString(),
+                                        catalog,
+                                        PartitionArchiver.DEFAULT_PARTITION_IDLE_TIME,
+                                        eligible)
+                                .archive("pt=cold")
+                                .get(0))
+                .contains("state=ARCHIVED");
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = {-1L, Long.MAX_VALUE})
+    void rejectsNegativeOrOverflowingIdleTime(long seconds) throws Exception {
+        assertThatThrownBy(
+                        () ->
+                                new PartitionArchiver(
+                                        table,
+                                        cold.toString(),
+                                        catalog,
+                                        Duration.ofSeconds(seconds)))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThat(io.exists(cold)).isFalse();
+        assertThat(table.tagManager().allTagNames()).isEmpty();
+    }
+
+    @Test
+    void laterWriteMakesArchivedPartitionActiveAgain() throws Exception {
+        assertThat(archive().get(0)).contains("state=ARCHIVED");
+        write(2);
+        long before = table.snapshotManager().latestSnapshot().id();
+        assertThat(new PartitionArchiver(table, cold.toString(), catalog).archive("pt=cold").get(0))
+                .contains("PARTITION_ACTIVE");
+        assertThat(table.snapshotManager().latestSnapshot().id()).isEqualTo(before);
+        assertThat(table.tagManager().allTagNames()).isEmpty();
+    }
+
     private List<String> archive() {
-        return new PartitionArchiver(table, cold.toString(), catalog).archive("pt=cold");
+        return new PartitionArchiver(table, cold.toString(), catalog, Duration.ZERO)
+                .archive("pt=cold");
     }
 
     private void write(int id) throws Exception {
@@ -364,10 +706,33 @@ class PartitionArchiverTest {
         boolean blockSnapshotReads;
         Runnable afterColdClose;
         Runnable beforeArchivePublication;
+        Runnable afterArchivePublication;
+        boolean removePinAtTagListing;
+        int removePinAtRead;
+
+        @Override
+        public org.apache.paimon.fs.FileStatus[] listStatus(Path path) throws IOException {
+            org.apache.paimon.fs.FileStatus[] files = super.listStatus(path);
+            if (removePinAtTagListing && path.getName().equals("tag")) {
+                for (org.apache.paimon.fs.FileStatus file : files) {
+                    if (file.getPath().getName().startsWith("tag-archive-partitions-")) {
+                        removePinAtTagListing = false;
+                        super.delete(file.getPath(), false);
+                        return super.listStatus(path);
+                    }
+                }
+            }
+            return files;
+        }
 
         @Override
         public org.apache.paimon.fs.SeekableInputStream newInputStream(Path path)
                 throws IOException {
+            if (removePinAtRead > 0 && path.getName().startsWith("tag-archive-partitions-")) {
+                if (--removePinAtRead == 0) {
+                    super.delete(path, false);
+                }
+            }
             if (failTagReads && path.toString().contains("/tag/")) {
                 throw new IOException("Injected tag read failure");
             }
@@ -385,6 +750,13 @@ class PartitionArchiverTest {
                 action.run();
             }
             boolean written = super.tryToWriteAtomic(path, content);
+            if (written
+                    && afterArchivePublication != null
+                    && content.contains("archive_partitions-")) {
+                Runnable action = afterArchivePublication;
+                afterArchivePublication = null;
+                action.run();
+            }
             if (written && hidePublishedReads && path.toString().contains("/snapshot/snapshot-")) {
                 blockSnapshotReads = true;
                 throw new IOException("Injected uncertain publication");

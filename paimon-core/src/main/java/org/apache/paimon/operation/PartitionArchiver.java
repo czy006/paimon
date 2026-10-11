@@ -33,6 +33,7 @@ import org.apache.paimon.io.DataFilePathFactory;
 import org.apache.paimon.io.DataIncrement;
 import org.apache.paimon.manifest.ManifestCommittable;
 import org.apache.paimon.manifest.ManifestEntry;
+import org.apache.paimon.manifest.PartitionEntry;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.sink.CommitMessageImpl;
 import org.apache.paimon.table.source.ScanMode;
@@ -41,6 +42,8 @@ import org.apache.paimon.utils.InternalRowPartitionComputer;
 import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.time.Clock;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
@@ -64,17 +67,50 @@ import static org.apache.paimon.utils.Preconditions.checkArgument;
  */
 public final class PartitionArchiver {
 
+    public static final Duration DEFAULT_PARTITION_IDLE_TIME = Duration.ofDays(1);
+
     private final FileStoreTable table;
     private final Catalog catalog;
     private final Path target;
     private final Identifier owner;
     private final String tableUuid;
+    private final Duration partitionIdleTime;
+    private final Clock clock;
     private final Map<Snapshot, Long> validatedHistory = new LinkedHashMap<>();
     private final String operation = UUID.randomUUID().toString();
     private final String commitUser = "archive_partitions-" + operation;
     private boolean invoked;
 
     public PartitionArchiver(FileStoreTable table, String targetPath, Catalog catalog) {
+        this(table, targetPath, catalog, DEFAULT_PARTITION_IDLE_TIME);
+    }
+
+    public PartitionArchiver(
+            FileStoreTable table, String targetPath, Catalog catalog, Duration partitionIdleTime) {
+        this(table, targetPath, catalog, partitionIdleTime, Clock.systemUTC());
+    }
+
+    PartitionArchiver(
+            FileStoreTable table,
+            String targetPath,
+            Catalog catalog,
+            Duration partitionIdleTime,
+            Clock clock) {
+        checkArgument(
+                partitionIdleTime != null && !partitionIdleTime.isNegative(),
+                "partition_idle_time must be non-negative");
+        try {
+            checkArgument(
+                    partitionIdleTime.isZero() || partitionIdleTime.toMillis() > 0,
+                    "partition_idle_time must be zero or at least one millisecond");
+        } catch (ArithmeticException tooLarge) {
+            throw new IllegalArgumentException("partition_idle_time is too large", tooLarge);
+        }
+        this.partitionIdleTime = partitionIdleTime;
+        this.clock = java.util.Objects.requireNonNull(clock, "clock");
+        checkArgument(
+                !catalog.supportsVersionManagement(),
+                "archive_partitions currently requires filesystem-managed snapshots");
         this.table = table;
         this.target = ArchivePath.parseRoot(targetPath);
         this.catalog = catalog;
@@ -116,6 +152,7 @@ public final class PartitionArchiver {
         boolean commitAttempted = false;
         boolean revalidating = false;
         Snapshot source = null;
+        ArchiveProtection protection = null;
         List<Mapping> mappings = Collections.emptyList();
         List<ManifestEntry> original = Collections.emptyList();
         FileStoreTable current = freshTable();
@@ -129,6 +166,30 @@ public final class PartitionArchiver {
             if (original.isEmpty()) {
                 return new Outcome("state=FAILED code=PARTITION_NOT_FOUND", false);
             }
+            // Match compact's manifest-derived activity, not directory/object modification times.
+            // Creation times survive byte-copy reference replacements.
+            if (!partitionIdleTime.isZero()) {
+                List<PartitionEntry> entries =
+                        current.store()
+                                .newScan()
+                                .withSnapshot(source)
+                                .withKind(ScanMode.ALL)
+                                .withPartitionFilter(Collections.singletonList(partition))
+                                .readPartitionEntries();
+                checkArgument(
+                        entries.size() == 1, "Unable to determine archive partition activity");
+                long lastActivity = entries.get(0).lastFileCreationTime();
+                long cutoff = clock.instant().minus(partitionIdleTime).toEpochMilli();
+                if (lastActivity > cutoff) {
+                    return new Outcome(
+                            "state=NOOP code=PARTITION_ACTIVE last_file_creation_time="
+                                    + lastActivity
+                                    + " idle_cutoff="
+                                    + cutoff
+                                    + " data_files=0 extra_files=0",
+                            false);
+                }
+            }
             mappings = plan(current, original);
             if (mappings.isEmpty()) {
                 return new Outcome(
@@ -139,6 +200,7 @@ public final class PartitionArchiver {
             checkArgument(
                     current.tagManager().getOrThrow(pin).id() == source.id(),
                     "Unable to confirm archive source pin");
+            protection = ArchiveProtection.capture(current, pin, source);
             for (Mapping mapping : mappings) {
                 ArchiveFileCopier.copyAndVerify(
                         current.fileIO(),
@@ -155,7 +217,8 @@ public final class PartitionArchiver {
             ArchiveSafety.validate(beforeCommit, target, validatedHistory);
             ArchiveSafety.validateOwnership(catalog, beforeCommit, target);
             Snapshot latest = beforeCommit.snapshotManager().latestSnapshot();
-            if (!sameSchema(current, beforeCommit)
+            if (!protection.unchanged(beforeCommit)
+                    || !sameSchema(current, beforeCommit)
                     || latest == null
                     || !sameFiles(original, scan(beforeCommit, latest, partition))) {
                 return new Outcome(
@@ -177,8 +240,18 @@ public final class PartitionArchiver {
                 commit.commit(committable, false);
             }
             Outcome confirmed =
-                    confirm(current, partition, mappings, original, source, identifier, pin);
-            return confirmed.stop ? confirmed : releasePin(current, pin, confirmed);
+                    confirm(
+                            current,
+                            partition,
+                            mappings,
+                            original,
+                            source,
+                            identifier,
+                            pin,
+                            protection);
+            return confirmed.stop
+                    ? confirmed
+                    : releasePin(current, pin, source, protection, confirmed);
         } catch (Exception failure) {
             if (commitAttempted) {
                 try {
@@ -190,8 +263,14 @@ public final class PartitionArchiver {
                                     original,
                                     source,
                                     identifier,
-                                    pin);
-                    return confirmed.stop ? confirmed : releasePin(current, pin, confirmed);
+                                    pin,
+                                    protection);
+                    if (confirmed.committedSnapshot == null && isPrePublicationConflict(failure)) {
+                        return maintenanceViolation(pin);
+                    }
+                    return confirmed.stop
+                            ? confirmed
+                            : releasePin(current, pin, source, protection, confirmed);
                 } catch (Exception confirmationFailure) {
                     return unknown(source, pin);
                 }
@@ -205,12 +284,21 @@ public final class PartitionArchiver {
                                 + " recovery_required=true",
                         true);
             }
+            if (pinAttempted && protection == null) {
+                return new Outcome(
+                        "state=FAILED code=SOURCE_PROTECTION_UNCONFIRMED operation="
+                                + operation
+                                + " pin_name="
+                                + pin
+                                + " recovery_required=true",
+                        true);
+            }
             Outcome failed =
                     new Outcome(
                             "state=FAILED code=COPY_OR_VALIDATION_FAILED operation=" + operation,
                             false);
             // Keep failed fresh objects for coordinated orphan cleanup; never delete source data.
-            return pinAttempted ? releasePin(current, pin, failed) : failed;
+            return pinAttempted ? releasePin(current, pin, source, protection, failed) : failed;
         }
     }
 
@@ -221,7 +309,8 @@ public final class PartitionArchiver {
             List<ManifestEntry> original,
             Snapshot source,
             long identifier,
-            String pin)
+            String pin,
+            ArchiveProtection protection)
             throws IOException {
         FileStoreTable current = freshTable();
         Snapshot latest = current.snapshotManager().latestSnapshot();
@@ -249,22 +338,20 @@ public final class PartitionArchiver {
             expected.add(mapping.afterEntry());
         }
         List<ManifestEntry> publishedFiles = scan(current, published, partition);
-        if (!publishedFiles.containsAll(expected)) {
+        List<ManifestEntry> copied = new ArrayList<>();
+        for (Mapping mapping : mappings) {
+            copied.add(mapping.afterEntry());
+        }
+        if (!publishedFiles.containsAll(copied)) {
             return unknown(source, pin);
         }
         List<ManifestEntry> live = scan(current, latest, partition);
         if (!sameFiles(expected, publishedFiles)
                 || !sameFiles(expected, live)
-                || !sameSchema(plannedTable, current)) {
-            return new Outcome(
-                    "state=INCOMPLETE operation="
-                            + operation
-                            + " committed_snapshot="
-                            + published.id()
-                            + " pin_name="
-                            + pin
-                            + " maintenance_violation=true recovery_required=true",
-                    true);
+                || !sameSchema(plannedTable, current)
+                || protection == null
+                || !protectionUnchanged(protection, current)) {
+            return incomplete(published.id(), pin);
         }
         for (ManifestEntry entry : live) {
             checkReference(current, entry);
@@ -296,7 +383,8 @@ public final class PartitionArchiver {
                         + extraBytes
                         + " skipped="
                         + (original.size() - mappings.size()),
-                false);
+                false,
+                published.id());
     }
 
     private Outcome unknown(Snapshot source, String pin) {
@@ -311,15 +399,36 @@ public final class PartitionArchiver {
                 true);
     }
 
-    private Outcome releasePin(FileStoreTable current, String pin, Outcome outcome) {
+    private Outcome releasePin(
+            FileStoreTable current,
+            String pin,
+            Snapshot source,
+            ArchiveProtection protection,
+            Outcome outcome) {
+        if (protection != null && !protectionUnchanged(protection, current)) {
+            return outcome.committedSnapshot == null
+                    ? maintenanceViolation(pin)
+                    : incomplete(outcome.committedSnapshot, pin);
+        }
+        boolean deletionAttempted = false;
         try {
-            if (current.tagManager().tagExists(pin)) {
-                current.deleteTag(pin);
+            if (!current.tagManager().tagExists(pin)
+                    || !ArchiveProtection.pinMatches(current, pin, source)) {
+                return outcome.committedSnapshot == null
+                        ? maintenanceViolation(pin)
+                        : incomplete(outcome.committedSnapshot, pin);
             }
+            deletionAttempted = true;
+            current.deleteTag(pin);
             if (!current.tagManager().tagExists(pin)) {
                 return outcome;
             }
         } catch (Exception ignored) {
+            if (!deletionAttempted) {
+                return outcome.committedSnapshot == null
+                        ? maintenanceViolation(pin)
+                        : incomplete(outcome.committedSnapshot, pin);
+            }
             // A failed response may follow a successful delete. Do not overwrite publication state.
             try {
                 if (!current.tagManager().tagExists(pin)) {
@@ -330,7 +439,56 @@ public final class PartitionArchiver {
             }
         }
         return new Outcome(
-                outcome.text + " pin_name=" + pin + " cleanup_required=true", outcome.stop);
+                outcome.text + " pin_name=" + pin + " cleanup_required=true",
+                outcome.stop,
+                outcome.committedSnapshot);
+    }
+
+    private static boolean protectionUnchanged(ArchiveProtection protection, FileStoreTable table) {
+        try {
+            return protection != null && protection.unchanged(table);
+        } catch (Exception unavailable) {
+            // Publication may be proven even when protection cannot be verified. Preserve its
+            // identity and stop recovery; a failed protection read is not a successful pin delete.
+            return false;
+        }
+    }
+
+    private Outcome maintenanceViolation(String pin) {
+        return new Outcome(
+                "state=FAILED code=MAINTENANCE_VIOLATION operation="
+                        + operation
+                        + " pin_name="
+                        + pin
+                        + " recovery_required=true",
+                true);
+    }
+
+    private Outcome incomplete(long snapshot, String pin) {
+        return new Outcome(
+                "state=INCOMPLETE operation="
+                        + operation
+                        + " committed_snapshot="
+                        + snapshot
+                        + " pin_name="
+                        + pin
+                        + " maintenance_violation=true recovery_required=true",
+                true,
+                snapshot);
+    }
+
+    private static boolean isPrePublicationConflict(Exception failure) {
+        // Release 1.3.2 has no typed file-conflict exception. Require both the native origin and
+        // its fixed conflict prefix; never classify arbitrary FileIO exception text as evidence.
+        StackTraceElement[] trace = failure.getStackTrace();
+        String message = failure.getMessage();
+        return failure.getClass() == RuntimeException.class
+                && trace.length > 0
+                && trace[0].getClassName().equals(FileStoreCommitImpl.class.getName())
+                && trace[0].getMethodName().equals("createConflictException")
+                && message != null
+                && (message.startsWith("File deletion conflicts detected!")
+                        || message.startsWith("LSM conflicts detected!"));
     }
 
     private List<Mapping> plan(FileStoreTable current, List<ManifestEntry> files)
@@ -579,10 +737,16 @@ public final class PartitionArchiver {
     private static class Outcome {
         final String text;
         final boolean stop;
+        final Long committedSnapshot;
 
         Outcome(String text, boolean stop) {
+            this(text, stop, null);
+        }
+
+        Outcome(String text, boolean stop, Long committedSnapshot) {
             this.text = text;
             this.stop = stop;
+            this.committedSnapshot = committedSnapshot;
         }
     }
 
