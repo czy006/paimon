@@ -27,8 +27,8 @@ The [REST Catalog OpenAPI specification](/rest-catalog-open-api.yaml) defines th
 wire contract for catalog servers and clients. Open the YAML specification to inspect request and
 response schemas, generate SDK models, or validate an implementation.
 
-For client configuration, start with the [REST Catalog overview](./). For privilege grants, row
-filters, and column masks, use the separate [REST Management API](./management-api).
+For client configuration, start with the [REST Catalog overview](./). For entity labels, privilege
+grants, row filters, and column masks, use the separate [REST Management API](./management-api).
 
 ## Connect to a Catalog
 
@@ -73,3 +73,22 @@ dropped, no data is deleted, and the request needs `replaceStatistics=true` with
 `partitionStatistics` entry for the same spec. Any other path under the table location stays
 invalid, so a server that does not implement this rejects the request rather than storing it. A
 server also rejects additive statistics for a partition that already has a custom location.
+
+Format Table partitions can also override the table format with `file.format`, for example
+`"partitionOptions": [{"file.format": "orc"}]`. An explicit format updates an existing partition
+even with `ignoreIfExists=true`, preserving other options. Omitting it preserves the stored
+override; a partition without an override inherits the table format, defaulting to `parquet`.
+An empty or unsupported format is rejected. The server and all readers and writers must support
+partition formats before mixed-format partitions are used.
+
+An additive statistics request that explicitly supplies a different format from the existing
+partition's effective format is rejected. Replacement statistics (`replaceStatistics=true`) can
+update the format and statistics together. Each request batch is atomic for catalog metadata;
+multiple batches and filesystem writes are not one transaction. See the
+[Format Table write and recovery boundaries](../../spark/format-table.md#partition-file-formats).
+
+## Semantic views
+
+See [Semantic Views](semantic-views.md) for experimental definition management, complete-document
+POST upserts, and pagination. These use dedicated catalog routes and preserve the
+existing SQL View contract.

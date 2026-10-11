@@ -26,7 +26,7 @@ from pypaimon.catalog.catalog_exception import (DatabaseAlreadyExistException,
                                                 TableNotExistException)
 from pypaimon.common.options import Options
 from pypaimon.common.options.config import OssOptions
-from pypaimon.filesystem.pyarrow_file_io import PyArrowFileIO
+from pypaimon.filesystem.oss_file_io import OssFileIO
 from pypaimon.tests.py36.pyarrow_compat import table_sort_by
 from pypaimon.tests.rest.rest_base_test import RESTBaseTest
 
@@ -404,19 +404,19 @@ class AOSimpleTest(RESTBaseTest):
 
         with patch("pypaimon.common.file_io.pyarrow.__version__", "6.0.0"), \
                 patch("pyarrow.fs.S3FileSystem") as mock_s3fs:
-            PyArrowFileIO("oss://oss-bucket/paimon-database/paimon-table", Options(props))
+            OssFileIO("oss://oss-bucket/paimon-database/paimon-table", Options(props))
             mock_s3fs.assert_called_once_with(access_key="AKID",
                                               secret_key="SECRET",
                                               session_token="TOKEN",
                                               region="cn-hangzhou",
                                               endpoint_override="oss-bucket." + props[OssOptions.OSS_ENDPOINT.key()])
-            PyArrowFileIO("oss://oss-bucket.endpoint/paimon-database/paimon-table", Options(props))
+            OssFileIO("oss://oss-bucket.endpoint/paimon-database/paimon-table", Options(props))
             mock_s3fs.assert_called_with(access_key="AKID",
                                          secret_key="SECRET",
                                          session_token="TOKEN",
                                          region="cn-hangzhou",
                                          endpoint_override="oss-bucket." + props[OssOptions.OSS_ENDPOINT.key()])
-            PyArrowFileIO("oss://access_id:secret_key@Endpoint/oss-bucket/paimon-database/paimon-table", Options(props))
+            OssFileIO("oss://access_id:secret_key@Endpoint/oss-bucket/paimon-database/paimon-table", Options(props))
             mock_s3fs.assert_called_with(access_key="AKID",
                                          secret_key="SECRET",
                                          session_token="TOKEN",
@@ -440,7 +440,7 @@ class AOSimpleTest(RESTBaseTest):
         }
         pa_table = pa.Table.from_pydict(data1, schema=self.pa_schema)
         table_write.write_arrow(pa_table)
-        table_write.prepare_commit(0)
+        cm = table_write.prepare_commit(0)
         # write 2
         data2 = {
             'user_id': [5, 6, 7, 8],
@@ -450,7 +450,7 @@ class AOSimpleTest(RESTBaseTest):
         }
         pa_table = pa.Table.from_pydict(data2, schema=self.pa_schema)
         table_write.write_arrow(pa_table)
-        table_write.prepare_commit(1)
+        cm.extend(table_write.prepare_commit(1))
         # write 3
         data3 = {
             'user_id': [9, 10],
@@ -460,7 +460,7 @@ class AOSimpleTest(RESTBaseTest):
         }
         pa_table = pa.Table.from_pydict(data3, schema=self.pa_schema)
         table_write.write_arrow(pa_table)
-        cm = table_write.prepare_commit(2)
+        cm.extend(table_write.prepare_commit(2))
         # commit
         table_commit.commit(cm, 2)
         table_write.close()

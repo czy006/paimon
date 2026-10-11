@@ -158,6 +158,10 @@ class CoreOptions:
     NESTED_SEQUENCE_FIELD = "nested-sequence-field"
     COUNT_LIMIT = "count-limit"
     MERGE_MAP_TS_FIELD = "ts-field"
+    MAP_STORAGE_LAYOUT = "map.storage-layout"
+    MAP_SHARED_SHREDDING_MAX_COLUMNS = "map.shared-shredding.max-columns"
+    MAP_SHARED_SHREDDING_COLUMN_PLACEMENT_POLICY = \
+        "map.shared-shredding.column-placement-policy"
 
     # Basic options
     AUTO_CREATE: ConfigOption[bool] = (
@@ -236,7 +240,8 @@ class CoreOptions:
         .int_type()
         .default_value(-1)
         .with_description(
-            "In dynamic bucket mode, max buckets per partition. -1 means unlimited."
+            "In dynamic bucket mode, max buckets per partition. It must be -1 "
+            "or between 1 and 32768."
         )
     )
 
@@ -256,6 +261,16 @@ class CoreOptions:
         .default_value(2048)
         .with_description(
             "Maximum bucket number inferred for a postpone batch write."
+        )
+    )
+
+    POSTPONE_DEFAULT_BUCKET_NUM: ConfigOption[int] = (
+        ConfigOptions.key("postpone.default-bucket-num")
+        .int_type()
+        .no_default_value()
+        .with_description(
+            "Exact bucket count for new postpone partitions and overwrite writes. "
+            "Takes precedence over automatic bucket estimation."
         )
     )
 
@@ -280,21 +295,25 @@ class CoreOptions:
         )
     )
 
-    WRITE_ONLY: ConfigOption[bool] = (
-        ConfigOptions.key("write-only")
-        .boolean_type()
-        .default_value(False)
-        .with_description(
-            "Whether to use write-only mode. Automatic manifest merging is skipped "
-            "when both this option and manifest.merge.skip-on-write-only are true."
-        )
-    )
-
     SCAN_MANIFEST_PARALLELISM: ConfigOption[int] = (
         ConfigOptions.key("scan.manifest.parallelism")
         .int_type()
         .default_value(16)
         .with_description("The parallelism for scanning manifest files.")
+    )
+
+    MANIFEST_SIDECAR_ENABLED: ConfigOption[bool] = (
+        ConfigOptions.key("manifest.sidecar.enabled")
+        .boolean_type()
+        .no_default_value()
+        .with_description("Enable sidecar pruning on reads. Defaults to manifest-sort.enabled when unset.")
+    )
+
+    MANIFEST_SORT_ENABLED: ConfigOption[bool] = (
+        ConfigOptions.key("manifest-sort.enabled")
+        .boolean_type()
+        .default_value(False)
+        .with_description("Manifest sort setting. Also supplies the default for manifest sidecar reads.")
     )
 
     MANIFEST_COMPRESSION: ConfigOption[str] = (
@@ -311,27 +330,18 @@ class CoreOptions:
         .with_description("Suggested file size of a manifest file.")
     )
 
-    MANIFEST_MERGE_SKIP_ON_WRITE_ONLY: ConfigOption[bool] = (
-        ConfigOptions.key("manifest.merge.skip-on-write-only")
-        .boolean_type()
-        .default_value(False)
-        .with_description(
-            "Whether to skip automatic manifest merging during commit when write-only is true. "
-            "Python only supports minor manifest compaction, without manifest sort rewrite."
-        )
-    )
-
-    MANIFEST_MERGE_MIN_COUNT: ConfigOption[int] = (
-        ConfigOptions.key("manifest.merge-min-count")
-        .int_type()
-        .default_value(30)
-        .with_description(
-            "To avoid frequent manifest merges, this parameter specifies the minimum number "
-            "of ManifestFileMeta to merge."
-        )
-    )
-
     # File format options
+    PARQUET_WRITE_PAGE_INDEX_ENABLED: ConfigOption[bool] = (
+        ConfigOptions.key("parquet.write-page-index.enabled")
+        .boolean_type()
+        .no_default_value()
+        .with_description(
+            "Whether Python Parquet writers write page indexes. Enabled by default on PyArrow >= 13, "
+            "disabled on older versions. Explicit true requires PyArrow >= 13. "
+            "Only affects newly written files; independent of read-side index filtering."
+        )
+    )
+
     FILE_FORMAT: ConfigOption[str] = (
         ConfigOptions.key("file.format")
         .string_type()
@@ -520,6 +530,13 @@ class CoreOptions:
         .default_value("data-")
         .with_description("Specify the file name prefix of data files.")
     )
+
+    DATA_FILE_PATH_DIRECTORY: ConfigOption[str] = (
+        ConfigOptions.key("data-file.path-directory")
+        .string_type()
+        .no_default_value()
+        .with_description("Specify the path directory of data files.")
+    )
     # Scan options
     SCAN_MODE: ConfigOption[StartupMode] = (
         ConfigOptions.key("scan.mode")
@@ -555,6 +572,13 @@ class CoreOptions:
         .string_type()
         .no_default_value()
         .with_description("Optional tag name used in case of 'from-snapshot' scan mode.")
+    )
+
+    SCAN_VERSION: ConfigOption[str] = (
+        ConfigOptions.key("scan.version")
+        .string_type()
+        .no_default_value()
+        .with_description("Time-travel version: tag name, watermark-<value>, or snapshot id; tags take precedence.")
     )
 
     SCAN_SNAPSHOT_ID: ConfigOption[int] = (
@@ -638,6 +662,13 @@ class CoreOptions:
         .with_description("Whether to enable deletion vectors.")
     )
 
+    DELETION_VECTORS_MERGE_ON_READ: ConfigOption[bool] = (
+        ConfigOptions.key("deletion-vectors.merge-on-read")
+        .boolean_type()
+        .default_value(False)
+        .with_description("Whether batch reads merge level-0 files when deletion vectors are enabled.")
+    )
+
     INDEX_FILE_IN_DATA_FILE_DIR: ConfigOption[bool] = (
         ConfigOptions.key("index-file-in-data-file-dir")
         .boolean_type()
@@ -652,6 +683,32 @@ class CoreOptions:
         .with_description("Plan splits via the native (pypaimon_rust) planner "
                           "instead of the Python manifest scanner; the pypaimon "
                           "reader still reads the files.")
+    )
+
+    READ_NATIVE_ENABLED: ConfigOption[bool] = (
+        ConfigOptions.key("read.native.enabled")
+        .boolean_type()
+        .default_value(False)
+        .with_description("Read data via pypaimon_rust and return PyArrow batches. "
+                          "This also enables native split planning; unsupported "
+                          "routes fall back to pypaimon.")
+    )
+
+    COMMIT_NATIVE_ENABLED: ConfigOption[bool] = (
+        ConfigOptions.key("commit.native.enabled")
+        .boolean_type()
+        .default_value(False)
+        .with_description("Commit append and batch overwrite messages via pypaimon_rust. Unsupported "
+                          "operations use Python before any native commit is attempted.")
+    )
+
+    WRITE_NATIVE_ENABLED: ConfigOption[bool] = (
+        ConfigOptions.key("write.native.enabled")
+        .boolean_type()
+        .default_value(False)
+        .with_description("Write Arrow data via pypaimon_rust when the table and "
+                          "writer API are supported. Unsupported routes use Python "
+                          "before any native data is written.")
     )
 
     CHANGELOG_PRODUCER: ConfigOption[ChangelogProducer] = (
@@ -707,6 +764,16 @@ class CoreOptions:
         .string_type()
         .no_default_value()
         .with_description("The prefix for commit user.")
+    )
+
+    SNAPSHOT_IGNORE_EMPTY_COMMIT: ConfigOption[bool] = (
+        ConfigOptions.key("snapshot.ignore-empty-commit")
+        .boolean_type()
+        .no_default_value()
+        .with_description(
+            "Whether to skip append commits without changes. "
+            "PyPaimon defaults to true; false allows tagging an empty table."
+        )
     )
 
     COMMIT_MAX_RETRIES: ConfigOption[int] = (
@@ -893,6 +960,15 @@ class CoreOptions:
         )
     )
 
+    GLOBAL_INDEX_FILTER_REFINE_FROM_DATA: ConfigOption[bool] = (
+        ConfigOptions.key("global-index.filter.refine-from-data")
+        .boolean_type()
+        .default_value(False)
+        .with_description(
+            "Whether vector search may read filter columns to verify candidate-only scalar index matches. "
+            "When false, inexact index candidates are excluded from the search.")
+    )
+
     GLOBAL_INDEX_THREAD_NUM: ConfigOption[int] = (
         ConfigOptions.key("global-index.thread-num")
         .int_type()
@@ -908,6 +984,17 @@ class CoreOptions:
         .long_type()
         .default_value(100000)
         .with_description("Row count per shard for global index.")
+    )
+
+    GLOBAL_INDEX_BUILD_PARALLELISM: ConfigOption[int] = (
+        ConfigOptions.key("global-index.build.parallelism")
+        .int_type()
+        .default_value(1)
+        .with_description(
+            "Number of global index shards built concurrently by the local "
+            "builder, including native builds. Each shard may also use native worker threads, "
+            "so increase this value conservatively."
+        )
     )
 
     PK_VECTOR_INDEX_COLUMNS: ConfigOption[str] = (
@@ -965,10 +1052,19 @@ class CoreOptions:
         .with_description("The block size to use for BTree global indexes.")
     )
 
-    SORTED_INDEX_RECORDS_PER_RANGE: ConfigOption[int] = (
-        ConfigOptions.key("sorted-index.records-per-range")
+    BTREE_INDEX_BLOOM_FILTER_ENABLED: ConfigOption[bool] = (
+        ConfigOptions.key("btree-index.bloom-filter.enabled")
+        .boolean_type()
+        .default_value(False)
+        .with_description(
+            "Whether to enable the Bloom filter for BTree index point lookups."
+        )
+    )
+
+    SORTED_INDEX_RECORDS_PER_FILE: ConfigOption[int] = (
+        ConfigOptions.key("sorted-index.records-per-file")
         .long_type()
-        .default_value(10_000_000)
+        .default_value(25_000_000)
         .with_description("The expected number of records per sorted global index file.")
     )
 
@@ -1055,7 +1151,8 @@ class CoreOptions:
         .default_value("meta,global-index")
         .with_description(
             "Comma-separated list of file types to cache. "
-            "Supported values: meta, global-index, bucket-index, data, file-index."
+            "Supported values: meta, global-index, bucket-index, data, file-index, "
+            "or * for all of them."
         )
     )
 
@@ -1064,6 +1161,28 @@ class CoreOptions:
         .int_type()
         .default_value(1024)
         .with_description("Read batch size for any file format if it supports.")
+    )
+
+    READ_VIDEO_MAX_OPEN_DECODERS: ConfigOption[int] = (
+        ConfigOptions.key("read.video.max-open-decoders")
+        .int_type()
+        .default_value(16)
+        .with_description(
+            "Maximum cached video decoders per video feature in a PyPaimon "
+            "LeRobot DataLoader worker.")
+    )
+
+    PARQUET_COLUMN_INDEX_ENABLED: ConfigOption[bool] = (
+        ConfigOptions.key("parquet.filter.columnindex.enabled")
+        .boolean_type()
+        .default_value(True)
+        .with_description(
+            "Enable Parquet page-index pruning. PyPaimon currently uses OffsetIndex "
+            "metadata for contiguous row windows. "
+            "Requires existing offset indexes; nested fields use common leaf row boundaries. "
+            "Unsupported or expensive selections use the ordinary reader. "
+            "Does not enable ColumnIndex predicate filtering."
+        )
     )
 
     READ_PARALLELISM: ConfigOption[int] = (
@@ -1086,18 +1205,6 @@ class CoreOptions:
         .with_description(
             "When adding a new column, if the table has partition keys, "
             "insert the new column before the first partition column by default."
-        )
-    )
-
-    VARIANT_SHREDDING_ENABLED: ConfigOption[bool] = (
-        ConfigOptions.key("variant.shredding.enabled")
-        .boolean_type()
-        .default_value(True)
-        .with_description(
-            "Whether to enable VARIANT shredding. When True (default), writes apply the "
-            "shredding schema configured via 'variant.shreddingSchema', and reads "
-            "automatically reassemble shredded columns back to the standard "
-            "struct<value, metadata> form. Set to False to bypass both behaviours."
         )
     )
 
@@ -1208,6 +1315,12 @@ class CoreOptions:
             default,
         )
 
+    def postpone_default_bucket_num(self):
+        value = self.options.get(CoreOptions.POSTPONE_DEFAULT_BUCKET_NUM)
+        if value is not None and not 0 < value <= 2147483647:
+            raise ValueError('postpone.default-bucket-num must be a positive 32-bit integer')
+        return value
+
     def postpone_target_row_num_per_bucket(self, default=None):
         return self.options.get(
             CoreOptions.POSTPONE_TARGET_ROW_NUM_PER_BUCKET, default
@@ -1224,9 +1337,6 @@ class CoreOptions:
             CoreOptions.POSTPONE_TARGET_SIZE_PER_BUCKET, default
         ).get_bytes()
 
-    def write_only(self, default=None):
-        return self.options.get(CoreOptions.WRITE_ONLY, default)
-
     def scan_manifest_parallelism(self, default=None):
         return self.options.get(CoreOptions.SCAN_MANIFEST_PARALLELISM, default)
 
@@ -1238,14 +1348,18 @@ class CoreOptions:
             default = MemorySize.of_bytes(default) if isinstance(default, int) else MemorySize.parse(default)
         return self.options.get(CoreOptions.MANIFEST_TARGET_FILE_SIZE, default).get_bytes()
 
-    def manifest_merge_skip_on_write_only(self, default=None):
-        return self.options.get(CoreOptions.MANIFEST_MERGE_SKIP_ON_WRITE_ONLY, default)
+    def manifest_sidecar_enabled(self):
+        enabled = self.options.get(CoreOptions.MANIFEST_SIDECAR_ENABLED)
+        return self.manifest_sort_enabled() if enabled is None else enabled
 
-    def manifest_merge_min_count(self, default=None):
-        return self.options.get(CoreOptions.MANIFEST_MERGE_MIN_COUNT, default)
+    def manifest_sort_enabled(self):
+        return self.options.get(CoreOptions.MANIFEST_SORT_ENABLED)
 
     def file_format(self, default=None):
         return self.options.get(CoreOptions.FILE_FORMAT, default)
+
+    def parquet_write_page_index_enabled(self) -> Optional[bool]:
+        return self.options.get(CoreOptions.PARQUET_WRITE_PAGE_INDEX_ENABLED)
 
     def file_compression(self, default=None):
         return self.options.get(CoreOptions.FILE_COMPRESSION, default)
@@ -1281,9 +1395,6 @@ class CoreOptions:
     def blob_as_descriptor(self, default=None):
         return self.options.get(CoreOptions.BLOB_AS_DESCRIPTOR, default)
 
-    def variant_shredding_enabled(self) -> bool:
-        return self.options.get(CoreOptions.VARIANT_SHREDDING_ENABLED, True)
-
     def variant_shredding_schema(self) -> Optional[str]:
         val = self.options.get(CoreOptions.VARIANT_SHREDDING_SCHEMA)
         if val is None:
@@ -1292,15 +1403,11 @@ class CoreOptions:
         return val
 
     def blob_descriptor_fields(self, default=None):
-        # Do not treat blob.stored-descriptor-fields as a layout switch.
-        # Python master ignored that key and wrote dedicated .blob payloads;
-        # a global fallback would mis-parse those files during a rolling
-        # upgrade. The cost is that Java tables which only set the fallback
-        # key store inline descriptors, and Python returns those bytes
-        # instead of fetching payload. Migrate explicitly to
-        # blob-descriptor-field (column directives already copy the legacy
-        # key onto the canonical option).
-        value = self.options.get(CoreOptions.BLOB_DESCRIPTOR_FIELD, default)
+        # Java's fallback key applies only when the canonical key is absent.
+        if self.options.contains_key(CoreOptions.BLOB_DESCRIPTOR_FIELD.key()):
+            value = self.options.get(CoreOptions.BLOB_DESCRIPTOR_FIELD, default)
+        else:
+            value = self.options.to_map().get('blob.stored-descriptor-fields', default)
         return CoreOptions._parse_field_set(value)
 
     def blob_view_fields(self, default=None):
@@ -1386,6 +1493,9 @@ class CoreOptions:
     def data_file_prefix(self, default=None):
         return self.options.get(CoreOptions.DATA_FILE_PREFIX, default)
 
+    def data_file_path_directory(self, default=None):
+        return self.options.get(CoreOptions.DATA_FILE_PATH_DIRECTORY, default)
+
     def scan_mode(self, default=None):
         return self.options.get(CoreOptions.SCAN_MODE, default)
 
@@ -1402,7 +1512,8 @@ class CoreOptions:
                 return StartupMode.FROM_TIMESTAMP
             elif (self.options.contains(CoreOptions.SCAN_SNAPSHOT_ID)
                   or self.options.contains(CoreOptions.SCAN_TAG_NAME)
-                  or self.options.contains(CoreOptions.SCAN_WATERMARK)):
+                  or self.options.contains(CoreOptions.SCAN_WATERMARK)
+                  or self.options.contains(CoreOptions.SCAN_VERSION)):
                 return StartupMode.FROM_SNAPSHOT
             elif self.options.contains(CoreOptions.INCREMENTAL_BETWEEN_TIMESTAMP):
                 return StartupMode.INCREMENTAL
@@ -1500,11 +1611,26 @@ class CoreOptions:
     def deletion_vectors_enabled(self, default=None):
         return self.options.get(CoreOptions.DELETION_VECTORS_ENABLED, default)
 
+    def batch_scan_skip_level0(self):
+        """Match Java CoreOptions.batchScanSkipLevel0."""
+        if self.deletion_vectors_enabled():
+            return not self.options.get(CoreOptions.DELETION_VECTORS_MERGE_ON_READ)
+        return self.merge_engine() == MergeEngine.FIRST_ROW
+
     def index_file_in_data_file_dir(self, default=None):
         return self.options.get(CoreOptions.INDEX_FILE_IN_DATA_FILE_DIR, default)
 
     def native_plan_enabled(self, default=None):
         return self.options.get(CoreOptions.SCAN_NATIVE_PLAN_ENABLED, default)
+
+    def native_read_enabled(self, default=None):
+        return self.options.get(CoreOptions.READ_NATIVE_ENABLED, default)
+
+    def native_commit_enabled(self, default=None):
+        return self.options.get(CoreOptions.COMMIT_NATIVE_ENABLED, default)
+
+    def native_write_enabled(self, default=None):
+        return self.options.get(CoreOptions.WRITE_NATIVE_ENABLED, default)
 
     def changelog_producer(self, default=None):
         return self.options.get(CoreOptions.CHANGELOG_PRODUCER, default)
@@ -1573,16 +1699,19 @@ class CoreOptions:
         )
         if value is None:
             return None
-        parts = value.split(",")
+        parts = value.rstrip(",").split(",")
         weights = []
         for part in parts:
             parsed = int(part.strip())
-            if parsed <= 0:
+            if parsed <= 0 or parsed > 2147483647:
                 raise ValueError(
-                    f"Weight must be positive, got: {parsed}"
+                    f"Weight must be a positive 32-bit integer, got: {parsed}"
                 )
             weights.append(parsed)
         return weights
+
+    def snapshot_ignore_empty_commit(self) -> bool:
+        return self.options.get(CoreOptions.SNAPSHOT_IGNORE_EMPTY_COMMIT, True)
 
     def commit_max_retries(self) -> int:
         return self.options.get(CoreOptions.COMMIT_MAX_RETRIES)
@@ -1636,8 +1765,14 @@ class CoreOptions:
     def global_index_thread_num(self) -> Optional[int]:
         return self.options.get(CoreOptions.GLOBAL_INDEX_THREAD_NUM)
 
+    def global_index_filter_refine_from_data(self) -> bool:
+        return self.options.get(CoreOptions.GLOBAL_INDEX_FILTER_REFINE_FROM_DATA)
+
     def global_index_row_count_per_shard(self) -> int:
         return self.options.get(CoreOptions.GLOBAL_INDEX_ROW_COUNT_PER_SHARD)
+
+    def global_index_build_parallelism(self) -> int:
+        return self.options.get(CoreOptions.GLOBAL_INDEX_BUILD_PARALLELISM)
 
     def primary_key_btree_index_columns(self) -> List[str]:
         return self._primary_key_index_columns(CoreOptions.PK_BTREE_INDEX_COLUMNS)
@@ -1701,6 +1836,7 @@ class CoreOptions:
     def _primary_key_sorted_index_options(
             self, column: str, option_family: str, algorithm_prefix: str) -> Options:
         resolved = dict(self.options.to_map())
+        resolved.pop("sorted-index.records-per-file", None)
         resolved.pop("sorted-index.records-per-range", None)
         option_key = "fields.%s.%s.index.options" % (column, option_family)
         serialized = self.options.to_map().get(option_key)
@@ -1754,10 +1890,17 @@ class CoreOptions:
     def btree_index_block_size(self) -> int:
         return self.options.get(CoreOptions.BTREE_INDEX_BLOCK_SIZE).get_bytes()
 
+    def btree_index_bloom_filter_enabled(self) -> bool:
+        return self.options.get(CoreOptions.BTREE_INDEX_BLOOM_FILTER_ENABLED)
+
     def sorted_index_records_per_range(self) -> int:
-        if self.options.contains(CoreOptions.SORTED_INDEX_RECORDS_PER_RANGE):
-            return self.options.get(CoreOptions.SORTED_INDEX_RECORDS_PER_RANGE)
-        return self.options.get(CoreOptions.BTREE_INDEX_RECORDS_PER_RANGE)
+        option = CoreOptions.SORTED_INDEX_RECORDS_PER_FILE
+        for key in (option.key(), "sorted-index.records-per-range",
+                    CoreOptions.BTREE_INDEX_RECORDS_PER_RANGE.key()):
+            value = self.options.to_map().get(key)
+            if value is not None:
+                return OptionsUtils.convert_to_long(value)
+        return option.default_value()
 
     def bitmap_index_fallback_scan_max_size(self) -> int:
         return self.options.get(
@@ -1792,6 +1935,23 @@ class CoreOptions:
 
     def read_batch_size(self, default=None) -> int:
         return self.options.get(CoreOptions.READ_BATCH_SIZE, default or 1024)
+
+    def read_video_max_open_decoders(self) -> int:
+        option = CoreOptions.READ_VIDEO_MAX_OPEN_DECODERS
+        raw = self.options.to_map().get(option.key())
+        if isinstance(raw, (bool, float)):
+            raise ValueError("%s must be a positive integer." % option.key())
+        try:
+            value = self.options.get(option)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "%s must be a positive integer." % option.key()) from error
+        if value <= 0:
+            raise ValueError("%s must be a positive integer." % option.key())
+        return value
+
+    def parquet_column_index_enabled(self) -> bool:
+        return self.options.get(CoreOptions.PARQUET_COLUMN_INDEX_ENABLED)
 
     def read_parallelism(self, default=None) -> Optional[int]:
         return self.options.get(CoreOptions.READ_PARALLELISM, default)
@@ -1872,6 +2032,46 @@ class CoreOptions:
             .string_type()
             .no_default_value()
         )
+
+    def map_storage_layout(self, field_name: str) -> str:
+        return self.options.get(
+            ConfigOptions.key(
+                f'{CoreOptions.FIELDS_PREFIX}.{field_name}.{CoreOptions.MAP_STORAGE_LAYOUT}'
+            )
+            .string_type()
+            .default_value('default')
+        ).lower()
+
+    def map_shared_shredding_max_columns(self, field_name: str) -> int:
+        value = self.options.get(
+            ConfigOptions.key(
+                f'{CoreOptions.FIELDS_PREFIX}.{field_name}.'
+                f'{CoreOptions.MAP_SHARED_SHREDDING_MAX_COLUMNS}'
+            )
+            .int_type()
+            .default_value(256)
+        )
+        if value <= 0:
+            raise ValueError(
+                '{} must be greater than 0'.format(
+                    CoreOptions.MAP_SHARED_SHREDDING_MAX_COLUMNS))
+        return value
+
+    def map_shared_shredding_column_placement_policy(
+            self, field_name: str) -> str:
+        value = self.options.get(
+            ConfigOptions.key(
+                f'{CoreOptions.FIELDS_PREFIX}.{field_name}.'
+                f'{CoreOptions.MAP_SHARED_SHREDDING_COLUMN_PLACEMENT_POLICY}'
+            )
+            .string_type()
+            .default_value('lru')
+        ).lower()
+        if value not in ('plain', 'sequential', 'lru'):
+            raise ValueError(
+                "Unsupported shared-shredding column placement policy: {}".format(
+                    value))
+        return value
 
     @property
     def query_auth_enabled(self) -> bool:
