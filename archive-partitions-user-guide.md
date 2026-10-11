@@ -23,6 +23,8 @@ limitations under the License.
 
 本地提交后的新一轮实现审查及修正结果见 [代码审查记录](tasks/evidence/AP-REVIEW.md)。表类型和catalog发布协议的当前边界以第6节为准。
 
+DV、HASH_DYNAMIC、KEY_DYNAMIC 和 POSTPONE_MODE 的当前限制及后续扩展前提见 [DV与动态分桶限制记录](archive-partitions-dv-dynamic-limitations.md)。该记录是未实施的可行性方案，不表示当前 CALL 已支持这些类型。
+
 ## 1. 功能用途与当前可用范围
 
 目标是将不再变更的完整分区从热存储复制到在线冷存储，例如本地文件系统 → MinIO，再通过快照原子替换文件引用。迁移数据文件时不合并、排序或重新编码，因此不需要执行数据 compaction。仍有全量复制、校验和 manifest 维护成本。

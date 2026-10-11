@@ -32,6 +32,8 @@ limitations under the License.
 
 第一阶段保持 Spark CALL 入口，核心方案放在 paimon-core；不新增 Flink 入口、表格式字段、CommitKind 或第三方依赖。支持条件见 §4，实施顺序见 §13，验收门槛见 §14。
 
+DV和动态分桶扩展的单独限制/可行性审查见 [DV与动态分桶限制记录](archive-partitions-dv-dynamic-limitations.md)。其中方案尚未实施，不能据此解除本阶段的DV、独立indexManifest或动态bucket拒绝条件。
+
 ### 1.1 两份 MD 的关系
 
 | 背景资料中的机制 | release-1.3 核实结果 | 本阶段用途 |
