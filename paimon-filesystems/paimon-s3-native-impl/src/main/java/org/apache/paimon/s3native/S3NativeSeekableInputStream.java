@@ -266,9 +266,8 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
             if (n <= 0) {
                 return 0;
             }
-            long newPos = Math.min(nextReadPos + n, contentLength);
-            long skipped = newPos - nextReadPos;
-            nextReadPos = newPos;
+            long skipped = Math.min(n, contentLength - nextReadPos);
+            nextReadPos += skipped;
             return skipped;
         } finally {
             this.lock.unlock();

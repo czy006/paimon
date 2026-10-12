@@ -294,4 +294,39 @@ class S3NativeSeekableInputStreamTest {
         assertThat(S3NativeSeekableInputStream.isRetryableReadFailure(new IOException("plain")))
                 .isFalse();
     }
+
+    @Test
+    void testSkipLongMaxValueClampsToEnd() throws Exception {
+        S3Client client = mock(S3Client.class);
+        try (S3NativeSeekableInputStream in =
+                new S3NativeSeekableInputStream(
+                        client, "bucket", "key", 4, 256, S3NativeSse.NONE, "original-etag")) {
+            in.seek(1);
+            assertThat(in.skip(Long.MAX_VALUE)).isEqualTo(3);
+            assertThat(in.getPos()).isEqualTo(4);
+            assertThat(in.skip(Long.MAX_VALUE)).isZero();
+            assertThat(in.read()).isEqualTo(-1);
+        }
+        verify(client, times(0)).getObject(any(GetObjectRequest.class));
+    }
+
+    @Test
+    void testSkipNearLongMaxValueDoesNotOverflow() throws Exception {
+        S3Client client = mock(S3Client.class);
+        try (S3NativeSeekableInputStream in =
+                new S3NativeSeekableInputStream(
+                        client,
+                        "bucket",
+                        "key",
+                        Long.MAX_VALUE,
+                        256,
+                        S3NativeSse.NONE,
+                        "original-etag")) {
+            in.seek(Long.MAX_VALUE - 2);
+            assertThat(in.skip(Long.MAX_VALUE)).isEqualTo(2);
+            assertThat(in.getPos()).isEqualTo(Long.MAX_VALUE);
+            assertThat(in.skip(Long.MAX_VALUE)).isZero();
+            assertThat(in.read()).isEqualTo(-1);
+        }
+    }
 }
