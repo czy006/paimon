@@ -95,6 +95,9 @@ final class S3NativeClientProvider implements AutoCloseable {
         // backoff; maxAttempts counts the initial attempt, retries exclude it.
         ClientOverrideConfiguration overrideConfig =
                 ClientOverrideConfiguration.builder()
+                        // Providers are shared across SSE configurations: check every request,
+                        // including SDK-resolved endpoints, on both sync and async clients.
+                        .addExecutionInterceptor(new S3NativeSseHttpsInterceptor())
                         .retryStrategy(
                                 StandardRetryStrategy.builder()
                                         .maxAttempts(options.maxRetries + 1)

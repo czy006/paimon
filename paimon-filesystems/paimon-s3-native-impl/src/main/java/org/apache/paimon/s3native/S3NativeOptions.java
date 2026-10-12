@@ -231,6 +231,8 @@ final class S3NativeOptions {
                             + "s3.secret-key; it cannot be combined with default-chain credentials");
         }
 
+        S3NativeSse sse = S3NativeSse.from(normalized);
+        sse.validateEndpoint(endpoint);
         return new S3NativeOptions(
                 normalized.get("s3.access-key"),
                 normalized.get("s3.secret-key"),
@@ -259,7 +261,7 @@ final class S3NativeOptions {
                 validatedAcl(normalized.get("s3.acl")),
                 validatedDeleteBatchSize(normalized),
                 validatedDeleteThreads(normalized),
-                S3NativeSse.from(normalized));
+                sse);
     }
 
     /** [PORTED-ICE Spec §14 I7] Keys per DeleteObjects request, 1..1000 (S3 API limit). */

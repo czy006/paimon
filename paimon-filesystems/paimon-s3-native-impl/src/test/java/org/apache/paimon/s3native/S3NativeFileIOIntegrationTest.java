@@ -387,14 +387,7 @@ class S3NativeFileIOIntegrationTest {
     }
 
     @Test
-    void testSseCustomerKeyHeadersReachServer() throws Exception {
-        // [PORTED-ICE I8] SSE-C end-to-end wiring proof: the put request carries the customer
-        // key headers all the way to MinIO, which rejects them with S3's standard
-        // "secure connection" rule — SSE-C is HTTPS-only and this container runs plain HTTP.
-        // A full encrypt/decrypt round trip needs an HTTPS endpoint; request shaping for
-        // PutObject/CreateMultipartUpload/UploadPart is pinned in
-        // S3NativePositionOutputStreamTest, and for GetObject/HeadObject in the stream and
-        // operations test classes.
+    void testSseCustomerKeyRequiresHttps() throws Exception {
         byte[] keyBytes = new byte[32];
         new Random(99).nextBytes(keyBytes);
         String key64 = Base64.getEncoder().encodeToString(keyBytes);
@@ -402,28 +395,15 @@ class S3NativeFileIOIntegrationTest {
                 Base64.getEncoder()
                         .encodeToString(
                                 java.security.MessageDigest.getInstance("MD5").digest(keyBytes));
-
         Map<String, String> config = new HashMap<>(MINIO_CONTAINER.getS3ConfigOptions());
         config.put("s3.sse.type", "custom");
         config.put("s3.sse.key", key64);
         config.put("s3.sse.md5", md564);
-        FileIO sseIO = createFileIO(Options.fromMap(config));
-
-        Path path = file("sse-c");
-        // The SSE-C headers ride the PutObject issued by close(); the try-with-resources
-        // close rethrows that failure, so the assertion must come after the block.
-        try (org.apache.paimon.fs.PositionOutputStream out = sseIO.newOutputStream(path, true)) {
-            out.write(new byte[16]);
-        } catch (IOException e) {
-            org.assertj.core.api.Assertions.assertThat(e)
-                    .hasRootCauseInstanceOf(
-                            software.amazon.awssdk.services.s3.model.InvalidRequestException.class);
-            org.assertj.core.api.Assertions.assertThat(e.getCause().getMessage())
-                    .contains("secure connection");
-            return;
-        }
-        org.assertj.core.api.Assertions.fail(
-                "SSE-C over HTTP should have been rejected with a secure-connection error");
+        // Reject before creating a client or transmitting the customer's encryption key.
+        // Server-specific refusal would happen only after that key had already crossed HTTP.
+        assertThatThrownBy(() -> createFileIO(Options.fromMap(config)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("HTTPS");
     }
 
     @Test

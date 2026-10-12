@@ -31,6 +31,7 @@ import software.amazon.awssdk.services.s3.model.UploadPartRequest;
 
 import javax.annotation.Nullable;
 
+import java.net.URI;
 import java.util.function.Consumer;
 
 /**
@@ -101,6 +102,14 @@ final class S3NativeSse {
                         "Invalid s3.sse.type value: "
                                 + raw
                                 + " (expected none, s3, kms, dsse-kms or custom)");
+        }
+    }
+
+    void validateEndpoint(@Nullable String endpoint) {
+        if (type == Type.CUSTOM
+                && endpoint != null
+                && !"https".equalsIgnoreCase(URI.create(endpoint).getScheme())) {
+            throw new IllegalArgumentException("s3.sse.type=custom requires an HTTPS s3.endpoint");
         }
     }
 

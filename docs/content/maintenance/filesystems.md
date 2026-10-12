@@ -440,6 +440,12 @@ through the SDK environment variables or AWS shared profiles; `s3.endpoint` appl
 and does not override the STS endpoint. See the
 [AWS default credentials chain](https://docs.aws.amazon.com/sdk-for-java/latest/developer-guide/credentials-chain.html).
 
+SSE-C (`s3.sse.type=custom`) requires HTTPS. An explicit non-HTTPS endpoint is rejected during
+configuration, and the plugin checks the resolved endpoint of every request before transmission,
+including SDK environment or profile endpoint overrides. This also protects copy-source customer
+keys. A service-side rejection cannot protect a key already sent over HTTP; see the
+[AWS SSE-C requirements](https://docs.aws.amazon.com/AmazonS3/latest/userguide/ServerSideEncryptionCustomerKeys.html).
+
 Additional options:
 
 | Option | Default | Description |
