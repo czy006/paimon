@@ -34,6 +34,8 @@ import software.amazon.awssdk.services.s3.model.CopyPartResult;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadResponse;
 import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectTaggingRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectTaggingResponse;
 import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
 import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
 import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
@@ -71,6 +73,8 @@ class S3NativeFileIORenameTest {
     void testAbortedCopyDoesNotDeleteSourceWhenRecoveryCannotBeProven(boolean headDenied)
             throws Exception {
         S3Client client = mock(S3Client.class);
+        when(client.getObjectTagging(any(GetObjectTaggingRequest.class)))
+                .thenReturn(GetObjectTaggingResponse.builder().build());
         AtomicInteger destinationHeads = new AtomicInteger();
         when(client.headObject(any(HeadObjectRequest.class)))
                 .thenAnswer(
@@ -113,6 +117,8 @@ class S3NativeFileIORenameTest {
     @Test
     void testLostCopyResponseRecoversThisUploadAndDeletesSource() throws Exception {
         S3Client client = mock(S3Client.class);
+        when(client.getObjectTagging(any(GetObjectTaggingRequest.class)))
+                .thenReturn(GetObjectTaggingResponse.builder().build());
         AtomicReference<CreateMultipartUploadRequest> create = new AtomicReference<>();
         when(client.headObject(any(HeadObjectRequest.class)))
                 .thenAnswer(

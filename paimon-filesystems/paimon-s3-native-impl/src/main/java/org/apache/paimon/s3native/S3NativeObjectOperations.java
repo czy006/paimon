@@ -124,12 +124,19 @@ final class S3NativeObjectOperations {
 
     /** [DEVIATION D1] Creates a 0-byte directory marker object at {@code <key>/}. */
     void putMarker(String key) throws IOException {
+        putMarker(key, null);
+    }
+
+    void putMarker(String key, @Nullable S3NativeOptions options) throws IOException {
         try {
             PutObjectRequest.Builder builder =
                     PutObjectRequest.builder().bucket(bucket).key(S3PathUtils.markerKey(key));
             // Markers must be encrypted like any other object: an SSE-C reader HEADs with key
             // headers, and a plaintext marker would turn every directory probe into a 400.
             sse.apply(builder);
+            if (options != null) {
+                S3NativeCopyAttributes.applyWriteAttributes(builder, options);
+            }
             client.putObject(builder.build(), RequestBody.empty());
         } catch (S3Exception e) {
             throw toIOException("putMarker " + key, e);

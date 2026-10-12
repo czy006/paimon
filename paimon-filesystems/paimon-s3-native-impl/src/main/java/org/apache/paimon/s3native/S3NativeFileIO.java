@@ -38,7 +38,6 @@ import software.amazon.awssdk.services.s3.model.UploadPartCopyRequest;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -350,7 +349,7 @@ public class S3NativeFileIO implements FileIO {
         // [DEVIATION D1] Directory existence is visible via a marker. Skip creating one when
         // children already exist (S3A-style legacy prefixes without markers still list fine).
         if (!operations.hasObjectsUnder(markerKey(key))) {
-            operations.putMarker(key);
+            operations.putMarker(key, resolvedOptions());
         }
         return true;
     }
@@ -390,9 +389,11 @@ public class S3NativeFileIO implements FileIO {
             return false; // cannot move a directory into itself
         }
 
+        S3NativeOptions options = resolvedOptions();
         if (srcClassification.kind == Kind.FILE) {
-            long length = srcClassification.head.contentLength;
-            copyObject(operations, resolvedOptions().sse, srcKey, dstKey, length);
+            S3NativeCopyAttributes attributes =
+                    S3NativeCopyAttributes.load(operations, srcKey, options);
+            copyObject(operations, options.sse, srcKey, dstKey, attributes);
             operations.deleteObject(srcKey);
             return true;
         }
@@ -403,15 +404,13 @@ public class S3NativeFileIO implements FileIO {
         String dstPrefix = dstKey.isEmpty() ? "" : dstKey + "/";
         List<software.amazon.awssdk.services.s3.model.S3Object> srcObjects =
                 operations.listAllObjects(srcPrefix);
-        for (software.amazon.awssdk.services.s3.model.S3Object srcObject : srcObjects) {
-            String srcObjectKey = srcObject.key();
+        // Preflight every object's metadata and tags before writing any destination object.
+        List<S3NativeCopyAttributes> attributes =
+                S3NativeCopyAttributes.loadAll(operations, srcObjects, options);
+        for (int i = 0; i < srcObjects.size(); i++) {
+            String srcObjectKey = srcObjects.get(i).key();
             String renamed = dstPrefix + srcObjectKey.substring(srcPrefix.length());
-            copyObject(
-                    operations,
-                    resolvedOptions().sse,
-                    srcObjectKey,
-                    renamed,
-                    srcObject.size() == null ? 0L : srcObject.size());
+            copyObject(operations, options.sse, srcObjectKey, renamed, attributes.get(i));
         }
         List<String> srcKeys = new ArrayList<>(srcObjects.size());
         for (software.amazon.awssdk.services.s3.model.S3Object srcObject : srcObjects) {
@@ -452,8 +451,9 @@ public class S3NativeFileIO implements FileIO {
             S3NativeSse sse,
             String srcKey,
             String dstKey,
-            long length)
+            S3NativeCopyAttributes attributes)
             throws IOException {
+        long length = attributes.contentLength();
         try {
             if (length <= MAX_COPY_OBJECT_BYTES) {
                 CopyObjectRequest.Builder builder =
@@ -462,11 +462,12 @@ public class S3NativeFileIO implements FileIO {
                                 .sourceKey(srcKey)
                                 .destinationBucket(operations.bucket())
                                 .destinationKey(dstKey);
+                attributes.apply(builder);
                 sse.apply(builder);
                 operations.client().copyObject(builder.build());
                 return;
             }
-            copyObjectMultipart(operations, sse, srcKey, dstKey, length);
+            copyObjectMultipart(operations, sse, srcKey, dstKey, attributes);
         } catch (S3Exception e) {
             throw new IOException("Failed to copy " + srcKey + " to " + dstKey, e);
         } catch (RuntimeException e) {
@@ -480,18 +481,15 @@ public class S3NativeFileIO implements FileIO {
             S3NativeSse sse,
             String srcKey,
             String dstKey,
-            long length)
+            S3NativeCopyAttributes attributes)
             throws IOException {
+        long length = attributes.contentLength();
         String uploadId = null;
         String uploadToken = UUID.randomUUID().toString();
         try {
             CreateMultipartUploadRequest.Builder createBuilder =
-                    CreateMultipartUploadRequest.builder()
-                            .bucket(operations.bucket())
-                            .key(dstKey)
-                            .metadata(
-                                    S3NativeUploadMetadata.withToken(
-                                            Collections.emptyMap(), uploadToken));
+                    CreateMultipartUploadRequest.builder().bucket(operations.bucket()).key(dstKey);
+            attributes.apply(createBuilder, uploadToken);
             sse.apply(createBuilder);
             CreateMultipartUploadResponse create =
                     operations.client().createMultipartUpload(createBuilder.build());

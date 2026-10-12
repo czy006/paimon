@@ -448,6 +448,12 @@ Notes:
 
 - Buckets expose S3A-compatible directory markers (0-byte `key/` objects), so tooling
   interoperates with data written by `paimon-s3`.
+- Rename preserves source tags, storage class and object metadata. Configured write tags are
+  merged into the source tags, and configured storage class and ACL take precedence. Reading
+  source tags requires `s3:GetObjectTagging`; an access failure stops the rename before copying.
+  Directory renames check every source object first. At most ten merged tags are allowed.
+  Without a configured ACL, copies use the AWS default private ACL; source ACLs and Object Lock
+  policies are not cloned. Keep source objects stable throughout rename.
 - Rename is copy+delete and not atomic, exactly like S3A; objects larger than 5GB are copied
   via multipart `UploadPartCopy`.
 - Configure a bucket lifecycle rule aborting incomplete multipart uploads (e.g.
