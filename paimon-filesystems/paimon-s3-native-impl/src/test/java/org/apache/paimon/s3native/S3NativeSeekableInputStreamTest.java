@@ -19,6 +19,9 @@
 package org.apache.paimon.s3native;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.ArgumentCaptor;
 import software.amazon.awssdk.core.ResponseInputStream;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
@@ -328,5 +331,91 @@ class S3NativeSeekableInputStreamTest {
             assertThat(in.skip(Long.MAX_VALUE)).isZero();
             assertThat(in.read()).isEqualTo(-1);
         }
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 1, 2})
+    void testNonRetryablePartialSkipFailureReopensAtRequestedOffset(int closeFailureMode)
+            throws Exception {
+        IOException readFailure = new IOException("failure after a partial skip");
+        IOException sharedCloseFailure = new IOException("close failure");
+        AtomicInteger sourcePosition = new AtomicInteger();
+        InputStream firstResponse =
+                new InputStream() {
+                    private boolean failed;
+
+                    @Override
+                    public int read() throws IOException {
+                        if (sourcePosition.get() == 2 && !failed) {
+                            failed = true;
+                            throw readFailure;
+                        }
+                        return sourcePosition.get() < 4
+                                ? "ABCD".charAt(sourcePosition.getAndIncrement())
+                                : -1;
+                    }
+
+                    @Override
+                    public int read(byte[] buffer, int offset, int length) throws IOException {
+                        if (length == 0) {
+                            return 0;
+                        }
+                        int value = read();
+                        if (value == -1) {
+                            return -1;
+                        }
+                        // Returning a short read forces InputStream's real skip to consume B,
+                        // then attempt another read, which fails before consuming C.
+                        buffer[offset] = (byte) value;
+                        return 1;
+                    }
+
+                    @Override
+                    public void close() throws IOException {
+                        if (closeFailureMode == 1) {
+                            throw new IOException("close failure");
+                        }
+                        if (closeFailureMode == 2) {
+                            throw sharedCloseFailure;
+                        }
+                    }
+                };
+        S3Client client =
+                clientServing(
+                        (call, rangeStart) ->
+                                call == 0
+                                        ? firstResponse
+                                        : new ByteArrayInputStream(
+                                                "ABCD".substring(rangeStart).getBytes()));
+        try (S3NativeSeekableInputStream in =
+                new S3NativeSeekableInputStream(
+                        client, "bucket", "key", 4, 256, S3NativeSse.NONE, "original-etag")) {
+            assertThat(in.read()).isEqualTo('A');
+            in.seek(3);
+            assertThatThrownBy(in::read)
+                    .isSameAs(readFailure)
+                    .satisfies(
+                            failure -> {
+                                if (closeFailureMode != 0) {
+                                    assertThat(failure.getSuppressed())
+                                            .anySatisfy(
+                                                    suppressed ->
+                                                            assertThat(suppressed)
+                                                                    .isInstanceOf(IOException.class)
+                                                                    .hasMessage("close failure"));
+                                }
+                            });
+            assertThat(sourcePosition.get()).isEqualTo(2); // A read, B skipped, C untouched
+            assertThat(in.getPos()).isEqualTo(3);
+            verify(client, times(1)).getObject(any(GetObjectRequest.class));
+            // The caller retries the read. Reusing the half-skipped old response would return C.
+            assertThat(in.read()).isEqualTo('D');
+            assertThat(in.getPos()).isEqualTo(4);
+            assertThat(in.read()).isEqualTo(-1);
+        }
+        ArgumentCaptor<GetObjectRequest> requests = ArgumentCaptor.forClass(GetObjectRequest.class);
+        verify(client, times(2)).getObject(requests.capture());
+        assertThat(requests.getAllValues().get(1).range()).isEqualTo("bytes=3-");
+        assertThat(requests.getAllValues().get(1).ifMatch()).isEqualTo("original-etag");
     }
 }

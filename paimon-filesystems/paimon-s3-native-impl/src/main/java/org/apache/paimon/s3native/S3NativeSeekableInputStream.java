@@ -407,6 +407,12 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
                 return;
             } catch (IOException e) {
                 if (!isRetryableReadFailure(e)) {
+                    // A failed skip may have consumed only part of the requested distance.
+                    // Discard that response so a later read can reopen at the requested target.
+                    IOException closeFailure = releaseStreams();
+                    if (closeFailure != null && closeFailure != e) {
+                        e.addSuppressed(closeFailure);
+                    }
                     throw e;
                 }
                 // Buffered skip hit the network mid-way, leaving the buffer state indeterminate;
@@ -515,7 +521,7 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
             } catch (IOException e) {
                 if (exception == null) {
                     exception = e;
-                } else {
+                } else if (exception != e) {
                     exception.addSuppressed(e);
                 }
                 LOG.warn("Error closing S3 response stream for {}/{}", bucket, key, e);
