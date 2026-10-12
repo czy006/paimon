@@ -62,6 +62,7 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
     private final String key;
     private final long contentLength;
     private final int readBufferSize;
+    private final String eTag;
 
     /**
      * [PORTED-ICE Spec §14 I1] Connection failures during an in-flight read are not covered by SDK
@@ -96,13 +97,18 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
             String key,
             long contentLength,
             int readBufferSize,
-            S3NativeSse sse) {
+            S3NativeSse sse,
+            String eTag) {
+        if (eTag == null || eTag.trim().isEmpty()) {
+            throw new IllegalArgumentException("An S3 input stream requires a non-empty ETag");
+        }
         this.client = client;
         this.bucket = bucket;
         this.key = key;
         this.contentLength = contentLength;
         this.readBufferSize = readBufferSize;
         this.sse = sse;
+        this.eTag = eTag;
         this.nextReadPos = 0;
         this.streamPos = 0;
         this.createStack = Thread.currentThread().getStackTrace();
@@ -325,9 +331,7 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
         // Independent ranged request: does not use or disturb the shared stream/cursor state.
         String range = String.format("bytes=%d-%d", position, position + toRead - 1);
         try (ResponseInputStream<GetObjectResponse> in =
-                client.getObject(
-                        sseApply(GetObjectRequest.builder().bucket(bucket).key(key).range(range))
-                                .build())) {
+                client.getObject(getObjectRequest().range(range).build())) {
             int readBytes = 0;
             while (readBytes < toRead) {
                 int n = in.read(buffer, offset + readBytes, toRead - readBytes);
@@ -441,7 +445,13 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
         return false;
     }
 
-    private GetObjectRequest.Builder sseApply(GetObjectRequest.Builder builder) {
+    private GetObjectRequest.Builder getObjectRequest() {
+        GetObjectRequest.Builder builder =
+                GetObjectRequest.builder().bucket(bucket).key(key).ifMatch(eTag);
+        // Pin every GET to the ETag observed by HEAD, including retries and independent preads.
+        // If-Match fails with 412 after an overwrite. Unlike versionId it needs no additional
+        // GetObjectVersion permission. Source:
+        // https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html#API_GetObject_RequestSyntax
         sse.applyCustomer(builder);
         return builder;
     }
@@ -467,8 +477,7 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
     private void openStreamAtCurrentPosition() throws IOException {
         releaseStreams();
         try {
-            GetObjectRequest.Builder requestBuilder =
-                    sseApply(GetObjectRequest.builder().bucket(bucket).key(key));
+            GetObjectRequest.Builder requestBuilder = getObjectRequest();
             if (streamPos > 0) {
                 requestBuilder.range(String.format("bytes=%d-", streamPos));
             }

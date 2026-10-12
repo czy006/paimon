@@ -203,6 +203,9 @@ public class S3NativeFileIO implements FileIO {
         if (head == null) {
             throw new FileNotFoundException("File does not exist: " + path);
         }
+        if (head.eTag == null || head.eTag.trim().isEmpty()) {
+            throw new IOException("Cannot open S3 input stream without an ETag: " + path);
+        }
         S3NativeOptions resolved = resolvedOptions();
         return new S3NativeSeekableInputStream(
                 provider().syncClient(),
@@ -210,7 +213,8 @@ public class S3NativeFileIO implements FileIO {
                 key,
                 head.contentLength,
                 resolved.readBufferSize,
-                resolved.sse);
+                resolved.sse,
+                head.eTag);
     }
 
     @Override
@@ -603,10 +607,12 @@ public class S3NativeFileIO implements FileIO {
     private static final class HeadInfo {
         final long contentLength;
         final long lastModified;
+        final String eTag;
 
-        HeadInfo(long contentLength, long lastModified) {
+        HeadInfo(long contentLength, long lastModified, String eTag) {
             this.contentLength = contentLength;
             this.lastModified = lastModified;
+            this.eTag = eTag;
         }
     }
 
@@ -679,7 +685,8 @@ public class S3NativeFileIO implements FileIO {
                 head.contentLength() == null ? 0L : head.contentLength(),
                 head.lastModified() == null
                         ? System.currentTimeMillis()
-                        : head.lastModified().toEpochMilli());
+                        : head.lastModified().toEpochMilli(),
+                head.eTag());
     }
 
     // ------------------------------------------------------------------------
