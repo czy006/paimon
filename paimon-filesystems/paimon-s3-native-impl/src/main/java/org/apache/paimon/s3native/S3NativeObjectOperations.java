@@ -56,6 +56,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -179,49 +180,31 @@ final class S3NativeObjectOperations {
         // Deduplicate like Iceberg's SetMultimap accumulation; duplicates would inflate the
         // failure count and repeat keys inside one request.
         List<String> distinctKeys = new ArrayList<>(new LinkedHashSet<>(keys));
-        List<Future<List<String>>> tasks = new ArrayList<>();
-        // First whole-request failure is kept as the cause of the aggregated IOException.
-        AtomicReference<Exception> firstFailure = new AtomicReference<>();
-        ExecutorService pool = deletePool(threads);
-        for (int from = 0; from < distinctKeys.size(); from += batchSize) {
-            List<String> batch =
-                    distinctKeys.subList(from, Math.min(distinctKeys.size(), from + batchSize));
-            List<ObjectIdentifier> identifiers = new ArrayList<>(batch.size());
-            for (String key : batch) {
-                identifiers.add(ObjectIdentifier.builder().key(key).build());
-            }
-            DeleteObjectsRequest request =
-                    DeleteObjectsRequest.builder()
-                            .bucket(bucket)
-                            .delete(Delete.builder().objects(identifiers).build())
-                            .build();
-            tasks.add(pool.submit(() -> deleteBatchQuietly(request, batch, firstFailure)));
-        }
-
+        Deque<Future<List<String>>> inFlight = new ArrayDeque<>();
         List<String> failedKeys = new ArrayList<>();
-        for (Future<List<String>> task : tasks) {
-            try {
-                failedKeys.addAll(task.get());
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                // Cancel outstanding batches like Iceberg; they would keep issuing requests
-                // after the caller aborted.
-                for (Future<List<String>> outstanding : tasks) {
-                    outstanding.cancel(true);
-                }
-                throw new IOException("Interrupted while waiting for batch deletions", e);
-            } catch (ExecutionException e) {
-                // Unexpected: deleteBatchQuietly maps every failure to failed keys.
-                throw new IOException("Batch deletion task failed", e.getCause());
+        AtomicReference<Exception> firstFailure = new AtomicReference<>();
+        AtomicBoolean stopped = new AtomicBoolean();
+        ExecutorService pool = deletePool(threads);
+        IOException failure = null;
+        try {
+            for (int from = 0; from < distinctKeys.size(); from += batchSize) {
+                List<String> batch =
+                        distinctKeys.subList(from, Math.min(distinctKeys.size(), from + batchSize));
+                submitBatch(inFlight, batch, firstFailure, stopped, pool);
             }
+            collect(inFlight, failedKeys);
+        } catch (InterruptedException e) {
+            failure = new IOException("Interrupted while waiting for batch deletions", e);
+            Thread.currentThread().interrupt();
+        } catch (IOException e) {
+            failure = e;
+        } catch (RuntimeException e) {
+            failure = new IOException("Failed to submit batch deletions", e);
+        } finally {
+            failure = finishDeletes(inFlight, failedKeys, firstFailure, stopped, failure);
         }
-        if (!failedKeys.isEmpty()) {
-            throw new IOException(
-                    "Batch delete failed for "
-                            + failedKeys.size()
-                            + " keys, first: "
-                            + failedKeys.get(0),
-                    firstFailure.get());
+        if (failure != null) {
+            throw failure;
         }
     }
 
@@ -305,9 +288,11 @@ final class S3NativeObjectOperations {
         Deque<Future<List<String>>> inFlight = new ArrayDeque<>();
         List<String> failedKeys = new ArrayList<>();
         AtomicReference<Exception> firstFailure = new AtomicReference<>();
+        AtomicBoolean stopped = new AtomicBoolean();
         ExecutorService pool = deletePool(threads);
         List<String> batch = new ArrayList<>(batchSize);
         String token = null;
+        IOException failure = null;
         try {
             do {
                 ListObjectsV2Request.Builder request =
@@ -320,32 +305,33 @@ final class S3NativeObjectOperations {
                 for (S3Object object : response.contents()) {
                     batch.add(object.key());
                     if (batch.size() == batchSize) {
-                        submitBatch(inFlight, batch, firstFailure, pool);
+                        submitBatch(inFlight, batch, firstFailure, stopped, pool);
                         batch = new ArrayList<>(batchSize);
                         drainIfCrowded(inFlight, failedKeys, threads);
                     }
                 }
             } while (token != null);
             if (!batch.isEmpty()) {
-                submitBatch(inFlight, batch, firstFailure, pool);
+                submitBatch(inFlight, batch, firstFailure, stopped, pool);
             }
             collect(inFlight, failedKeys);
         } catch (S3Exception e) {
-            throw toIOException("deletePrefixStreaming " + prefix, e);
+            failure = toIOException("deletePrefixStreaming " + prefix, e);
+        } catch (RuntimeException e) {
+            // SdkClientException (network/credentials) does not extend S3Exception.
+            failure =
+                    new IOException(
+                            "S3 operation failed (deletePrefixStreaming " + prefix + ")", e);
         } catch (InterruptedException e) {
+            failure = new IOException("Interrupted while streaming batch deletions", e);
             Thread.currentThread().interrupt();
-            for (Future<List<String>> outstanding : inFlight) {
-                outstanding.cancel(true);
-            }
-            throw new IOException("Interrupted while streaming batch deletions", e);
+        } catch (IOException e) {
+            failure = e;
+        } finally {
+            failure = finishDeletes(inFlight, failedKeys, firstFailure, stopped, failure);
         }
-        if (!failedKeys.isEmpty()) {
-            throw new IOException(
-                    "Batch delete failed for "
-                            + failedKeys.size()
-                            + " keys, first: "
-                            + failedKeys.get(0),
-                    firstFailure.get());
+        if (failure != null) {
+            throw failure;
         }
     }
 
@@ -354,8 +340,99 @@ final class S3NativeObjectOperations {
             Deque<Future<List<String>>> inFlight,
             List<String> keys,
             AtomicReference<Exception> firstFailure,
+            AtomicBoolean stopped,
             ExecutorService pool) {
-        inFlight.add(pool.submit(() -> deleteBatchQuietly(buildRequest(keys), keys, firstFailure)));
+        inFlight.add(
+                pool.submit(
+                        () -> {
+                            // A queued task that has not started must not issue new requests
+                            // after pagination fails or its caller is interrupted.
+                            if (stopped.get()) {
+                                return Collections.emptyList();
+                            }
+                            return deleteBatchQuietly(buildRequest(keys), keys, firstFailure);
+                        }));
+    }
+
+    /**
+     * Finishes every submitted task before returning, even after caller interruption. Cancelling a
+     * Future only attempts to interrupt its worker and makes get() throw immediately; it does not
+     * prove that a synchronous SDK request stopped. Keep the futures until their workers actually
+     * complete, and restore the caller's interrupt status after cleanup.
+     *
+     * <p>https://docs.oracle.com/javase/8/docs/api/java/util/concurrent/Future.html#cancel-boolean-
+     */
+    @Nullable
+    private static IOException finishDeletes(
+            Deque<Future<List<String>>> inFlight,
+            List<String> failedKeys,
+            AtomicReference<Exception> firstFailure,
+            AtomicBoolean stopped,
+            @Nullable IOException failure) {
+        boolean interrupted = Thread.interrupted();
+        if (failure != null || interrupted) {
+            stopped.set(true);
+        }
+        if (failure == null && interrupted) {
+            failure =
+                    new IOException(
+                            "Interrupted while waiting for batch deletions",
+                            new InterruptedException());
+        }
+        try {
+            while (!inFlight.isEmpty()) {
+                Future<List<String>> task = inFlight.peekFirst();
+                boolean complete = false;
+                while (!complete) {
+                    try {
+                        failedKeys.addAll(task.get());
+                        complete = true;
+                    } catch (InterruptedException e) {
+                        interrupted = true;
+                        stopped.set(true);
+                        if (failure == null) {
+                            failure =
+                                    new IOException(
+                                            "Interrupted while waiting for batch deletions", e);
+                        } else {
+                            failure.addSuppressed(e);
+                        }
+                    } catch (ExecutionException e) {
+                        stopped.set(true);
+                        IOException taskFailure =
+                                new IOException("Batch deletion task failed", e.getCause());
+                        if (failure == null) {
+                            failure = taskFailure;
+                        } else if (failure.getCause() != e.getCause()) {
+                            failure.addSuppressed(taskFailure);
+                        }
+                        complete = true;
+                    }
+                }
+                inFlight.removeFirst();
+            }
+            if (!failedKeys.isEmpty()) {
+                IOException batchFailure =
+                        new IOException(
+                                "Batch delete failed for "
+                                        + failedKeys.size()
+                                        + " keys, first: "
+                                        + failedKeys.get(0),
+                                firstFailure.get());
+                if (failure == null) {
+                    failure = batchFailure;
+                } else {
+                    // The pagination/interruption error stays primary; cleanup failures are
+                    // still inspectable and include the aggregate failed-key count.
+                    failure.addSuppressed(batchFailure);
+                }
+            }
+            return failure;
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     private DeleteObjectsRequest buildRequest(List<String> keys) {
@@ -374,7 +451,8 @@ final class S3NativeObjectOperations {
             Deque<Future<List<String>>> inFlight, List<String> failedKeys, int threads)
             throws InterruptedException, IOException {
         while (inFlight.size() > 2 * threads) {
-            failedKeys.addAll(join(inFlight.pollFirst()));
+            failedKeys.addAll(join(inFlight.peekFirst()));
+            inFlight.removeFirst();
         }
     }
 
@@ -392,7 +470,8 @@ final class S3NativeObjectOperations {
     private static void collect(Deque<Future<List<String>>> inFlight, List<String> failedKeys)
             throws InterruptedException, IOException {
         while (!inFlight.isEmpty()) {
-            failedKeys.addAll(join(inFlight.pollFirst()));
+            failedKeys.addAll(join(inFlight.peekFirst()));
+            inFlight.removeFirst();
         }
     }
 
