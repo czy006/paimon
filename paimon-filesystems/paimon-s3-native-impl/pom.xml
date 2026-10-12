@@ -33,7 +33,8 @@
 
     <properties>
         <japicmp.skip>true</japicmp.skip>
-        <fs.s3native.awssdk.version>2.44.4</fs.s3native.awssdk.version>
+        <!-- Includes the asynchronous checksum/signing completion fix; matches Iceberg. -->
+        <fs.s3native.awssdk.version>2.55.1</fs.s3native.awssdk.version>
         <!-- Module-local override: 1.19.x docker-java fails API negotiation against
              Docker Engine 29+ (HTTP 400 on /info). -->
         <testcontainers.version>1.21.3</testcontainers.version>
@@ -52,12 +53,25 @@
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>s3</artifactId>
             <version>${fs.s3native.awssdk.version}</version>
+            <exclusions>
+                <!-- Keep the existing bundled Apache 4 transport for SDK default clients. -->
+                <exclusion>
+                    <groupId>software.amazon.awssdk</groupId>
+                    <artifactId>apache5-client</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
         <!-- The SDK default chain reflectively loads STS for web identity and role profiles. -->
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>sts</artifactId>
             <version>${fs.s3native.awssdk.version}</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>software.amazon.awssdk</groupId>
+                    <artifactId>apache5-client</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>

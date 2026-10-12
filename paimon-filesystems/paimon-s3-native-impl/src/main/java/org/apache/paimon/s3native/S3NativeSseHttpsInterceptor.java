@@ -30,8 +30,8 @@ final class S3NativeSseHttpsInterceptor implements ExecutionInterceptor {
     @Override
     public SdkHttpRequest modifyHttpRequest(
             Context.ModifyHttpRequest context, ExecutionAttributes executionAttributes) {
-        // SDK 2.44.4 resolves S3 endpoints before user modifyHttpRequest interceptors and signs
-        // afterwards. Reject here before signing, including SDK-native endpoint overrides.
+        // Reject known plaintext endpoints early. SDK endpoint resolution can also run after
+        // this hook, so beforeTransmission must validate the final request independently.
         validate(context.httpRequest());
         return context.httpRequest();
     }

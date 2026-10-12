@@ -445,6 +445,8 @@ configuration, and the plugin checks the resolved endpoint of every request befo
 including SDK environment or profile endpoint overrides. This also protects copy-source customer
 keys. A service-side rejection cannot protect a key already sent over HTTP; see the
 [AWS SSE-C requirements](https://docs.aws.amazon.com/AmazonS3/latest/userguide/ServerSideEncryptionCustomerKeys.html).
+Keep SDK signer and HTTP wire debug logging disabled when using SSE-C: the SDK can include
+customer key headers in canonical-request or wire debug output, even for HTTPS requests.
 
 Additional options:
 
