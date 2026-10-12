@@ -423,10 +423,28 @@ The `s3.*` option keys (`s3.endpoint`, `s3.access-key`, `s3.secret-key`, `s3.pat
 `fs.s3a.access.key`, `fs.s3a.multipart.size`, `fs.s3a.connection.maximum`, ...) are accepted as
 aliases, and unrecognized `fs.s3a.*` keys are reported with a warning and ignored.
 
+Credentials can be supplied as `s3.access-key` and `s3.secret-key`. For temporary AWS
+credentials, also set `s3.session-token`; the token must be non-empty and accompanied by both
+keys. `s3.session.token`, `s3a.session-token`, `s3a.session.token` and `fs.s3a.session.token`
+are accepted aliases. Explicit temporary credentials are static and are intended for short-lived
+processes that finish before the session expires. Replace all three options when starting the next
+process. Live rotation of explicit credentials is unsupported: the process-wide client cache
+retains clients for old configurations. Long-running processes should use a refreshing provider
+from the default credentials chain, such as an instance/task role, web identity or role profile.
+See the
+[AWS temporary-credentials documentation](https://docs.aws.amazon.com/sdk-for-java/latest/developer-guide/credentials-explicit.html).
+
+With no explicit key pair, the AWS SDK default credentials chain is used. The plugin bundles
+the STS module required by EKS web identity (IRSA) and assumed-role profiles. Configure those
+through the SDK environment variables or AWS shared profiles; `s3.endpoint` applies only to S3
+and does not override the STS endpoint. See the
+[AWS default credentials chain](https://docs.aws.amazon.com/sdk-for-java/latest/developer-guide/credentials-chain.html).
+
 Additional options:
 
 | Option | Default | Description |
 | :- | :- | :- |
+| `s3.session-token` | none | Session token accompanying explicit temporary access and secret keys. |
 | `s3.upload.min.part.size` | 5mb | Multipart part size (5MB–5GB); parts upload concurrently. |
 | `s3.upload.max.concurrent.uploads` | CPU cores | Maximum in-flight part uploads per stream. |
 | `s3.read.buffer.size` | 256kb | Input stream read-ahead buffer (minimum 256KB). |

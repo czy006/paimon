@@ -53,6 +53,12 @@
             <artifactId>s3</artifactId>
             <version>${fs.s3native.awssdk.version}</version>
         </dependency>
+        <!-- The SDK default chain reflectively loads STS for web identity and role profiles. -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>sts</artifactId>
+            <version>${fs.s3native.awssdk.version}</version>
+        </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>netty-nio-client</artifactId>

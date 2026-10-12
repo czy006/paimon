@@ -23,6 +23,7 @@ import org.slf4j.LoggerFactory;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProviderChain;
+import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
@@ -170,9 +171,17 @@ final class S3NativeClientProvider implements AutoCloseable {
         if (options.accessKey != null && options.secretKey != null) {
             chain.add(
                     StaticCredentialsProvider.create(
-                            AwsBasicCredentials.create(options.accessKey, options.secretKey)));
+                            // AWS temporary credentials require the session token in signing.
+                            // https://docs.aws.amazon.com/sdk-for-java/latest/developer-guide/credentials-explicit.html
+                            options.sessionToken == null
+                                    ? AwsBasicCredentials.create(
+                                            options.accessKey, options.secretKey)
+                                    : AwsSessionCredentials.create(
+                                            options.accessKey,
+                                            options.secretKey,
+                                            options.sessionToken)));
         }
-        chain.add(DefaultCredentialsProvider.create());
+        chain.add(DefaultCredentialsProvider.builder().build());
         return AwsCredentialsProviderChain.builder().credentialsProviders(chain).build();
     }
 

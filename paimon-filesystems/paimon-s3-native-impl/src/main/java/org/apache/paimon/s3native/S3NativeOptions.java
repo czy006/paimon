@@ -46,6 +46,7 @@ final class S3NativeOptions {
 
     @Nullable final String accessKey;
     @Nullable final String secretKey;
+    @Nullable final String sessionToken;
     @Nullable final String region;
     @Nullable final String endpoint;
     final boolean pathStyleAccess;
@@ -95,6 +96,7 @@ final class S3NativeOptions {
     private S3NativeOptions(
             @Nullable String accessKey,
             @Nullable String secretKey,
+            @Nullable String sessionToken,
             @Nullable String region,
             @Nullable String endpoint,
             boolean pathStyleAccess,
@@ -122,6 +124,7 @@ final class S3NativeOptions {
             S3NativeSse sse) {
         this.accessKey = accessKey;
         this.secretKey = secretKey;
+        this.sessionToken = sessionToken;
         this.region = region;
         this.endpoint = endpoint;
         this.pathStyleAccess = pathStyleAccess;
@@ -218,9 +221,20 @@ final class S3NativeOptions {
                             + ")");
         }
 
+        String sessionToken = normalized.get("s3.session-token");
+        if (sessionToken != null
+                && (sessionToken.trim().isEmpty()
+                        || isBlank(normalized.get("s3.access-key"))
+                        || isBlank(normalized.get("s3.secret-key")))) {
+            throw new IllegalArgumentException(
+                    "s3.session-token requires a non-empty token and both s3.access-key and "
+                            + "s3.secret-key; it cannot be combined with default-chain credentials");
+        }
+
         return new S3NativeOptions(
                 normalized.get("s3.access-key"),
                 normalized.get("s3.secret-key"),
+                sessionToken,
                 normalized.get("s3.region"),
                 endpoint,
                 pathStyle,
@@ -256,6 +270,10 @@ final class S3NativeOptions {
                     "s3.delete.batch-size must be between 1 and 1000, but was: " + batchSize);
         }
         return batchSize;
+    }
+
+    private static boolean isBlank(@Nullable String value) {
+        return value == null || value.trim().isEmpty();
     }
 
     /** [PORTED-ICE Spec §14 I7] Concurrent DeleteObjects requests; Iceberg default = CPU cores. */

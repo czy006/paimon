@@ -65,11 +65,14 @@ final class S3ConfigTranslator {
     static {
         CANONICAL_KEY_ALIASES.put("s3.access.key", "s3.access-key");
         CANONICAL_KEY_ALIASES.put("s3.secret.key", "s3.secret-key");
+        CANONICAL_KEY_ALIASES.put("s3.session.token", "s3.session-token");
         CANONICAL_KEY_ALIASES.put("s3.path.style.access", "s3.path-style-access");
         FS_S3A_ALIASES.put(
                 "s3.access-key", new String[] {"fs.s3a.access.key", "fs.s3a.access-key"});
         FS_S3A_ALIASES.put(
                 "s3.secret-key", new String[] {"fs.s3a.secret.key", "fs.s3a.secret-key"});
+        FS_S3A_ALIASES.put(
+                "s3.session-token", new String[] {"fs.s3a.session.token", "fs.s3a.session-token"});
         FS_S3A_ALIASES.put("s3.endpoint", new String[] {"fs.s3a.endpoint"});
         FS_S3A_ALIASES.put("s3.region", new String[] {"fs.s3a.endpoint.region"});
         FS_S3A_ALIASES.put(

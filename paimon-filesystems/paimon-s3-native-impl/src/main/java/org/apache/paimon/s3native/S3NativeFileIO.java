@@ -94,6 +94,7 @@ public class S3NativeFileIO implements FileIO {
     static final class ClientKey {
         final String accessKey;
         final String secretKey;
+        final String sessionToken;
         final String region;
         final String endpoint;
         final boolean pathStyleAccess;
@@ -111,6 +112,7 @@ public class S3NativeFileIO implements FileIO {
         private ClientKey(S3NativeOptions options) {
             this.accessKey = options.accessKey;
             this.secretKey = options.secretKey;
+            this.sessionToken = options.sessionToken;
             this.region = options.region;
             this.endpoint = options.endpoint;
             this.pathStyleAccess = options.pathStyleAccess;
@@ -152,6 +154,7 @@ public class S3NativeFileIO implements FileIO {
                     && retryMaxBackoffMs == that.retryMaxBackoffMs
                     && java.util.Objects.equals(accessKey, that.accessKey)
                     && java.util.Objects.equals(secretKey, that.secretKey)
+                    && java.util.Objects.equals(sessionToken, that.sessionToken)
                     && java.util.Objects.equals(region, that.region)
                     && java.util.Objects.equals(endpoint, that.endpoint);
         }
@@ -161,6 +164,7 @@ public class S3NativeFileIO implements FileIO {
             return java.util.Objects.hash(
                     accessKey,
                     secretKey,
+                    sessionToken,
                     region,
                     endpoint,
                     pathStyleAccess,
