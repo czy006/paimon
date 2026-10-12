@@ -38,52 +38,53 @@ import java.util.Locale;
 import java.util.Map;
 
 /**
- * {@code MinioTestContainer} provides a MinIO instance for the native S3 FileIO tests.
+ * {@code S3NativeRustFsContainer} provides a RustFS instance for the native S3 FileIO tests.
  *
  * <p>[NEW] Structure copied from {@code org.apache.paimon.s3.MinioTestContainer} (paimon-s3
  * module); depending on its test-jar would create a Maven cycle (paimon-s3 packages paimon-s3-impl
  * at runtime). Bucket creation uses this module's own AWS SDK v2 instead of SDK v1.
  */
-public class S3NativeMinioContainer extends GenericContainer<S3NativeMinioContainer>
+public class S3NativeRustFsContainer extends GenericContainer<S3NativeRustFsContainer>
         implements BeforeAllCallback, AfterAllCallback {
 
     private static final int DEFAULT_PORT = 9000;
 
-    private static final String MINIO_ACCESS_KEY = "MINIO_ROOT_USER";
-    private static final String MINIO_SECRET_KEY = "MINIO_ROOT_PASSWORD";
+    private static final String RUSTFS_ACCESS_KEY = "RUSTFS_ACCESS_KEY";
+    private static final String RUSTFS_SECRET_KEY = "RUSTFS_SECRET_KEY";
 
     private static final String DEFAULT_STORAGE_DIRECTORY = "/data";
-    private static final String HEALTH_ENDPOINT = "/minio/health/ready";
+    private static final String HEALTH_ENDPOINT = "/health";
 
     private final String accessKey;
     private final String secretKey;
     private final String bucketName;
 
-    public S3NativeMinioContainer() {
+    public S3NativeRustFsContainer() {
         this(randomString("bucket", 6));
     }
 
-    public S3NativeMinioContainer(String bucketName) {
-        // Newer than the repo-wide pinned DockerImageVersions.MINIO (2022-02): that release
-        // rejects chunked-encoding uploads with an empty body (XAmzContentSHA256Mismatch),
-        // which SDK v2 emits for directory markers.
-        super("minio/minio:RELEASE.2025-09-07T16-13-09Z");
+    public S3NativeRustFsContainer(String bucketName) {
+        // Pin the public RustFS release; see
+        // https://docs.rustfs.com/en/installation/container/docker.
+        super("rustfs/rustfs:1.0.1");
 
         this.accessKey = randomString("accessKey", 10);
         // secrets must have at least 8 characters
         this.secretKey = randomString("secret", 10);
         this.bucketName = bucketName;
 
-        withNetworkAliases(randomString("minio", 6));
+        withNetworkAliases(randomString("rustfs", 6));
         addExposedPort(DEFAULT_PORT);
-        withEnv(MINIO_ACCESS_KEY, this.accessKey);
-        withEnv(MINIO_SECRET_KEY, this.secretKey);
-        withCommand("server", DEFAULT_STORAGE_DIRECTORY);
+        withEnv(RUSTFS_ACCESS_KEY, this.accessKey);
+        withEnv(RUSTFS_SECRET_KEY, this.secretKey);
+        withEnv("RUSTFS_CONSOLE_ENABLE", "false");
+        withCommand(DEFAULT_STORAGE_DIRECTORY);
         setWaitStrategy(
                 new HttpWaitStrategy()
                         .forPort(DEFAULT_PORT)
                         .forPath(HEALTH_ENDPOINT)
                         .withStartupTimeout(Duration.ofMinutes(2)));
+        withStartupAttempts(3);
     }
 
     @Override

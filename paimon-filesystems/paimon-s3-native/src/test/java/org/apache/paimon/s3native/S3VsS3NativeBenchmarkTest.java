@@ -39,17 +39,17 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Benchmark comparison test cases: the native SDK v2 implementation against the S3A baseline
- * ({@code paimon-s3}) on the same MinIO instance, with identical workloads and parameters.
+ * ({@code paimon-s3}) on the same RustFS instance, with identical workloads and parameters.
  *
  * <p>Each measurement runs best-of-N to damp container/disk noise, and the asserted ratios are
- * deliberately conservative (locally observed: large-write 2.4x+, small-write 1.7x). The measured
- * numbers are printed to stdout for the benchmark report. This test lives in the loader-shell
- * module because only here both implementations are on one classpath without a Maven cycle.
+ * deliberately conservative to tolerate shared-runner noise. The measured numbers are printed to
+ * stdout for the benchmark report. This test lives in the loader-shell module because only here
+ * both implementations are on one classpath without a Maven cycle.
  */
 class S3VsS3NativeBenchmarkTest {
 
     @org.junit.jupiter.api.extension.RegisterExtension
-    public static final S3BenchmarkMinioContainer MINIO = new S3BenchmarkMinioContainer();
+    public static final S3BenchmarkRustFsContainer S3_CONTAINER = new S3BenchmarkRustFsContainer();
 
     private static final int MB = 1024 * 1024;
     private static final int WARMUP_FILES = 1;
@@ -62,7 +62,7 @@ class S3VsS3NativeBenchmarkTest {
 
     @BeforeAll
     static void start() throws IOException {
-        Map<String, String> config = new HashMap<>(MINIO.getConfigOptions());
+        Map<String, String> config = new HashMap<>(S3_CONTAINER.getConfigOptions());
         config.put("s3.region", "us-east-1");
         // Symmetric transfer parameters: 8MB parts and a 50-connection pool on both sides.
         // fs.s3a.multipart.size is a whitelisted alias of s3.upload.min.part.size; the S3A
@@ -74,7 +74,7 @@ class S3VsS3NativeBenchmarkTest {
 
         s3a = createIO(org.apache.paimon.s3.S3FileIO.class, config);
         nativeIO = createIO(S3NativeFileIO.class, config);
-        base = new Path("s3://" + MINIO.getBucketName() + "/bench");
+        base = new Path("s3://" + S3_CONTAINER.getBucketName() + "/bench");
         s3a.mkdirs(base);
 
         data = new byte[32 * MB];
@@ -170,10 +170,8 @@ class S3VsS3NativeBenchmarkTest {
         assertThat(nativeIO.getFileStatus(new Path(base, "cmp-native")).getLen())
                 .isEqualTo(data.length);
 
-        // With S3A on genuine multipart (8MB parts, fast upload) local-container runs record
-        // 1.07-1.10x: the local disk is the shared bottleneck, and native's advantage is
-        // expected to widen on real network-bound S3 endpoints (cf. Flink's 2.17x SDK v2 vs
-        // v1 benchmark). The 1.25x regression floor tolerates shared-runner noise.
+        // Local disk is a shared bottleneck, so container timings do not predict performance
+        // on AWS. The 1.25x regression floor tolerates shared-runner noise.
         assertThat(nativeMs * 4).isLessThanOrEqualTo(s3aMs * 5);
 
         cleanup(s3a, base);
@@ -241,7 +239,8 @@ class S3VsS3NativeBenchmarkTest {
                                         .isEqualTo(data.length));
         report("read 32MB sequential", s3aMs, nativeMs);
 
-        // Local MinIO reads are page-cache bound (parity); the floor guards regressions only.
+        // Local S3-compatible reads are page-cache bound (parity); the floor guards regressions
+        // only.
         assertThat(nativeMs).isLessThanOrEqualTo((long) (s3aMs * 1.5));
     }
 

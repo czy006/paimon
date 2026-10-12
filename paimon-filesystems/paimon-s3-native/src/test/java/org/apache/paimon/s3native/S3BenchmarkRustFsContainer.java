@@ -37,48 +37,50 @@ import java.util.Locale;
 import java.util.Map;
 
 /**
- * MinIO container for the benchmark comparison tests in this module. Creates its default bucket
+ * RustFS container for the benchmark comparison tests in this module. Creates its default bucket
  * with the AWS SDK v1 client that ships (unrelocated) inside the paimon-s3-impl fat jar — the
  * SDK-v2-based container of the impl module's test-jar cannot be reused here because its {@code
  * software.amazon.awssdk} references only exist in relocated form on this classpath.
  *
  * <p>[NEW] Structure follows {@code org.apache.paimon.s3.MinioTestContainer}.
  */
-public class S3BenchmarkMinioContainer extends GenericContainer<S3BenchmarkMinioContainer>
+public class S3BenchmarkRustFsContainer extends GenericContainer<S3BenchmarkRustFsContainer>
         implements BeforeAllCallback, AfterAllCallback {
 
     private static final int DEFAULT_PORT = 9000;
 
-    private static final String MINIO_ACCESS_KEY = "MINIO_ROOT_USER";
-    private static final String MINIO_SECRET_KEY = "MINIO_ROOT_PASSWORD";
+    private static final String RUSTFS_ACCESS_KEY = "RUSTFS_ACCESS_KEY";
+    private static final String RUSTFS_SECRET_KEY = "RUSTFS_SECRET_KEY";
 
     private final String accessKey;
     private final String secretKey;
     private final String bucketName;
 
-    public S3BenchmarkMinioContainer() {
+    public S3BenchmarkRustFsContainer() {
         this(randomString("bench-bucket", 6));
     }
 
-    private S3BenchmarkMinioContainer(String bucketName) {
-        // Newer than the repo-wide pinned image (2022-02): that release rejects chunked-encoding
-        // uploads with an empty body, which SDK v2 emits for directory markers.
-        super("minio/minio:RELEASE.2025-09-07T16-13-09Z");
+    private S3BenchmarkRustFsContainer(String bucketName) {
+        // Pin the public RustFS release; see
+        // https://docs.rustfs.com/en/installation/container/docker.
+        super("rustfs/rustfs:1.0.1");
 
         this.accessKey = randomString("accessKey", 10);
         this.secretKey = randomString("secret", 10);
         this.bucketName = bucketName;
 
-        withNetworkAliases(randomString("minio", 6));
+        withNetworkAliases(randomString("rustfs", 6));
         addExposedPort(DEFAULT_PORT);
-        withEnv(MINIO_ACCESS_KEY, this.accessKey);
-        withEnv(MINIO_SECRET_KEY, this.secretKey);
-        withCommand("server", "/data");
+        withEnv(RUSTFS_ACCESS_KEY, this.accessKey);
+        withEnv(RUSTFS_SECRET_KEY, this.secretKey);
+        withEnv("RUSTFS_CONSOLE_ENABLE", "false");
+        withCommand("/data");
         setWaitStrategy(
                 new HttpWaitStrategy()
                         .forPort(DEFAULT_PORT)
-                        .forPath("/minio/health/ready")
+                        .forPath("/health")
                         .withStartupTimeout(Duration.ofMinutes(2)));
+        withStartupAttempts(3);
     }
 
     @Override

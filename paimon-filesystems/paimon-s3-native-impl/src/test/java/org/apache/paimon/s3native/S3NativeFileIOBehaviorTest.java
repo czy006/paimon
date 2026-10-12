@@ -28,19 +28,19 @@ import org.junit.jupiter.api.BeforeAll;
 
 import java.util.Map;
 
-/** Behavior suite for {@link S3NativeFileIO} against MinIO. */
+/** Behavior suite for {@link S3NativeFileIO} against RustFS. */
 class S3NativeFileIOBehaviorTest extends FileIOBehaviorTestBase {
 
-    public static final S3NativeMinioContainer MINIO_CONTAINER = new S3NativeMinioContainer();
+    public static final S3NativeRustFsContainer S3_CONTAINER = new S3NativeRustFsContainer();
 
     @BeforeAll
     static void startContainer() {
-        MINIO_CONTAINER.start();
+        S3_CONTAINER.start();
     }
 
     @Override
     protected FileIO getFileSystem() {
-        Map<String, String> config = MINIO_CONTAINER.getS3ConfigOptions();
+        Map<String, String> config = S3_CONTAINER.getS3ConfigOptions();
         S3NativeFileIO fileIO = new S3NativeFileIO();
         fileIO.configure(CatalogContext.create(Options.fromMap(config)));
         return fileIO;
@@ -50,6 +50,6 @@ class S3NativeFileIOBehaviorTest extends FileIOBehaviorTestBase {
     protected Path getBasePath() {
         // Keep the trailing slash: a bucket-root URI without a path component breaks
         // Path(Path, String) resolution (the child would glue onto the authority).
-        return new Path(MINIO_CONTAINER.getS3UriForDefaultBucket() + "/");
+        return new Path(S3_CONTAINER.getS3UriForDefaultBucket() + "/");
     }
 }

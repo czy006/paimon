@@ -41,23 +41,23 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Integration tests for {@link S3NativeFileIO} rename semantics (D2/D7) and stream round-trips
- * (multipart, small file, empty file, lazy seek) against MinIO.
+ * (multipart, small file, empty file, lazy seek) against RustFS.
  */
 class S3NativeFileIOIntegrationTest {
 
-    public static final S3NativeMinioContainer MINIO_CONTAINER = new S3NativeMinioContainer();
+    public static final S3NativeRustFsContainer S3_CONTAINER = new S3NativeRustFsContainer();
 
     private static FileIO fs;
     private static Path base;
 
     @BeforeAll
     static void start() throws IOException {
-        MINIO_CONTAINER.start();
-        Map<String, String> config = MINIO_CONTAINER.getS3ConfigOptions();
+        S3_CONTAINER.start();
+        Map<String, String> config = S3_CONTAINER.getS3ConfigOptions();
         // Small part size so multi-part uploads are exercised with modest data volumes.
         config.put("s3.upload.min.part.size", "5 mb");
         fs = createFileIO(Options.fromMap(config));
-        base = new Path(MINIO_CONTAINER.getS3UriForDefaultBucket() + "/it");
+        base = new Path(S3_CONTAINER.getS3UriForDefaultBucket() + "/it");
         fs.mkdirs(base);
     }
 
@@ -173,7 +173,7 @@ class S3NativeFileIOIntegrationTest {
 
     @Test
     void testBucketRootRecursiveDeleteRefused() throws Exception {
-        Path bucketRoot = new Path(MINIO_CONTAINER.getS3UriForDefaultBucket() + "/");
+        Path bucketRoot = new Path(S3_CONTAINER.getS3UriForDefaultBucket() + "/");
         assertThatThrownBy(() -> fs.delete(bucketRoot, true))
                 .isInstanceOf(IOException.class)
                 .hasMessageContaining("bucket root");
@@ -192,7 +192,7 @@ class S3NativeFileIOIntegrationTest {
     }
 
     private String createSecondBucket() {
-        Map<String, String> config = MINIO_CONTAINER.getS3ConfigOptions();
+        Map<String, String> config = S3_CONTAINER.getS3ConfigOptions();
         String bucket = "second-bucket-" + System.nanoTime();
         software.amazon.awssdk.services.s3.S3Client client =
                 software.amazon.awssdk.services.s3.S3Client.builder()
@@ -395,7 +395,7 @@ class S3NativeFileIOIntegrationTest {
                 Base64.getEncoder()
                         .encodeToString(
                                 java.security.MessageDigest.getInstance("MD5").digest(keyBytes));
-        Map<String, String> config = new HashMap<>(MINIO_CONTAINER.getS3ConfigOptions());
+        Map<String, String> config = new HashMap<>(S3_CONTAINER.getS3ConfigOptions());
         config.put("s3.sse.type", "custom");
         config.put("s3.sse.key", key64);
         config.put("s3.sse.md5", md564);
@@ -408,7 +408,7 @@ class S3NativeFileIOIntegrationTest {
 
     @Test
     void testRecursiveDeleteWithSmallBatchSize() throws Exception {
-        Map<String, String> config = new HashMap<>(MINIO_CONTAINER.getS3ConfigOptions());
+        Map<String, String> config = new HashMap<>(S3_CONTAINER.getS3ConfigOptions());
         config.put("s3.upload.min.part.size", "5 mb");
         // Force many small DeleteObjects batches through the parallel path (I7).
         config.put("s3.delete.batch-size", "3");
