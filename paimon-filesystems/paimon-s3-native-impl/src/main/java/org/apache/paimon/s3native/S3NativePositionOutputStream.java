@@ -58,6 +58,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
@@ -138,6 +139,7 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
     private long currentPartSize;
 
     private String uploadId;
+    private final String uploadToken = UUID.randomUUID().toString();
     private int nextPartNumber = 1;
     private long pos;
     private boolean closed;
@@ -471,7 +473,12 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
 
     private String startMultipartUpload() throws IOException {
         CreateMultipartUploadRequest.Builder requestBuilder =
-                CreateMultipartUploadRequest.builder().bucket(bucket).key(key);
+                CreateMultipartUploadRequest.builder()
+                        .bucket(bucket)
+                        .key(key)
+                        .metadata(
+                                S3NativeUploadMetadata.withToken(
+                                        Collections.emptyMap(), uploadToken));
         sse.apply(requestBuilder);
         applyWriteAttributes(
                 requestBuilder::tagging, requestBuilder::storageClass, requestBuilder::acl);
@@ -531,10 +538,7 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
                                     CompletedMultipartUpload.builder().parts(parts).build())
                             .build());
         } catch (NoSuchUploadException e) {
-            // [PORTED] NativeS3ObjectOperations#commitMultiPartUpload — the complete request may
-            // have succeeded on the server while its response was lost; S3 read-after-write
-            // consistency makes a present object proof the upload committed.
-            if (!objectExists()) {
+            if (!uploadedObjectMatches()) {
                 throw new IOException("Failed to complete multipart upload for " + key, e);
             }
         } catch (RuntimeException e) {
@@ -542,15 +546,15 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
         }
     }
 
-    private boolean objectExists() {
+    private boolean uploadedObjectMatches() {
         try {
             // [PORTED-ICE I8] The NoSuchUpload recovery probe carries SSE-C headers like
             // Iceberg's getObjectMetadata recovery path.
             software.amazon.awssdk.services.s3.model.HeadObjectRequest.Builder builder =
                     HeadObjectRequest.builder().bucket(bucket).key(key);
             sse.applyCustomer(builder);
-            syncClient.headObject(builder.build());
-            return true;
+            return S3NativeUploadMetadata.matches(
+                    syncClient.headObject(builder.build()), uploadToken, pos);
         } catch (RuntimeException e) {
             return false;
         }

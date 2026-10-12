@@ -340,13 +340,46 @@ class S3NativePositionOutputStreamTest {
     }
 
     @Test
-    void testNoSuchUploadCommitRecoverySucceedsWhenObjectExists() throws Exception {
-        // [PORTED] Flink/Iceberg commitMultiPartUpload recovery: a lost Complete response must
-        // not fail the close when the object verifiably exists.
+    void testNoSuchUploadDoesNotConfirmAnOldObject() throws Exception {
         S3Client sync = mock(S3Client.class);
         S3AsyncClient async = mock(S3AsyncClient.class);
         when(sync.createMultipartUpload(any(CreateMultipartUploadRequest.class)))
                 .thenReturn(CreateMultipartUploadResponse.builder().uploadId("u1").build());
+        when(async.uploadPart(any(UploadPartRequest.class), any(AsyncRequestBody.class)))
+                .thenReturn(
+                        CompletableFuture.completedFuture(
+                                UploadPartResponse.builder().eTag("new-part").build()));
+        when(sync.completeMultipartUpload(any(CompleteMultipartUploadRequest.class)))
+                .thenThrow(
+                        software.amazon.awssdk.services.s3.model.NoSuchUploadException.builder()
+                                .statusCode(404)
+                                .build());
+        when(sync.headObject(any(software.amazon.awssdk.services.s3.model.HeadObjectRequest.class)))
+                .thenReturn(
+                        software.amazon.awssdk.services.s3.model.HeadObjectResponse.builder()
+                                .contentLength(PART_SIZE + 3)
+                                .eTag("old-object")
+                                .build());
+
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(sync, async, "bucket", "key", options());
+        out.write(new byte[(int) PART_SIZE + 3]);
+        assertThatThrownBy(out::close).isInstanceOf(IOException.class);
+        verify(sync).abortMultipartUpload(any(AbortMultipartUploadRequest.class));
+    }
+
+    @Test
+    void testNoSuchUploadCommitRecoverySucceedsWhenObjectExists() throws Exception {
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        java.util.concurrent.atomic.AtomicReference<CreateMultipartUploadRequest> create =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        when(sync.createMultipartUpload(any(CreateMultipartUploadRequest.class)))
+                .thenAnswer(
+                        invocation -> {
+                            create.set(invocation.getArgument(0));
+                            return CreateMultipartUploadResponse.builder().uploadId("u1").build();
+                        });
         when(async.uploadPart(any(UploadPartRequest.class), any(AsyncRequestBody.class)))
                 .thenReturn(
                         CompletableFuture.completedFuture(
@@ -358,9 +391,13 @@ class S3NativePositionOutputStreamTest {
                                         .builder()
                                         .build());
         when(sync.headObject(any(software.amazon.awssdk.services.s3.model.HeadObjectRequest.class)))
-                .thenReturn(
-                        software.amazon.awssdk.services.s3.model.HeadObjectResponse.builder()
-                                .build());
+                .thenAnswer(
+                        invocation ->
+                                software.amazon.awssdk.services.s3.model.HeadObjectResponse
+                                        .builder()
+                                        .metadata(create.get().metadata())
+                                        .contentLength(PART_SIZE + 3)
+                                        .build());
 
         S3NativePositionOutputStream out =
                 new S3NativePositionOutputStream(sync, async, "bucket", "key", options());
@@ -395,6 +432,41 @@ class S3NativePositionOutputStreamTest {
                                         .builder()
                                         .build());
 
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(sync, async, "bucket", "key", options());
+        out.write(new byte[(int) PART_SIZE + 3]);
+        assertThatThrownBy(out::close).isInstanceOf(IOException.class);
+    }
+
+    @Test
+    void testNoSuchUploadRejectsMatchingTokenWithWrongLength() throws Exception {
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        java.util.concurrent.atomic.AtomicReference<CreateMultipartUploadRequest> create =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        when(sync.createMultipartUpload(any(CreateMultipartUploadRequest.class)))
+                .thenAnswer(
+                        invocation -> {
+                            create.set(invocation.getArgument(0));
+                            return CreateMultipartUploadResponse.builder().uploadId("u1").build();
+                        });
+        when(async.uploadPart(any(UploadPartRequest.class), any(AsyncRequestBody.class)))
+                .thenReturn(
+                        CompletableFuture.completedFuture(
+                                UploadPartResponse.builder().eTag("part").build()));
+        when(sync.completeMultipartUpload(any(CompleteMultipartUploadRequest.class)))
+                .thenThrow(
+                        software.amazon.awssdk.services.s3.model.NoSuchUploadException.builder()
+                                .statusCode(404)
+                                .build());
+        when(sync.headObject(any(software.amazon.awssdk.services.s3.model.HeadObjectRequest.class)))
+                .thenAnswer(
+                        invocation ->
+                                software.amazon.awssdk.services.s3.model.HeadObjectResponse
+                                        .builder()
+                                        .metadata(create.get().metadata())
+                                        .contentLength(PART_SIZE + 2)
+                                        .build());
         S3NativePositionOutputStream out =
                 new S3NativePositionOutputStream(sync, async, "bucket", "key", options());
         out.write(new byte[(int) PART_SIZE + 3]);

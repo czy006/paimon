@@ -38,8 +38,10 @@ import software.amazon.awssdk.services.s3.model.UploadPartCopyRequest;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 import static org.apache.paimon.s3native.S3PathUtils.isMarkerKey;
@@ -477,9 +479,15 @@ public class S3NativeFileIO implements FileIO {
             long length)
             throws IOException {
         String uploadId = null;
+        String uploadToken = UUID.randomUUID().toString();
         try {
             CreateMultipartUploadRequest.Builder createBuilder =
-                    CreateMultipartUploadRequest.builder().bucket(operations.bucket()).key(dstKey);
+                    CreateMultipartUploadRequest.builder()
+                            .bucket(operations.bucket())
+                            .key(dstKey)
+                            .metadata(
+                                    S3NativeUploadMetadata.withToken(
+                                            Collections.emptyMap(), uploadToken));
             sse.apply(createBuilder);
             CreateMultipartUploadResponse create =
                     operations.client().createMultipartUpload(createBuilder.build());
@@ -523,9 +531,15 @@ public class S3NativeFileIO implements FileIO {
                                                         .build())
                                         .build());
             } catch (software.amazon.awssdk.services.s3.model.NoSuchUploadException e) {
-                // [PORTED] NativeS3ObjectOperations#commitMultiPartUpload — the complete request
-                // may have succeeded while its response was lost; verify the object exists.
-                if (operations.headObjectOrNull(dstKey) == null) {
+                software.amazon.awssdk.services.s3.model.HeadObjectResponse head;
+                try {
+                    head = operations.headObjectOrNull(dstKey);
+                } catch (IOException verificationFailure) {
+                    e.addSuppressed(verificationFailure);
+                    abortCopyQuietly(operations, dstKey, uploadId);
+                    throw new IOException("Failed to verify multipart copy " + dstKey, e);
+                }
+                if (!S3NativeUploadMetadata.matches(head, uploadToken, length)) {
                     abortCopyQuietly(operations, dstKey, uploadId);
                     throw new IOException(
                             "Failed to multipart-copy " + srcKey + " to " + dstKey, e);
