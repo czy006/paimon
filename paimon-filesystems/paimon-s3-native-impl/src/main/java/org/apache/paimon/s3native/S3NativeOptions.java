@@ -221,21 +221,28 @@ final class S3NativeOptions {
                             + ")");
         }
 
+        String accessKey = normalized.get("s3.access-key");
+        String secretKey = normalized.get("s3.secret-key");
         String sessionToken = normalized.get("s3.session-token");
         if (sessionToken != null
-                && (sessionToken.trim().isEmpty()
-                        || isBlank(normalized.get("s3.access-key"))
-                        || isBlank(normalized.get("s3.secret-key")))) {
+                && (sessionToken.trim().isEmpty() || isBlank(accessKey) || isBlank(secretKey))) {
             throw new IllegalArgumentException(
                     "s3.session-token requires a non-empty token and both s3.access-key and "
                             + "s3.secret-key; it cannot be combined with default-chain credentials");
         }
 
+        if ((accessKey != null || secretKey != null)
+                && (isBlank(accessKey) || isBlank(secretKey))) {
+            throw new IllegalArgumentException(
+                    "Explicit credentials require both non-empty s3.access-key and s3.secret-key; "
+                            + "omit both to use default-chain credentials");
+        }
+
         S3NativeSse sse = S3NativeSse.from(normalized);
         sse.validateEndpoint(endpoint);
         return new S3NativeOptions(
-                normalized.get("s3.access-key"),
-                normalized.get("s3.secret-key"),
+                accessKey,
+                secretKey,
                 sessionToken,
                 normalized.get("s3.region"),
                 endpoint,

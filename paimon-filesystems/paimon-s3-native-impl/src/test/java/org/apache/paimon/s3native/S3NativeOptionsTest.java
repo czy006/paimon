@@ -137,8 +137,15 @@ class S3NativeOptionsTest {
             {"s3.retry.max-backoff", "21s"},
         };
         for (String[] variant : clientLevelVariants) {
-            S3NativeOptions base = parse();
-            S3NativeOptions varied = parse(variant[0], variant[1]);
+            S3NativeOptions base = parse("s3.access-key", "base-ak", "s3.secret-key", "base-sk");
+            S3NativeOptions varied =
+                    parse(
+                            "s3.access-key",
+                            "base-ak",
+                            "s3.secret-key",
+                            "base-sk",
+                            variant[0],
+                            variant[1]);
             org.assertj.core.api.Assertions.assertThat(S3NativeFileIO.ClientKey.from(varied))
                     .as("ClientKey must differ when %s changes", variant[0])
                     .isNotEqualTo(S3NativeFileIO.ClientKey.from(base));
