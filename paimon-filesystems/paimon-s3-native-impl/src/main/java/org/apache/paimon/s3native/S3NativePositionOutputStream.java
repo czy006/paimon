@@ -558,14 +558,15 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
         }
         parts.sort(Comparator.comparing(CompletedPart::partNumber));
         try {
-            syncClient.completeMultipartUpload(
+            CompleteMultipartUploadRequest.Builder requestBuilder =
                     CompleteMultipartUploadRequest.builder()
                             .bucket(bucket)
                             .key(key)
                             .uploadId(uploadId)
                             .multipartUpload(
-                                    CompletedMultipartUpload.builder().parts(parts).build())
-                            .build());
+                                    CompletedMultipartUpload.builder().parts(parts).build());
+            sse.applyCustomer(requestBuilder);
+            syncClient.completeMultipartUpload(requestBuilder.build());
         } catch (NoSuchUploadException e) {
             if (!uploadedObjectMatches()) {
                 throw new IOException("Failed to complete multipart upload for " + key, e);

@@ -20,6 +20,7 @@ package org.apache.paimon.s3native;
 
 import org.apache.paimon.options.Options;
 
+import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CopyObjectRequest;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
@@ -206,6 +207,17 @@ final class S3NativeSse {
 
     private static boolean hasText(@Nullable String value) {
         return value != null && !value.trim().isEmpty();
+    }
+
+    /** Applies SSE-C to completion requests for checksum and bucket-policy requirements. */
+    void applyCustomer(CompleteMultipartUploadRequest.Builder builder) {
+        // https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html
+        if (type == Type.CUSTOM) {
+            applyCustomer(
+                    builder::sseCustomerAlgorithm,
+                    builder::sseCustomerKey,
+                    builder::sseCustomerKeyMD5);
+        }
     }
 
     /** Applies SSE-C to a part-upload request (the only SSE form valid there). */

@@ -28,6 +28,8 @@ import org.apache.paimon.options.Options;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest;
+import software.amazon.awssdk.services.s3.model.CompletedMultipartUpload;
 import software.amazon.awssdk.services.s3.model.CopyObjectRequest;
 import software.amazon.awssdk.services.s3.model.CopyPartResult;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
@@ -537,20 +539,15 @@ public class S3NativeFileIO implements FileIO {
                                 .build());
             }
             try {
-                operations
-                        .client()
-                        .completeMultipartUpload(
-                                software.amazon.awssdk.services.s3.model
-                                        .CompleteMultipartUploadRequest.builder()
-                                        .bucket(operations.bucket())
-                                        .key(dstKey)
-                                        .uploadId(uploadId)
-                                        .multipartUpload(
-                                                software.amazon.awssdk.services.s3.model
-                                                        .CompletedMultipartUpload.builder()
-                                                        .parts(parts)
-                                                        .build())
-                                        .build());
+                CompleteMultipartUploadRequest.Builder completeBuilder =
+                        CompleteMultipartUploadRequest.builder()
+                                .bucket(operations.bucket())
+                                .key(dstKey)
+                                .uploadId(uploadId)
+                                .multipartUpload(
+                                        CompletedMultipartUpload.builder().parts(parts).build());
+                sse.applyCustomer(completeBuilder);
+                operations.client().completeMultipartUpload(completeBuilder.build());
             } catch (software.amazon.awssdk.services.s3.model.NoSuchUploadException e) {
                 software.amazon.awssdk.services.s3.model.HeadObjectResponse head;
                 try {
