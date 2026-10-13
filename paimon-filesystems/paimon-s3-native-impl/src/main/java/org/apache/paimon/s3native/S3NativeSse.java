@@ -38,14 +38,19 @@ import java.util.function.Consumer;
 /**
  * Server-side encryption settings applied to S3 requests.
  *
- * <p>[PORTED-ICE Spec §14 I8] Adopted from Iceberg S3RequestUtil (configureEncryption family):
- * SSE-S3 / SSE-KMS / DSSE-KMS shape object-creating requests (PutObject, CreateMultipartUpload);
- * SSE-C (customer-managed keys) additionally shapes Get/Head/UploadPart, which is exactly the part
- * easy to miss. Local reference: /Users/SL/javaProject/iceberg/aws/src/main/java/org/
- * apache/iceberg/aws/s3/S3RequestUtil.java
+ * <p>Reference: Iceberg S3RequestUtil#configureEncryption overloads for PutObject,
+ * CreateMultipartUpload, UploadPart, GetObject and HeadObject, and the shared encryption
+ * dispatcher:
+ * https://github.com/apache/iceberg/blob/4eb9cb7c3d53cb8080724eebf6e6898871ee23b0/aws/src/main/java/org/apache/iceberg/aws/s3/S3RequestUtil.java#L41-L134
  *
- * <p>Options: {@code s3.sse.type} (none|s3|kms|dsse-kms|custom), {@code s3.sse.key} (KMS key id, or
- * base64 AES-256 key for SSE-C), {@code s3.sse.md5} (base64 MD5 of the SSE-C key).
+ * <p>Paimon extends this request mapping to copy-source keys and multipart completion. The
+ * completion fields are verified in AWS SDK 2.55.1's s3-2.55.1-sources.jar, class
+ * software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest (SSE_CUSTOMER_*_FIELD
+ * header traits and Builder#sseCustomerAlgorithm, #sseCustomerKey and #sseCustomerKeyMD5):
+ * https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html
+ *
+ * <p>Options: {@code s3.sse.type} (none|s3|kms|dsse-kms|custom), {@code s3.sse.key} (KMS key id or
+ * base64 AES-256 customer key), and {@code s3.sse.md5} (base64 MD5 of that key).
  */
 final class S3NativeSse {
 
@@ -209,7 +214,11 @@ final class S3NativeSse {
         return value != null && !value.trim().isEmpty();
     }
 
-    /** Applies SSE-C to completion requests for checksum and bucket-policy requirements. */
+    /**
+     * Applies SSE-C to completion requests for checksum and bucket-policy requirements. SDK
+     * reference: CompleteMultipartUploadRequest.SSE_CUSTOMER_*_FIELD and Builder setters listed
+     * above. This completion extension is based on the S3 API, not Iceberg's helper.
+     */
     void applyCustomer(CompleteMultipartUploadRequest.Builder builder) {
         // https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html
         if (type == Type.CUSTOM) {

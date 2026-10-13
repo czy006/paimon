@@ -24,8 +24,10 @@ import org.apache.paimon.fs.Path;
 /**
  * {@link FileStatus} for S3 objects and simulated directories.
  *
- * <p>[PORTED] Derived from Apache Flink flink-filesystems/flink-s3-fs-native (FLINK-38592, Apache
- * License 2.0), class org.apache.flink.fs.s3native.S3FileStatus.
+ * <p>Reference: Apache Flink (Apache License 2.0), S3FileStatus#withFile and #withDirectory:
+ * https://github.com/apache/flink/blob/6ad337697826a995789a6dafc7d379f64548e34e/flink-filesystems/flink-s3-fs-native/src/main/java/org/apache/flink/fs/s3native/S3FileStatus.java#L26-L76
+ *
+ * <p>Paimon reports a wall-clock timestamp for directories; the Flink reference reports zero.
  */
 final class S3NativeFileStatus implements FileStatus {
 
@@ -47,7 +49,7 @@ final class S3NativeFileStatus implements FileStatus {
 
     static S3NativeFileStatus directory(Path path) {
         // Directory timestamps are best-effort on object stores. [ADAPTED] Flink reports 0; we
-        // report wall-clock time, which keeps listings monotonic for tooling.
+        // report wall-clock time, as a Paimon FileStatus convention.
         return new S3NativeFileStatus(0, true, path, System.currentTimeMillis());
     }
 

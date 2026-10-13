@@ -21,14 +21,13 @@ package org.apache.paimon.s3native;
 import org.apache.paimon.fs.Path;
 
 /**
- * Extracts bucket and object key from Paimon {@link Path} URIs of the form {@code
- * s3://bucket-name/path/to/object}.
+ * Bucket/key extraction and directory-marker helpers for {@code s3://bucket-name/path/to/object}.
  *
- * <p>[PORTED] Derived from Apache Flink flink-filesystems/flink-s3-fs-native (FLINK-38592, Apache
- * License 2.0), class org.apache.flink.fs.s3native.writer.NativeS3ObjectOperations
- * (extractKey/extractBucketName). Local reference: /Users/SL/javaProject/flink/
- * flink-filesystems/flink-s3-fs-native/src/main/java/org/apache/flink/fs/s3native/writer/
- * NativeS3ObjectOperations.java
+ * <p>Reference: Apache Flink (Apache License 2.0), S3UriUtils#extractKey(Path) and
+ * #extractBucketName(Path), from the reviewed master snapshot:
+ * https://github.com/apache/flink/blob/6ad337697826a995789a6dafc7d379f64548e34e/flink-filesystems/flink-s3-fs-native/src/main/java/org/apache/flink/fs/s3native/S3UriUtils.java#L37-L50
+ *
+ * <p>Paimon additionally validates a missing bucket and handles normalized directory-marker keys.
  */
 final class S3PathUtils {
 
@@ -36,7 +35,7 @@ final class S3PathUtils {
 
     /** Returns the bucket name (URI host). Fails if the URI carries no authority. */
     static String bucket(Path path) {
-        // [PORTED] NativeS3ObjectOperations#extractBucketName
+        // [PORTED] S3UriUtils#extractBucketName
         String bucket = path.toUri().getHost();
         if (bucket == null || bucket.isEmpty()) {
             throw new IllegalArgumentException(
@@ -50,12 +49,12 @@ final class S3PathUtils {
      * empty key.
      */
     static String key(Path path) {
-        // [PORTED] NativeS3ObjectOperations#extractKey
+        // [PORTED] S3UriUtils#extractKey
         String key = path.toUri().getPath();
         if (key == null) {
             return "";
         }
-        // [PORTED] NativeS3ObjectOperations#extractKey — single leading-slash strip; Paimon
+        // [PORTED] S3UriUtils#extractKey — single leading-slash strip; Paimon
         // Path normalization already removes trailing slashes before we get here.
         if (key.startsWith("/")) {
             key = key.substring(1);

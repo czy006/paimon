@@ -78,32 +78,24 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * Positional output stream writing to S3.
+ * Positional output stream writing to S3 with per-part local staging and bounded async uploads.
  *
- * <p>Data is buffered into local per-part temp files (64KB write buffer). A filled part is rolled
- * into a pending list and submitted as an async {@code UploadPart} with bounded in-flight
- * concurrency once the multipart threshold is reached ([PORTED-ICE I5]: {@code threshold = partSize
- * * factor}, default 1.5 — smaller objects stay on the single-PutObject path); {@link #close()}
- * uploads the tail and completes the multipart upload. With {@code s3.checksum-enabled}, part-level
- * and whole-object MD5 digests are sent as Content-MD5 ([PORTED-ICE I4]); write tags, storage class
- * and canned ACL are attached to object-creating requests ([PORTED-ICE I6]).
+ * <p>References: Apache Flink (Apache License 2.0),
+ * NativeS3RecoverableFsDataOutputStream#createNewTempFile, #uploadCurrentPart and #closeForCommit
+ * for staging and cleanup, and NativeS3OutputStream#uploadToS3 for the single-PUT path:
+ * https://github.com/apache/flink/blob/6ad337697826a995789a6dafc7d379f64548e34e/flink-filesystems/flink-s3-fs-native/src/main/java/org/apache/flink/fs/s3native/writer/NativeS3RecoverableFsDataOutputStream.java#L136-L249
+ * https://github.com/apache/flink/blob/6ad337697826a995789a6dafc7d379f64548e34e/flink-filesystems/flink-s3-fs-native/src/main/java/org/apache/flink/fs/s3native/NativeS3OutputStream.java#L170-L205
  *
- * <p>[PORTED] Buffering pattern from Apache Flink flink-filesystems/flink-s3-fs-native
- * (FLINK-38592, Apache License 2.0) writer/NativeS3RecoverableFsDataOutputStream (per-part temp
- * files, 64KB buffer, CompletedPart collection, abort-on-failure) and NativeS3OutputStream
- * (single-PutObject small-file path, here extended to Iceberg's multi-file sequence form). Local
- * reference: /Users/SL/javaProject/flink/flink-filesystems/flink-s3-fs-native/src/main/java/org/
- * apache/flink/fs/s3native/. Iceberg reference: S3OutputStream.java (threshold switch, part
- * splitting, MD5 digests, tags/storage-class) in /Users/SL/javaProject/iceberg/aws/src/main/
- * java/org/apache/iceberg/aws/s3/.
+ * <p>Reference: Iceberg S3OutputStream#write, #newStream and #completeUploads for part-boundary
+ * splitting, the multipart threshold, MD5 digests and the sequence of staged files for small
+ * uploads:
+ * https://github.com/apache/iceberg/blob/4eb9cb7c3d53cb8080724eebf6e6898871ee23b0/aws/src/main/java/org/apache/iceberg/aws/s3/S3OutputStream.java#L164-L272
+ * https://github.com/apache/iceberg/blob/4eb9cb7c3d53cb8080724eebf6e6898871ee23b0/aws/src/main/java/org/apache/iceberg/aws/s3/S3OutputStream.java#L412-L450
  *
- * <p>[DEVIATION D3] Parts are uploaded via bounded-concurrency async UploadPart calls instead of
- * Flink's synchronous sequential uploadPart — the TransferManager offers no parallel multipart on
- * the non-CRT Netty client, and CRT is excluded (D8).
- *
- * <p>Single-writer contract like the Flink original: write/flush/close are lock-guarded so close
- * from another thread (task cancellation) stays safe. An abandoned stream that is never closed
- * leaks its local part temp files until finalization — always close in a finally block.
+ * <p>Paimon replaces the reference upload orchestration with async UploadPart futures. A failed
+ * write or flush permanently closes the stream; {@link #close()} must never publish its staged
+ * prefix. Write, flush and close share a lock so task cancellation cannot publish a partially
+ * staged object. Always close the stream; finalization only provides last-resort cleanup.
  */
 final class S3NativePositionOutputStream extends PositionOutputStream {
 
@@ -251,7 +243,7 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
         lock.lock();
         try {
             ensureOpen();
-            // [PORTED-ICE Spec §14 I2] Split writes larger than a part at part boundaries, so a
+            // [ADAPTED FROM ICEBERG] Split writes larger than a part at part boundaries, so a
             // single large write cannot produce oversized parts. Mirrors Iceberg
             // S3OutputStream#write(byte[], int, int).
             int remaining = len;
@@ -272,7 +264,8 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
             currentPartSize += remaining;
             updateWholeDigest(b, relativeOffset, remaining);
             onPartMaybeFull();
-            // [PORTED-ICE I5] Iceberg re-checks the threshold at the end of every write; without
+            // [ADAPTED FROM ICEBERG] Iceberg re-checks the threshold at the end of every write;
+            // without
             // this tail check a sub-part-increment stream just past the threshold would reach
             // close() and take the single-PutObject path instead of starting the MPU.
             maybeStartUploading();
@@ -314,7 +307,8 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
             closed = true;
             try {
                 if (uploadId == null) {
-                    // [PORTED-ICE I5] Below the threshold: one PutObject over the sequence of all
+                    // [ADAPTED FROM ICEBERG] Below the threshold: one PutObject over the sequence
+                    // of all
                     // staging files (Iceberg S3OutputStream#completeUploads).
                     currentBuffer.flush();
                     currentBuffer.close();
@@ -384,7 +378,7 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
     }
 
     /**
-     * [PORTED-ICE I5] Parts start uploading only once the stream has passed the multipart
+     * [ADAPTED FROM ICEBERG] Parts start uploading only once the stream has passed the multipart
      * threshold; afterwards every filled part is submitted immediately.
      */
     private void maybeStartUploading() throws IOException {
@@ -454,6 +448,10 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
      * failure aborts the upload and poisons the stream so later writes fail fast with the original
      * cause chain intact.
      */
+    // SDK reference: AsyncRequestBody#fromFile(Path) builds the file-backed async body.
+    // Close staging before subscription. Successful parts are deleted after future completion;
+    // failure cleanup attempts to abort the upload and deletes staged files best effort.
+    // https://github.com/aws/aws-sdk-java-v2/blob/2.55.1/core/sdk-core/src/main/java/software/amazon/awssdk/core/async/AsyncRequestBody.java#L149-L171
     private void submitPendingParts() throws IOException {
         if (pendingParts.isEmpty()) {
             return;
@@ -518,7 +516,7 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
         }
     }
 
-    /** [PORTED-ICE I6] Tags, storage class and ACL on every object-creating request. */
+    /** [ADAPTED FROM ICEBERG] Tags, storage class and ACL on every object-creating request. */
     private void applyWriteAttributes(
             java.util.function.Consumer<Tagging> taggingSetter,
             java.util.function.Consumer<StorageClass> storageClassSetter,
@@ -578,7 +576,7 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
 
     private boolean uploadedObjectMatches() {
         try {
-            // [PORTED-ICE I8] The NoSuchUpload recovery probe carries SSE-C headers like
+            // [ADAPTED FROM ICEBERG] The NoSuchUpload recovery probe carries SSE-C headers like
             // Iceberg's getObjectMetadata recovery path.
             software.amazon.awssdk.services.s3.model.HeadObjectRequest.Builder builder =
                     HeadObjectRequest.builder().bucket(bucket).key(key);
@@ -590,7 +588,15 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
         }
     }
 
-    /** Discards a failed write without letting a later close publish its staged prefix. */
+    /**
+     * Discards a failed write without letting a later close publish its staged prefix.
+     *
+     * <p>Reference: Flink NativeS3RecoverableFsDataOutputStream#closeForCommit releases local
+     * resources on failure and leaves the upload open for checkpoint recovery. Paimon's FileIO
+     * stream instead makes write/flush/initialization failures terminal and attempts to abort
+     * existing uploads, including cleanup when initialization produced no upload ID:
+     * https://github.com/apache/flink/blob/6ad337697826a995789a6dafc7d379f64548e34e/flink-filesystems/flink-s3-fs-native/src/main/java/org/apache/flink/fs/s3native/writer/NativeS3RecoverableFsDataOutputStream.java#L221-L264
+     */
     private IOException failStream(Exception cause) {
         failure =
                 cause instanceof IOException
@@ -649,13 +655,19 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
         tempFiles.add(partFile);
         currentPartSize = 0;
         outputStream = new BufferedOutputStream(outputStream, BUFFER_SIZE);
-        // [PORTED-ICE I4] Part-level MD5 accumulates as bytes pass through the buffer.
+        // [ADAPTED FROM ICEBERG] Part-level MD5 accumulates as bytes pass through the buffer.
         currentBuffer =
                 checksumEnabled && currentPartDigest != null
                         ? new DigestOutputStream(outputStream, currentPartDigest)
                         : outputStream;
     }
 
+    /**
+     * JDK reference: Files#newByteChannel(Path, Set, FileAttribute...) atomically applies file
+     * attributes on CREATE_NEW. Create and open in one operation to avoid a path-replacement
+     * window; non-POSIX providers retain their native creation permissions.
+     * https://docs.oracle.com/javase/8/docs/api/java/nio/file/Files.html#newByteChannel-java.nio.file.Path-java.util.Set-java.nio.file.attribute.FileAttribute...-
+     */
     private static OutputStream createPartStream(Path path) throws IOException {
         Set<StandardOpenOption> options =
                 EnumSet.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
@@ -682,7 +694,7 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
     }
 
     /**
-     * [PORTED-ICE Spec §14 I3] Last-resort cleanup for streams a writer failed to close: abort the
+     * [ADAPTED FROM ICEBERG] Last-resort cleanup for streams a writer failed to close: abort the
      * multipart upload and delete temp files. Completing the upload from a finalizer would be
      * unsafe, so the data is intentionally discarded. Mirrors Iceberg S3OutputStream#finalize.
      */

@@ -51,14 +51,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * Builds and owns the sync ({@link S3Client}, Apache HTTP) and async ({@link S3AsyncClient}, Netty)
  * S3 clients from {@link S3NativeOptions}.
  *
- * <p>[PORTED] Derived from Apache Flink flink-filesystems/flink-s3-fs-native (FLINK-38592, Apache
- * License 2.0), class org.apache.flink.fs.s3native.S3ClientProvider (trimmed: no CRT transport, no
- * STS assume-role, no delegation tokens, no metrics, no TransferManager — parallel multipart is
- * issued via bounded-concurrency async UploadPart calls instead, see Spec deviation D3/D8). Local
- * reference: /Users/SL/javaProject/flink/flink-filesystems/flink-s3-fs-native/src/main/java/org/
- * apache/flink/fs/s3native/S3ClientProvider.java
+ * <p>Reference: Apache Flink (Apache License 2.0), S3ClientProvider.Builder#build,
+ * #buildSyncClient, #buildAsyncClient and #buildBaseCredentialsProvider, from the reviewed master
+ * snapshot:
+ * https://github.com/apache/flink/blob/6ad337697826a995789a6dafc7d379f64548e34e/flink-filesystems/flink-s3-fs-native/src/main/java/org/apache/flink/fs/s3native/S3ClientProvider.java#L646-L942
  *
- * <p>Thread-safe after construction; {@link #close()} is idempotent.
+ * <p>Paimon uses bounded async UploadPart calls and the SDK default credential chain, without
+ * Flink's recoverable writer, delegation-token provider, explicit assume-role options or CRT
+ * transport. Thread-safe after construction; {@link #close()} is idempotent.
  */
 final class S3NativeClientProvider implements AutoCloseable {
 
@@ -110,12 +110,12 @@ final class S3NativeClientProvider implements AutoCloseable {
                                                         options.retryThrottleBaseDelay,
                                                         options.retryMaxBackoff))
                                         // [ADAPTED] Circuit breaker stays at the Flink default
-                                        // (off); the toggle option is out of scope (D8).
+                                        // (off); the toggle option is out of scope.
                                         .circuitBreakerEnabled(false)
                                         .build())
                         .build();
 
-        // [PORTED] S3ClientProvider#buildSyncClient (non-CRT branch)
+        // [PORTED] S3ClientProvider.Builder#buildSyncClient (non-CRT branch)
         S3ClientBuilder syncBuilder =
                 S3Client.builder()
                         .credentialsProvider(credentialsProvider)
@@ -134,7 +134,7 @@ final class S3NativeClientProvider implements AutoCloseable {
         }
         S3Client syncClient = syncBuilder.build();
 
-        // [PORTED] S3ClientProvider#buildAsyncClient (non-CRT branch)
+        // [PORTED] S3ClientProvider.Builder#buildAsyncClient (non-CRT branch)
         S3AsyncClientBuilder asyncBuilder =
                 S3AsyncClient.builder()
                         .credentialsProvider(credentialsProvider)
@@ -167,9 +167,12 @@ final class S3NativeClientProvider implements AutoCloseable {
     }
 
     private static AwsCredentialsProvider buildCredentialsProvider(S3NativeOptions options) {
-        // [PORTED] S3ClientProvider#buildBaseCredentialsProvider — static credentials first,
-        // then the default chain (env vars, profiles, instance metadata). [DEVIATION D8]
-        // delegation-token and custom provider classes are out of scope.
+        // Reference: Flink S3ClientProvider.Builder#buildBaseCredentialsProvider (link above).
+        // SDK 2.55.1 DefaultCredentialsProvider#createChain provides web identity and role
+        // profiles;
+        // static session credentials must use AwsSessionCredentials#create to carry the token.
+        // https://github.com/aws/aws-sdk-java-v2/blob/2.55.1/core/auth/src/main/java/software/amazon/awssdk/auth/credentials/DefaultCredentialsProvider.java#L93-L121
+        // https://github.com/aws/aws-sdk-java-v2/blob/2.55.1/core/auth/src/main/java/software/amazon/awssdk/auth/credentials/AwsSessionCredentials.java#L47-L72
         List<AwsCredentialsProvider> chain = new ArrayList<>();
         if (options.accessKey != null && options.secretKey != null) {
             chain.add(
@@ -189,8 +192,8 @@ final class S3NativeClientProvider implements AutoCloseable {
     }
 
     /**
-     * [PORTED] S3ClientProvider#resolveRegion — explicit region, else AWS SDK region detection
-     * (AWS_REGION env var, ~/.aws/config, EC2 metadata); no silent fallback.
+     * [PORTED] S3ClientProvider.Builder#resolveRegion — explicit region, else AWS SDK region
+     * detection (AWS_REGION env var, ~/.aws/config, EC2 metadata); no silent fallback.
      */
     private static Region resolveRegion(@Nullable String explicitRegion) {
         if (explicitRegion != null && !explicitRegion.trim().isEmpty()) {
@@ -219,7 +222,11 @@ final class S3NativeClientProvider implements AutoCloseable {
     /**
      * [PORTED] S3ClientProvider#closeAsync — sequential close, each guarded. [ADAPTED] Synchronous
      * instead of a time-bounded async close ({@code orTimeout} is Java 9+), so a hung client close
-     * blocks the caller — acceptable because this provider is process-cached (Spec R5).
+     * blocks the caller. Providers are cached across FileIO instances.
+     *
+     * <p>Reference: Flink S3ClientProvider#closeAsync, with synchronous close as a Java 8
+     * adaptation:
+     * https://github.com/apache/flink/blob/6ad337697826a995789a6dafc7d379f64548e34e/flink-filesystems/flink-s3-fs-native/src/main/java/org/apache/flink/fs/s3native/S3ClientProvider.java#L356-L391
      */
     @Override
     public void close() {

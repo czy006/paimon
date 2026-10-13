@@ -30,10 +30,13 @@ import java.util.Map;
 /**
  * Typed, immutable view of the canonical {@code s3.*} option set with validation and clamping.
  *
- * <p>[PORTED] Defaults and validation rules are taken from Apache Flink flink-filesystems/
- * flink-s3-fs-native (FLINK-38592), class org.apache.flink.fs.s3native.NativeS3FileSystemFactory.
- * Local reference: /Users/SL/javaProject/flink/flink-filesystems/flink-s3-fs-native/src/main/java/
- * org/apache/flink/fs/s3native/NativeS3FileSystemFactory.java
+ * <p>Reference: Apache Flink NativeS3FileSystemFactory option definitions and #create validation,
+ * including the part-size bounds and minimum read-buffer size:
+ * https://github.com/apache/flink/blob/6ad337697826a995789a6dafc7d379f64548e34e/flink-filesystems/flink-s3-fs-native/src/main/java/org/apache/flink/fs/s3native/NativeS3FileSystemFactory.java#L606-L644
+ *
+ * <p>Reference: Iceberg S3FileIOProperties for multipart threshold, checksum, encryption, write
+ * attributes and delete batching. Paimon keeps its own documented option names and defaults:
+ * https://github.com/apache/iceberg/blob/4eb9cb7c3d53cb8080724eebf6e6898871ee23b0/aws/src/main/java/org/apache/iceberg/aws/s3/S3FileIOProperties.java
  */
 final class S3NativeOptions {
 
@@ -65,12 +68,12 @@ final class S3NativeOptions {
     final Duration retryMaxBackoff;
     final String tmpDir;
 
-    // [PORTED-ICE Spec §14 I4-I6] Write-path enhancements adopted from Iceberg S3FileIOProperties.
+    // [ADAPTED FROM ICEBERG] Write-path enhancements adopted from Iceberg S3FileIOProperties.
     /** Multipart switches on only above partSize * factor (Iceberg default 1.5). */
     final double multipartThresholdFactor;
     /** When true, part-level and whole-object MD5 are sent as Content-MD5. */
     final boolean checksumEnabled;
-    /** Storage class for new objects; null = bucket default. Typed to reject typos (I6). */
+    /** Storage class for new objects; null = bucket default. Typed to reject typos. */
     @Nullable final software.amazon.awssdk.services.s3.model.StorageClass writeStorageClass;
     /**
      * Tags for new objects, "k1:v1,k2:v2"; empty map = none. [DEVIATION vs Iceberg] Iceberg uses
@@ -78,10 +81,10 @@ final class S3NativeOptions {
      * option. Empty values are allowed (S3 permits them); duplicate keys keep the last value.
      */
     final Map<String, String> writeTags;
-    /** Canned ACL for new objects; null = none. Typed to reject typos (I6). */
+    /** Canned ACL for new objects; null = none. Typed to reject typos. */
     @Nullable final software.amazon.awssdk.services.s3.model.ObjectCannedACL acl;
 
-    // [PORTED-ICE Spec §14 I7] Parallel batch deletion adopted from Iceberg S3FileIOProperties.
+    // [ADAPTED FROM ICEBERG] Parallel batch deletion adopted from Iceberg S3FileIOProperties.
     /**
      * Keys per DeleteObjects request, 1..1000 (S3 API limit). Default 1000 keeps this module's
      * pre-Iceberg behavior; Iceberg's own default is 250.
@@ -90,7 +93,7 @@ final class S3NativeOptions {
     /** Concurrent DeleteObjects requests during bulk deletes (Iceberg default: CPU cores). */
     final int deleteThreads;
 
-    /** [PORTED-ICE Spec §14 I8] Server-side encryption settings; NONE by default. */
+    /** [ADAPTED FROM ICEBERG] Server-side encryption settings; NONE by default. */
     final S3NativeSse sse;
 
     private S3NativeOptions(
@@ -221,6 +224,10 @@ final class S3NativeOptions {
                             + ")");
         }
 
+        // Reference: SDK 2.55.1 AwsBasicCredentials#create and AwsSessionCredentials#create.
+        // Reject incomplete explicit configuration before the default chain can select another
+        // identity; both keys omitted intentionally retains default-chain credentials.
+        // https://github.com/aws/aws-sdk-java-v2/blob/2.55.1/core/auth/src/main/java/software/amazon/awssdk/auth/credentials/AwsBasicCredentials.java#L59-L98
         String accessKey = normalized.get("s3.access-key");
         String secretKey = normalized.get("s3.secret-key");
         String sessionToken = normalized.get("s3.session-token");
@@ -271,7 +278,7 @@ final class S3NativeOptions {
                 sse);
     }
 
-    /** [PORTED-ICE Spec §14 I7] Keys per DeleteObjects request, 1..1000 (S3 API limit). */
+    /** [ADAPTED FROM ICEBERG] Keys per DeleteObjects request, 1..1000 (S3 API limit). */
     private static int validatedDeleteBatchSize(Options options) {
         int batchSize = options.getInteger("s3.delete.batch-size", MAX_BATCH_DELETE_KEYS);
         if (batchSize < 1 || batchSize > MAX_BATCH_DELETE_KEYS) {
@@ -285,7 +292,7 @@ final class S3NativeOptions {
         return value == null || value.trim().isEmpty();
     }
 
-    /** [PORTED-ICE Spec §14 I7] Concurrent DeleteObjects requests; Iceberg default = CPU cores. */
+    /** [ADAPTED FROM ICEBERG] Concurrent DeleteObjects requests; Iceberg default = CPU cores. */
     private static int validatedDeleteThreads(Options options) {
         int threads =
                 options.getInteger(

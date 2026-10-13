@@ -36,22 +36,20 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * S3 input stream with read-ahead buffering, lazy seek, and automatic stream reopening.
+ * S3 input stream with read-ahead buffering, lazy seek and bounded retries for connection failures.
  *
- * <p>{@link #seek(long)} only records the desired position without performing any I/O. All HTTP
- * work is deferred to the next read via {@link #lazySeek()}, so multiple seeks between reads
- * coalesce. A forward seek within {@code readBufferSize} bytes is skipped in-buffer instead of
- * reopening the HTTP connection.
+ * <p>Reference: Apache Flink (Apache License 2.0), NativeS3InputStream#lazySeek,
+ * #openStreamAtCurrentPosition and #releaseStreams, from the reviewed master snapshot:
+ * https://github.com/apache/flink/blob/6ad337697826a995789a6dafc7d379f64548e34e/flink-filesystems/flink-s3-fs-native/src/main/java/org/apache/flink/fs/s3native/NativeS3InputStream.java#L113-L245
  *
- * <p>[PORTED] Derived from Apache Flink flink-filesystems/flink-s3-fs-native (FLINK-38592, Apache
- * License 2.0), class org.apache.flink.fs.s3native.NativeS3InputStream. Local reference:
- * /Users/SL/javaProject/flink/flink-filesystems/flink-s3-fs-native/src/main/java/org/apache/
- * flink/fs/s3native/NativeS3InputStream.java
+ * <p>Reference: Iceberg S3InputStream#positionStream, #resetForRetry and #readRange for retry
+ * reopening and independent ranged reads:
+ * https://github.com/apache/iceberg/blob/4eb9cb7c3d53cb8080724eebf6e6898871ee23b0/aws/src/main/java/org/apache/iceberg/aws/s3/S3InputStream.java#L120-L203
+ * https://github.com/apache/iceberg/blob/4eb9cb7c3d53cb8080724eebf6e6898871ee23b0/aws/src/main/java/org/apache/iceberg/aws/s3/S3InputStream.java#L217-L296
  *
- * <p>Also implements {@link VectoredReadable}: {@link #pread(long, byte[], int, int)} issues an
- * independent ranged GET that neither moves the stream cursor nor touches the shared buffer, so it
- * is thread-safe by construction; the inherited default {@code readVectored} parallelizes preads
- * via {@code VectoredReadUtils}.
+ * <p>{@link #seek(long)} records the desired position; the next read performs HTTP work. Paimon
+ * additionally pins every GET to the HEAD ETag, validates response status/length/range, rejects
+ * premature EOF, and implements {@link VectoredReadable} with cursor-independent preads.
  */
 final class S3NativeSeekableInputStream extends SeekableInputStream implements VectoredReadable {
 
@@ -70,13 +68,10 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
     private final String eTag;
 
     /**
-     * [PORTED-ICE Spec §14 I1] Connection failures during an in-flight read are not covered by SDK
-     * retries (which only govern request setup); mirror Iceberg S3InputStream's bounded
-     * reopen-and-retry for them.
-     */
-    /**
-     * Total attempts per read (1 initial + 2 retries); Iceberg budgets 1+3. The smaller budget
-     * trades one extra retry for a tighter failure latency.
+     * Reference: Iceberg S3InputStream#retryPolicy and #resetForRetry wrap body reads, which happen
+     * after SDK request setup. Paimon budgets 1 initial attempt + 2 retries; Iceberg uses 1 + 3.
+     * The smaller budget bounds failure latency.
+     * https://github.com/apache/iceberg/blob/4eb9cb7c3d53cb8080724eebf6e6898871ee23b0/aws/src/main/java/org/apache/iceberg/aws/s3/S3InputStream.java#L53-L86
      */
     private static final int MAX_READ_ATTEMPTS = 3;
 
@@ -370,7 +365,7 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
     }
 
     /**
-     * [PORTED-ICE Spec §14 I3] Last-resort release for streams a reader failed to close; mirrors
+     * [ADAPTED FROM ICEBERG] Last-resort release for streams a reader failed to close; mirrors
      * Iceberg S3InputStream#finalize.
      */
     @Override
@@ -471,6 +466,7 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
         // Pin every GET to the ETag observed by HEAD, including retries and independent preads.
         // If-Match fails with 412 after an overwrite. Unlike versionId it needs no additional
         // GetObjectVersion permission. Source:
+        // SDK reference: s3-2.55.1-sources.jar, GetObjectRequest.Builder#ifMatch marshals If-Match.
         // https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html#API_GetObject_RequestSyntax
         sse.applyCustomer(builder);
         return builder;
@@ -513,8 +509,13 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
     /**
      * Verify the response before exposing bytes at the requested offset. A server can ignore Range
      * and return 200, so only a response for the entire object at offset zero can use that status.
-     * A 206 response is only valid when a range was requested. See RFC 9110 sections 14.2, 14.4,
-     * and 15.3.7.1, and the S3 GetObject response headers.
+     * A 206 response is only valid when a range was requested.
+     *
+     * <p>SDK reference: s3-2.55.1-sources.jar, GetObjectResponse#contentLength/#contentRange and
+     * SdkResponse#sdkHttpResponse expose these response headers and status.
+     * https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html#API_GetObject_ResponseElements
+     * https://www.rfc-editor.org/rfc/rfc9110.html#section-14.4
+     * https://www.rfc-editor.org/rfc/rfc9110.html#section-15.3.7
      */
     private void validateResponse(
             GetObjectResponse response, long start, long length, boolean rangeRequested)
@@ -585,7 +586,15 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
         }
     }
 
-    /** Aborts and closes both streams, nulling the references; returns the first failure. */
+    /**
+     * Aborts and closes both streams, nulling the references; returns the first failure.
+     *
+     * <p>SDK reference: ResponseInputStream#abort prevents Apache HTTP close from draining the
+     * remaining response. Iceberg S3InputStream#closeStream follows the same abort-before-close
+     * rule.
+     * https://github.com/aws/aws-sdk-java-v2/blob/2.55.1/core/sdk-core/src/main/java/software/amazon/awssdk/core/ResponseInputStream.java#L40-L57
+     * https://github.com/apache/iceberg/blob/4eb9cb7c3d53cb8080724eebf6e6898871ee23b0/aws/src/main/java/org/apache/iceberg/aws/s3/S3InputStream.java#L271-L300
+     */
     private IOException releaseStreams() {
         // Abort the in-flight HTTP connection to avoid draining remaining bytes on close.
         if (currentStream != null) {

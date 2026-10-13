@@ -40,6 +40,13 @@ import java.util.Map;
 /**
  * Source attributes and explicit destination overrides for both S3 copy paths.
  *
+ * <p>SDK reference: AWS SDK 2.55.1 s3-2.55.1-sources.jar, HeadObjectResponse accessors,
+ * CopyObjectRequest.Builder#metadataDirective/#taggingDirective, and
+ * CreateMultipartUploadRequest.Builder#metadata/#tagging. The API defines attribute-copy defaults
+ * and the website-redirect exception:
+ * https://docs.aws.amazon.com/AmazonS3/latest/API/API_CopyObject.html#API_CopyObject_RequestSyntax
+ * https://docs.aws.amazon.com/AmazonS3/latest/API/API_CreateMultipartUpload.html#API_CreateMultipartUpload_RequestSyntax
+ *
  * <p>Only an explicitly configured ACL is sent. Source ACLs are not queried or copied; S3 defaults
  * copies to private when ACLs are enabled. Omitting the ACL also supports bucket-owner-enforced
  * ownership. See https://docs.aws.amazon.com/AmazonS3/latest/API/API_CopyObject.html.

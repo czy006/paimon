@@ -23,7 +23,17 @@ import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
 import java.util.HashMap;
 import java.util.Map;
 
-/** Identifies the object committed by one multipart upload, including multipart copies. */
+/**
+ * Identifies the object committed by one multipart upload, including multipart copies.
+ *
+ * <p>Reference: Apache Flink NativeS3ObjectOperations#commitMultiPartUpload performs a HEAD probe
+ * when the completion response is lost. Paimon adds an upload token and exact length to distinguish
+ * this upload from an aborted upload or an object already stored under the same key:
+ * https://github.com/apache/flink/blob/6ad337697826a995789a6dafc7d379f64548e34e/flink-filesystems/flink-s3-fs-native/src/main/java/org/apache/flink/fs/s3native/writer/NativeS3ObjectOperations.java#L280-L334
+ *
+ * <p>The token is a Paimon metadata convention; NoSuchUpload alone is ambiguous in the S3 API:
+ * https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html#API_CompleteMultipartUpload_Errors
+ */
 final class S3NativeUploadMetadata {
 
     private static final String TOKEN_KEY = "paimon-upload-id";

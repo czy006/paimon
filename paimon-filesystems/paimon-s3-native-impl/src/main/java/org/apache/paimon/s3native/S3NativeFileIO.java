@@ -54,19 +54,14 @@ import static org.apache.paimon.s3native.S3PathUtils.markerKey;
 /**
  * S3 {@link FileIO} implemented directly on AWS SDK v2, without any Hadoop dependency.
  *
- * <p>[PORTED] Object-store semantics (HeadObject-based existence, delimiter listing, CopyObject +
- * Delete rename, mkdirs succeeding without directory creation) derived from Apache Flink
- * flink-filesystems/flink-s3-fs-native (FLINK-38592, Apache License 2.0), class
- * org.apache.flink.fs.s3native.NativeS3FileSystem. Local reference:
- * /Users/SL/javaProject/flink/flink-filesystems/flink-s3-fs-native/src/main/java/org/
- * apache/flink/fs/s3native/NativeS3FileSystem.java
+ * <p>Reference: Apache Flink (Apache License 2.0), NativeS3FileSystem#getFileStatus, #listStatus,
+ * #delete, #create and #rename, from the reviewed master snapshot:
+ * https://github.com/apache/flink/blob/6ad337697826a995789a6dafc7d379f64548e34e/flink-filesystems/flink-s3-fs-native/src/main/java/org/apache/flink/fs/s3native/NativeS3FileSystem.java#L206-L503
  *
- * <p>Registered deviations from the Flink reference (see Spec §5.5): D1 directory markers (0-byte
- * {@code <key>/} objects, S3A-compatible — required by FileIOBehaviorTestBase empty-dir
- * visibility), D2 recursive directory rename, D4 zero-length files are files (key suffix decides
- * marker vs file), D5 empty-directory non-recursive delete succeeds, D6 batch recursive delete, D7
- * objects larger than 5GB are renamed via UploadPartCopy, D9 mkdirs fails fast on file conflicts
- * (Paimon contract) instead of returning true unconditionally.
+ * <p>Paimon adds visible directory markers, recursive directory rename and batched deletion,
+ * distinguishes zero-length files by key suffix, and rejects file conflicts in mkdirs and rename.
+ * Objects above the CopyObject size limit use UploadPartCopy. These adaptations enforce the Paimon
+ * FileIO contract; S3 copy-and-delete rename remains non-atomic.
  */
 public class S3NativeFileIO implements FileIO {
 
@@ -310,7 +305,7 @@ public class S3NativeFileIO implements FileIO {
             default:
                 String prefix = key.isEmpty() ? "" : key + "/";
                 if (!recursive) {
-                    // [DEVIATION D5] An empty directory (only a marker) may be deleted
+                    // [ADAPTED] An empty directory (only a marker) may be deleted
                     // non-recursively; a non-empty one must fail.
                     S3NativeObjectOperations.Children children = operations.listChildren(prefix);
                     if (!children.objects.isEmpty() || !children.commonPrefixes.isEmpty()) {
@@ -322,7 +317,7 @@ public class S3NativeFileIO implements FileIO {
                     }
                     return true;
                 }
-                // [DEVIATION D6] Stream the prefix into parallel batch deletes — bounded memory
+                // [ADAPTED] Stream the prefix into parallel batch deletes — bounded memory
                 // and list/delete overlap instead of materializing every key first.
                 S3NativeOptions options = resolvedOptions();
                 operations.deletePrefixStreaming(
@@ -339,7 +334,7 @@ public class S3NativeFileIO implements FileIO {
         }
         S3NativeObjectOperations operations = ops(path);
 
-        // [DEVIATION D9] Flink's mkdirs is unconditionally true; the fail-fast checks below are
+        // [ADAPTED] Flink's mkdirs is unconditionally true; the fail-fast checks below are
         // mandated by the Paimon FileIO contract (FileIOBehaviorTestBase mkdirs cases).
         if (operations.headObjectOrNull(key) != null) {
             // A plain object occupies the path (a marker would return null for the bare key).
@@ -350,7 +345,7 @@ public class S3NativeFileIO implements FileIO {
             throw new IOException("Cannot mkdirs, a file blocks ancestor: " + ancestor);
         }
 
-        // [DEVIATION D1] Directory existence is visible via a marker. Skip creating one when
+        // [ADAPTED] Directory existence is visible via a marker. Skip creating one when
         // children already exist (S3A-style legacy prefixes without markers still list fine).
         if (!operations.hasObjectsUnder(markerKey(key))) {
             operations.putMarker(key, resolvedOptions());
@@ -406,7 +401,7 @@ public class S3NativeFileIO implements FileIO {
             return true;
         }
 
-        // [DEVIATION D2] Directory rename: copy every key under the prefix (markers included),
+        // [ADAPTED] Directory rename: copy every key under the prefix (markers included),
         // then batch delete the source side. Not atomic, like every S3A rename.
         String srcPrefix = srcKey.isEmpty() ? "" : srcKey + "/";
         String dstPrefix = dstKey.isEmpty() ? "" : dstKey + "/";
@@ -436,6 +431,12 @@ public class S3NativeFileIO implements FileIO {
 
     // ------------------------------------------------------------------------
 
+    /**
+     * Shares the mkdirs ancestor rule with rename before copying or deleting source objects. Local
+     * contract reference: paimon-common/src/test/java/org/apache/paimon/fs/
+     * FileIOBehaviorTestBase.java#testMkdirsFailsWithExistingParentFile. Applying the same rule to
+     * rename is a Paimon adaptation so a file cannot hide the copied destination subtree.
+     */
     @Nullable
     private static String fileAncestor(S3NativeObjectOperations operations, String key)
             throws IOException {
@@ -462,10 +463,9 @@ public class S3NativeFileIO implements FileIO {
     }
 
     /**
-     * Copies an object; [DEVIATION D7] objects over 5GB go through UploadPartCopy. Both paths carry
-     * the SSE settings — the copy source needs SSE-C headers to be readable, and the destination
-     * must keep the encryption policy (a blind spot inherited from Iceberg, whose FileIO has no
-     * rename).
+     * Copies an object; [ADAPTED] objects over 5GB go through UploadPartCopy. Both paths carry the
+     * SSE settings — the copy source needs SSE-C headers to be readable, and the destination must
+     * keep the encryption policy (a blind spot inherited from Iceberg, whose FileIO has no rename).
      */
     private static void copyObject(
             S3NativeObjectOperations operations,
@@ -497,6 +497,12 @@ public class S3NativeFileIO implements FileIO {
         }
     }
 
+    /**
+     * API reference: UploadPartCopyRequest.Builder#copySourceRange in SDK 2.55.1
+     * s3-2.55.1-sources.jar uses inclusive byte ranges. Copy attributes must be supplied at
+     * CreateMultipartUpload, and SSE-C headers at completion as well as on copied parts.
+     * https://docs.aws.amazon.com/AmazonS3/latest/API/API_UploadPartCopy.html#API_UploadPartCopy_RequestSyntax
+     */
     private static void copyObjectMultipart(
             S3NativeObjectOperations operations,
             S3NativeSse sse,
@@ -655,7 +661,7 @@ public class S3NativeFileIO implements FileIO {
 
     /**
      * [PORTED] NativeS3FileSystem#getFileStatus — HeadObject first, then directory detection.
-     * [DEVIATION D4] Zero-length files are files: marker-ness is decided by the key suffix, not by
+     * [ADAPTED] Zero-length files are files: marker-ness is decided by the key suffix, not by
      * content length.
      */
     private Classification classify(Path path) throws IOException {

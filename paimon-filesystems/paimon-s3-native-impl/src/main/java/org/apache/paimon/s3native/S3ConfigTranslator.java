@@ -39,8 +39,11 @@ import java.util.Set;
  * fs.s3a.*} keys are warned about and dropped: S3A semantics cannot be forwarded to AWS SDK v2, and
  * failing loudly beats silently mis-configuring.
  *
- * <p>[NEW] The prefix-mirroring idea is taken from {@code org.apache.paimon.s3.S3FileIO}
- * (paimon-s3-impl), the alias whitelist from the compatibility layer of the porting Spec (§6.3).
+ * <p>Local reference: paimon-filesystems/paimon-s3-impl/src/main/java/org/apache/paimon/s3/
+ * S3FileIO.java, CONFIG_PREFIXES/MIRRORED_CONFIG_KEYS and #configure, for the supported prefix
+ * spellings. Paimon Native resolves canonical keys before aliases and whitelists only Hadoop
+ * options whose semantics can be mapped to the SDK; this precedence policy is implemented here, not
+ * in AWS.
  */
 final class S3ConfigTranslator {
 

@@ -61,17 +61,19 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Sync S3 metadata/object operations used by {@link S3NativeFileIO}.
+ * Sync S3 metadata and object operations used by {@link S3NativeFileIO}.
  *
- * <p>[PORTED] Derived from Apache Flink flink-filesystems/flink-s3-fs-native (FLINK-38592, Apache
- * License 2.0), class org.apache.flink.fs.s3native.writer.NativeS3ObjectOperations (HeadObject /
- * PutObject / DeleteObject / listing semantics). Local reference: /Users/SL/javaProject/flink/
- * flink-filesystems/flink-s3-fs-native/src/main/java/org/apache/flink/fs/s3native/writer/
- * NativeS3ObjectOperations.java
+ * <p>References: Apache Flink (Apache License 2.0), NativeS3ObjectOperations#getObjectMetadata and
+ * #deleteObject for HEAD/delete handling, and NativeS3FileSystem#listStatus for delimiter listing:
+ * https://github.com/apache/flink/blob/6ad337697826a995789a6dafc7d379f64548e34e/flink-filesystems/flink-s3-fs-native/src/main/java/org/apache/flink/fs/s3native/writer/NativeS3ObjectOperations.java#L377-L445
+ * https://github.com/apache/flink/blob/6ad337697826a995789a6dafc7d379f64548e34e/flink-filesystems/flink-s3-fs-native/src/main/java/org/apache/flink/fs/s3native/NativeS3FileSystem.java#L338-L380
  *
- * <p>[DEVIATION D1] Adds directory-marker helpers (S3A-compatible 0-byte {@code <key>/} objects).
- * [DEVIATION D6] Adds batch delete (DeleteObjects, up to 1000 keys per request) used by recursive
- * deletion.
+ * <p>Reference: Iceberg S3FileIO#deleteFiles and #deleteBatch for parallel batched deletion,
+ * deduplication and aggregated failures. Paimon bounds outstanding tasks and joins work after
+ * cancellation:
+ * https://github.com/apache/iceberg/blob/4eb9cb7c3d53cb8080724eebf6e6898871ee23b0/aws/src/main/java/org/apache/iceberg/aws/s3/S3FileIO.java#L202-L331
+ *
+ * <p>Directory markers and fail-loud permission handling are Paimon adaptations.
  */
 final class S3NativeObjectOperations {
 
@@ -123,7 +125,7 @@ final class S3NativeObjectOperations {
         }
     }
 
-    /** [DEVIATION D1] Creates a 0-byte directory marker object at {@code <key>/}. */
+    /** [ADAPTED] Creates a 0-byte directory marker object at {@code <key>/}. */
     void putMarker(String key) throws IOException {
         putMarker(key, null);
     }
@@ -165,13 +167,18 @@ final class S3NativeObjectOperations {
     }
 
     /**
-     * [DEVIATION D6] Batch-deletes keys with {@code DeleteObjects} (<=1000 per request). Keys
-     * reported as NotFound are treated as success; any other per-key error fails the call.
+     * [ADAPTED] Batch-deletes keys with {@code DeleteObjects} (<=1000 per request). Keys reported
+     * as NotFound are treated as success; any other per-key error fails the call.
      *
-     * <p>[PORTED-ICE Spec §14 I7] Batches run in parallel on a shared daemon pool sized by {@code
+     * <p>[ADAPTED FROM ICEBERG] Batches run in parallel on a shared daemon pool sized by {@code
      * s3.delete.num-threads}, mirroring Iceberg S3FileIO#deleteFiles; failures across batches are
      * aggregated into one IOException carrying the count (Iceberg throws a counted
      * BulkDeletionFailureException) instead of failing on the first batch.
+     *
+     * <p>Reference: Iceberg S3FileIO#deleteFiles and #deleteBatch:
+     * https://github.com/apache/iceberg/blob/4eb9cb7c3d53cb8080724eebf6e6898871ee23b0/aws/src/main/java/org/apache/iceberg/aws/s3/S3FileIO.java#L202-L331
+     * The API also defines per-key errors in a successful HTTP response:
+     * https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html#API_DeleteObjects_ResponseElements
      */
     void deleteBatch(List<String> keys, int batchSize, int threads) throws IOException {
         if (keys.isEmpty()) {
@@ -221,7 +228,7 @@ final class S3NativeObjectOperations {
             List<String> failed = new ArrayList<>();
             for (S3Error error : response.errors()) {
                 String code = error.code() == null ? "" : error.code();
-                // Per-key NotFound means the object is already gone — success per Spec D6.
+                // Per-key NotFound means the object is already gone — success.
                 if (!"NoSuchKey".equals(code) && !"NotFound".equals(code)) {
                     failed.add(error.key() == null ? "?" : error.key());
                 }
@@ -280,9 +287,9 @@ final class S3NativeObjectOperations {
      * {@code 2 * threads} batches are outstanding (backpressure; at most {@code 2 * threads + 1} in
      * flight at any instant). Memory stays bounded at O(batchSize * threads) keys instead of
      * materializing the whole listing, and deletion overlaps with pagination. Failure semantics
-     * match {@link #deleteBatch}: per-key NotFound is success (Spec D6), whole-request failures
-     * mark their keys failed with the first cause preserved, and any failed key throws one
-     * aggregated IOException.
+     * match {@link #deleteBatch}: per-key NotFound is success, whole-request failures mark their
+     * keys failed with the first cause preserved, and any failed key throws one aggregated
+     * IOException.
      */
     void deletePrefixStreaming(String prefix, int batchSize, int threads) throws IOException {
         Deque<Future<List<String>>> inFlight = new ArrayDeque<>();
@@ -539,10 +546,14 @@ final class S3NativeObjectOperations {
      * NO delimiter — the delimiter form does not return the prefix-equal marker itself (AWS
      * ListObjectsV2 docs, Example 8). Marker-ness is decided by membership of the self-marker
      * {@code key/} in the returned contents, not by sort order: general-purpose buckets and MinIO
-     * return keys sorted, but directory buckets are documented unsorted and remain unsupported
-     * (Spec §14.2). With sorted responses the marker is necessarily contents[0] when present, so
+     * return keys sorted, but directory buckets are documented unsorted and remain unsupported by
+     * this FileIO. With sorted responses the marker is necessarily contents[0] when present, so
      * absence from the maxKeys=2 window is conclusive. maxKeys=2 is a defensive margin: on sorted
      * backends maxKeys=1 already suffices.
+     *
+     * <p>API reference: ListObjectsV2 documents delimiter grouping and the ordering difference
+     * between general-purpose and directory buckets:
+     * https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html
      *
      * @param key non-empty object key (the bucket root short-circuits before the probe)
      * @return MARKER_DIR if the self-marker is listed, PREFIX_DIR if any other key is listed,

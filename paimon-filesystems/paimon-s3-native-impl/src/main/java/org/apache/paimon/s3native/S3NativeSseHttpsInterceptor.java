@@ -24,7 +24,17 @@ import software.amazon.awssdk.core.interceptor.ExecutionAttributes;
 import software.amazon.awssdk.core.interceptor.ExecutionInterceptor;
 import software.amazon.awssdk.http.SdkHttpRequest;
 
-/** Prevents customer-provided encryption keys from being sent to plaintext S3 endpoints. */
+/**
+ * Prevents customer-provided encryption keys from being sent to plaintext S3 endpoints.
+ *
+ * <p>Reference: AWS SDK 2.55.1 ExecutionInterceptor#modifyHttpRequest and #beforeTransmission for
+ * the request lifecycle. The final transmission hook checks SDK-resolved endpoints on every
+ * attempt:
+ * https://github.com/aws/aws-sdk-java-v2/blob/2.55.1/core/sdk-core/src/main/java/software/amazon/awssdk/core/interceptor/ExecutionInterceptor.java#L177-L237
+ *
+ * <p>S3 requires HTTPS for SSE-C, including customer keys used to read a copy source:
+ * https://docs.aws.amazon.com/AmazonS3/latest/userguide/ServerSideEncryptionCustomerKeys.html
+ */
 final class S3NativeSseHttpsInterceptor implements ExecutionInterceptor {
 
     @Override
