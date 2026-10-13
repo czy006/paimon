@@ -35,6 +35,8 @@ import software.amazon.awssdk.services.s3.model.CreateMultipartUploadResponse;
 import software.amazon.awssdk.services.s3.model.S3Exception;
 import software.amazon.awssdk.services.s3.model.UploadPartCopyRequest;
 
+import javax.annotation.Nullable;
+
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -341,13 +343,9 @@ public class S3NativeFileIO implements FileIO {
             // A plain object occupies the path (a marker would return null for the bare key).
             throw new IOException("Cannot mkdirs, a file already exists: " + path);
         }
-        // An ancestor being a plain object blocks directory creation.
-        int separator = -1;
-        while ((separator = key.indexOf('/', separator + 1)) >= 0) {
-            String ancestor = key.substring(0, separator);
-            if (!ancestor.isEmpty() && operations.headObjectOrNull(ancestor) != null) {
-                throw new IOException("Cannot mkdirs, a file blocks ancestor: " + ancestor);
-            }
+        String ancestor = fileAncestor(operations, key);
+        if (ancestor != null) {
+            throw new IOException("Cannot mkdirs, a file blocks ancestor: " + ancestor);
         }
 
         // [DEVIATION D1] Directory existence is visible via a marker. Skip creating one when
@@ -393,6 +391,10 @@ public class S3NativeFileIO implements FileIO {
             return false; // cannot move a directory into itself
         }
 
+        if (fileAncestor(operations, dstKey) != null) {
+            return false;
+        }
+
         S3NativeOptions options = resolvedOptions();
         if (srcClassification.kind == Kind.FILE) {
             S3NativeCopyAttributes attributes =
@@ -431,6 +433,19 @@ public class S3NativeFileIO implements FileIO {
     }
 
     // ------------------------------------------------------------------------
+
+    @Nullable
+    private static String fileAncestor(S3NativeObjectOperations operations, String key)
+            throws IOException {
+        int separator = -1;
+        while ((separator = key.indexOf('/', separator + 1)) >= 0) {
+            String ancestor = key.substring(0, separator);
+            if (!ancestor.isEmpty() && operations.headObjectOrNull(ancestor) != null) {
+                return ancestor;
+            }
+        }
+        return null;
+    }
 
     private static boolean isAncestorOf(String ancestorKey, String descendantKey) {
         return !ancestorKey.isEmpty()

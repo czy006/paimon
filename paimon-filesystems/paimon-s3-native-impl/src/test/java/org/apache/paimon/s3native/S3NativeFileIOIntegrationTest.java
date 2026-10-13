@@ -27,6 +27,8 @@ import org.apache.paimon.options.Options;
 
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.net.URI;
@@ -451,5 +453,27 @@ class S3NativeFileIOIntegrationTest {
         assertThat(files).isEqualTo(1);
 
         fs.delete(dir, true);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testRejectRenameBelowFileAncestor(boolean sourceDirectory) throws Exception {
+        Path parent = file("rename-parent-file-" + sourceDirectory);
+        Path src = file("rename-source-" + sourceDirectory);
+        // The intermediate parent does not exist: every ancestor must be checked.
+        Path dst = new Path(parent, "intermediate/child");
+        writeFile(parent, new byte[] {1});
+        Path sourceData = sourceDirectory ? new Path(src, "data") : src;
+        if (sourceDirectory) {
+            fs.mkdirs(src);
+        }
+        writeFile(sourceData, new byte[] {2});
+
+        assertThat(fs.rename(src, dst)).isFalse();
+        assertThat(fs.exists(src)).isTrue();
+        assertThat(fs.exists(dst)).isFalse();
+        assertThat(fs.getFileStatus(parent).isDir()).isFalse();
+        assertThat(readFile(parent)).containsExactly((byte) 1);
+        assertThat(readFile(sourceData)).containsExactly((byte) 2);
     }
 }
