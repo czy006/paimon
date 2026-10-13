@@ -23,6 +23,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import software.amazon.awssdk.core.ResponseInputStream;
+import software.amazon.awssdk.http.SdkHttpResponse;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectResponse;
@@ -58,6 +59,7 @@ class S3NativeSeekableInputStreamTest {
     }
 
     private static S3Client clientServing(
+            int contentLength,
             java.util.function.BiFunction<Integer, Integer, InputStream> streamForCall) {
         S3Client client = mock(S3Client.class);
         AtomicInteger calls = new AtomicInteger();
@@ -76,10 +78,30 @@ class S3NativeSeekableInputStreamTest {
                                                         "bytes=".length(), range.length() - 1));
                             }
                             return new ResponseInputStream<>(
-                                    GetObjectResponse.builder().build(),
+                                    responseMetadata(request, contentLength),
                                     streamForCall.apply(calls.getAndIncrement(), rangeStart));
                         });
         return client;
+    }
+
+    private static GetObjectResponse responseMetadata(GetObjectRequest request, int contentLength) {
+        int start = 0;
+        int end = contentLength - 1;
+        if (request.range() != null) {
+            String[] bounds = request.range().substring(6).split("-", -1);
+            start = Integer.parseInt(bounds[0]);
+            if (!bounds[1].isEmpty()) {
+                end = Integer.parseInt(bounds[1]);
+            }
+        }
+        GetObjectResponse.Builder response =
+                GetObjectResponse.builder().contentLength((long) end - start + 1);
+        response.sdkHttpResponse(
+                SdkHttpResponse.builder().statusCode(request.range() == null ? 200 : 206).build());
+        if (request.range() != null) {
+            response.contentRange(String.format("bytes %d-%d/%d", start, end, contentLength));
+        }
+        return response.build();
     }
 
     /** An InputStream whose first read throws; subsequent reads delegate to known bytes. */
@@ -107,10 +129,14 @@ class S3NativeSeekableInputStreamTest {
         when(client.getObject(any(GetObjectRequest.class)))
                 .thenAnswer(
                         invocation -> {
-                            requests.add(invocation.getArgument(0));
+                            GetObjectRequest request = invocation.getArgument(0);
+                            requests.add(request);
                             return new ResponseInputStream<>(
-                                    GetObjectResponse.builder().build(),
-                                    new ByteArrayInputStream(new byte[] {1, 2, 3, 4}));
+                                    responseMetadata(request, 4),
+                                    new ByteArrayInputStream(
+                                            request.range() == null
+                                                    ? new byte[] {1, 2, 3, 4}
+                                                    : new byte[] {3, 4}));
                         });
 
         S3NativeSse sse = customSse();
@@ -120,7 +146,7 @@ class S3NativeSeekableInputStreamTest {
             assertThat(in.read()).isEqualTo(1); // stream-open path
             byte[] buf = new byte[2];
             ((org.apache.paimon.fs.VectoredReadable) in).pread(2, buf, 0, 2); // pread path
-            assertThat(buf).containsExactly(1, 2);
+            assertThat(buf).containsExactly(3, 4);
         }
 
         assertThat(requests).hasSize(2);
@@ -141,7 +167,7 @@ class S3NativeSeekableInputStreamTest {
                         invocation -> {
                             requests.add(invocation.getArgument(0));
                             return new ResponseInputStream<>(
-                                    GetObjectResponse.builder().build(),
+                                    responseMetadata(invocation.getArgument(0), 1),
                                     new ByteArrayInputStream(new byte[] {1}));
                         });
 
@@ -159,6 +185,7 @@ class S3NativeSeekableInputStreamTest {
     void testMidReadSocketFailureRetriedWithCorrectOffset() throws Exception {
         S3Client client =
                 clientServing(
+                        2,
                         (call, rangeStart) ->
                                 call == 0
                                         ? failingFirstRead("AB")
@@ -178,6 +205,7 @@ class S3NativeSeekableInputStreamTest {
     void testRetriesExhaustedPropagates() throws Exception {
         S3Client client =
                 clientServing(
+                        2,
                         (call, rangeStart) ->
                                 new InputStream() {
                                     @Override
@@ -199,6 +227,7 @@ class S3NativeSeekableInputStreamTest {
     void testNonRetryableFailureNotRetried() throws Exception {
         S3Client client =
                 clientServing(
+                        2,
                         (call, rangeStart) ->
                                 new InputStream() {
                                     @Override
@@ -223,6 +252,7 @@ class S3NativeSeekableInputStreamTest {
         String data = "XYZW";
         S3Client client =
                 clientServing(
+                        4,
                         (call, rangeStart) ->
                                 call == 0
                                         ? new InputStream() {
@@ -261,7 +291,7 @@ class S3NativeSeekableInputStreamTest {
     @Test
     void testFinalizeReleasesUnclosedStream() throws Exception {
         S3Client client =
-                clientServing((call, rangeStart) -> new ByteArrayInputStream("AB".getBytes()));
+                clientServing(2, (call, rangeStart) -> new ByteArrayInputStream("AB".getBytes()));
         S3NativeSeekableInputStream in =
                 new S3NativeSeekableInputStream(
                         client, "bucket", "key", 2, 256, S3NativeSse.NONE, "original-etag");
@@ -382,6 +412,7 @@ class S3NativeSeekableInputStreamTest {
                 };
         S3Client client =
                 clientServing(
+                        4,
                         (call, rangeStart) ->
                                 call == 0
                                         ? firstResponse

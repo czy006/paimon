@@ -32,6 +32,8 @@ import java.io.BufferedInputStream;
 import java.io.EOFException;
 import java.io.IOException;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * S3 input stream with read-ahead buffering, lazy seek, and automatic stream reopening.
@@ -54,6 +56,9 @@ import java.util.concurrent.locks.ReentrantLock;
 final class S3NativeSeekableInputStream extends SeekableInputStream implements VectoredReadable {
 
     private static final Logger LOG = LoggerFactory.getLogger(S3NativeSeekableInputStream.class);
+
+    private static final Pattern CONTENT_RANGE =
+            Pattern.compile("bytes ([0-9]+)-([0-9]+)/([0-9]+)", Pattern.CASE_INSENSITIVE);
 
     private final ReentrantLock lock = new ReentrantLock();
 
@@ -177,6 +182,7 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
                     reopenAfterReadFailure();
                 }
             }
+            checkPrematureEof(data);
             if (data != -1) {
                 nextReadPos++;
                 streamPos++;
@@ -231,6 +237,7 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
                     reopenAfterReadFailure();
                 }
             }
+            checkPrematureEof(bytesRead);
             if (bytesRead > 0) {
                 nextReadPos += bytesRead;
                 streamPos += bytesRead;
@@ -331,15 +338,23 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
         String range = String.format("bytes=%d-%d", position, position + toRead - 1);
         try (ResponseInputStream<GetObjectResponse> in =
                 client.getObject(getObjectRequest().range(range).build())) {
-            int readBytes = 0;
-            while (readBytes < toRead) {
-                int n = in.read(buffer, offset + readBytes, toRead - readBytes);
-                if (n < 0) {
-                    break;
+            try {
+                validateResponse(in.response(), position, toRead, true);
+                int readBytes = 0;
+                while (readBytes < toRead) {
+                    int n = in.read(buffer, offset + readBytes, toRead - readBytes);
+                    if (n < 0) {
+                        throw prematureEof(position + readBytes);
+                    }
+                    readBytes += n;
                 }
-                readBytes += n;
+                return readBytes;
+            } catch (IOException | RuntimeException e) {
+                abortResponse(in);
+                throw e;
             }
-            return readBytes == 0 ? -1 : readBytes;
+        } catch (EOFException e) {
+            throw e;
         } catch (IOException | RuntimeException e) {
             throw new IOException(
                     String.format("pread failed for %s/%s at %d", bucket, key, position), e);
@@ -472,8 +487,7 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
         while (remaining > 0) {
             long skipped = bufferedStream.skip(remaining);
             if (skipped <= 0) {
-                openStreamAtCurrentPosition();
-                return;
+                throw prematureEof(streamPos - remaining);
             }
             remaining -= skipped;
         }
@@ -487,6 +501,8 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
                 requestBuilder.range(String.format("bytes=%d-", streamPos));
             }
             currentStream = client.getObject(requestBuilder.build());
+            validateResponse(
+                    currentStream.response(), streamPos, contentLength - streamPos, streamPos > 0);
             bufferedStream = new BufferedInputStream(currentStream, readBufferSize);
         } catch (Exception e) {
             releaseStreams();
@@ -494,15 +510,86 @@ final class S3NativeSeekableInputStream extends SeekableInputStream implements V
         }
     }
 
+    /**
+     * Verify the response before exposing bytes at the requested offset. A server can ignore Range
+     * and return 200, so only a response for the entire object at offset zero can use that status.
+     * A 206 response is only valid when a range was requested. See RFC 9110 sections 14.2, 14.4,
+     * and 15.3.7.1, and the S3 GetObject response headers.
+     */
+    private void validateResponse(
+            GetObjectResponse response, long start, long length, boolean rangeRequested)
+            throws IOException {
+        int status =
+                response.sdkHttpResponse() == null ? -1 : response.sdkHttpResponse().statusCode();
+        Long responseLength = response.contentLength();
+        String range = response.contentRange();
+        boolean valid = responseLength != null && responseLength == length;
+        if (status == 200) {
+            valid &= start == 0 && length == contentLength && range == null;
+        } else if (status == 206 && rangeRequested) {
+            Matcher matcher = CONTENT_RANGE.matcher(range == null ? "" : range);
+            if (matcher.matches()) {
+                try {
+                    valid &=
+                            Long.parseLong(matcher.group(1)) == start
+                                    && Long.parseLong(matcher.group(2)) == start + length - 1
+                                    && Long.parseLong(matcher.group(3)) == contentLength;
+                } catch (NumberFormatException e) {
+                    valid = false;
+                }
+            } else {
+                valid = false;
+            }
+        } else {
+            valid = false;
+        }
+        if (!valid) {
+            throw new IOException(
+                    String.format(
+                            "Invalid S3 GET response for %s/%s: expected bytes %d-%d/%d, "
+                                    + "status=%d, Content-Length=%s, Content-Range=%s",
+                            bucket,
+                            key,
+                            start,
+                            start + length - 1,
+                            contentLength,
+                            status,
+                            responseLength,
+                            range));
+        }
+    }
+
+    private EOFException prematureEof(long position) {
+        return new EOFException(
+                String.format(
+                        "Premature EOF for %s/%s at %d before object length %d",
+                        bucket, key, position, contentLength));
+    }
+
+    private void checkPrematureEof(int readResult) throws EOFException {
+        if (readResult < 0) {
+            EOFException failure = prematureEof(nextReadPos);
+            IOException closeFailure = releaseStreams();
+            if (closeFailure != null) {
+                failure.addSuppressed(closeFailure);
+            }
+            throw failure;
+        }
+    }
+
+    private void abortResponse(ResponseInputStream<GetObjectResponse> stream) {
+        try {
+            stream.abort();
+        } catch (RuntimeException e) {
+            LOG.debug("Error aborting S3 response stream for {}/{}", bucket, key, e);
+        }
+    }
+
     /** Aborts and closes both streams, nulling the references; returns the first failure. */
     private IOException releaseStreams() {
         // Abort the in-flight HTTP connection to avoid draining remaining bytes on close.
         if (currentStream != null) {
-            try {
-                currentStream.abort();
-            } catch (RuntimeException e) {
-                LOG.debug("Error aborting S3 response stream for {}/{}", bucket, key, e);
-            }
+            abortResponse(currentStream);
         }
         IOException exception = null;
         if (bufferedStream != null) {

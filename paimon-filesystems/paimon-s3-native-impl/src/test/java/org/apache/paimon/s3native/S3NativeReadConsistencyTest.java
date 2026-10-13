@@ -31,6 +31,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.NullAndEmptySource;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.core.ResponseInputStream;
+import software.amazon.awssdk.http.SdkHttpResponse;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
@@ -112,8 +113,20 @@ class S3NativeReadConsistencyTest {
                                             : new ByteArrayInputStream(
                                                     data.substring(start, end)
                                                             .getBytes(StandardCharsets.UTF_8));
-                            return new ResponseInputStream<>(
-                                    GetObjectResponse.builder().eTag(currentETag).build(), body);
+                            GetObjectResponse.Builder response =
+                                    GetObjectResponse.builder()
+                                            .eTag(currentETag)
+                                            .contentLength((long) end - start);
+                            response.sdkHttpResponse(
+                                    SdkHttpResponse.builder()
+                                            .statusCode(request.range() == null ? 200 : 206)
+                                            .build());
+                            if (request.range() != null) {
+                                response.contentRange(
+                                        String.format(
+                                                "bytes %d-%d/%d", start, end - 1, data.length()));
+                            }
+                            return new ResponseInputStream<>(response.build(), body);
                         });
 
         Options options = new Options();
