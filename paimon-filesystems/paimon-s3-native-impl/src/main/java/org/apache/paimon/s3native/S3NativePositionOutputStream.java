@@ -47,12 +47,16 @@ import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.ByteArrayInputStream;
 import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.SequenceInputStream;
+import java.nio.channels.Channels;
 import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.PosixFileAttributeView;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.security.DigestOutputStream;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -60,6 +64,7 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -631,21 +636,40 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
     }
 
     private void rollPartFile() throws IOException {
-        currentPartFile = new File(tmpDir, "paimon-s3-native-" + UUID.randomUUID());
-        tempFiles.add(currentPartFile);
-        currentPartSize = 0;
+        File partFile = new File(tmpDir, "paimon-s3-native-" + UUID.randomUUID());
         OutputStream outputStream;
         try {
-            outputStream =
-                    new BufferedOutputStream(new FileOutputStream(currentPartFile), BUFFER_SIZE);
+            outputStream = createPartStream(partFile.toPath());
         } catch (IOException e) {
-            throw new IOException("Failed to create local part file " + currentPartFile, e);
+            throw new IOException("Failed to create local part file " + partFile, e);
         }
+        // Register only files we created, so a name collision cannot delete someone else's file.
+        currentPartFile = partFile;
+        tempFiles.add(partFile);
+        currentPartSize = 0;
+        outputStream = new BufferedOutputStream(outputStream, BUFFER_SIZE);
         // [PORTED-ICE I4] Part-level MD5 accumulates as bytes pass through the buffer.
         currentBuffer =
                 checksumEnabled && currentPartDigest != null
                         ? new DigestOutputStream(outputStream, currentPartDigest)
                         : outputStream;
+    }
+
+    private static OutputStream createPartStream(Path path) throws IOException {
+        Set<StandardOpenOption> options =
+                EnumSet.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+        if (Files.getFileStore(path.getParent())
+                .supportsFileAttributeView(PosixFileAttributeView.class)) {
+            // Create and open atomically with owner-only permissions; never reopen the path.
+            return Channels.newOutputStream(
+                    Files.newByteChannel(
+                            path,
+                            options,
+                            PosixFilePermissions.asFileAttribute(
+                                    PosixFilePermissions.fromString("rw-------"))));
+        }
+        // Non-POSIX providers retain their native file-creation permissions.
+        return Channels.newOutputStream(Files.newByteChannel(path, options));
     }
 
     private void cleanupTempFiles() {

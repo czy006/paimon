@@ -37,10 +37,18 @@ import software.amazon.awssdk.services.s3.model.UploadPartResponse;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.net.URI;
+import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.FileSystem;
+import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFileAttributeView;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -986,5 +994,79 @@ class S3NativePositionOutputStreamTest {
 
         verify(sync).putObject(any(PutObjectRequest.class), any(RequestBody.class));
         assertThat(tmpDir.toFile().listFiles()).isNullOrEmpty();
+    }
+
+    @Test
+    void testStagingFilesAreOwnerOnlyInSharedDirectory() throws Exception {
+        boolean posix =
+                Files.getFileStore(tmpDir).supportsFileAttributeView(PosixFileAttributeView.class);
+        if (posix) {
+            Files.setPosixFilePermissions(tmpDir, PosixFilePermissions.fromString("rwxrwxrwx"));
+        }
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        try (S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(
+                        sync, async, "bucket", "key", options("s3.multipart.threshold", "3"))) {
+            // Keep a full pending part and a current part below the multipart threshold.
+            out.write(new byte[(int) PART_SIZE + 1]);
+            out.flush();
+            java.io.File[] stagingFiles = tmpDir.toFile().listFiles();
+            assertThat(stagingFiles).hasSize(2);
+            for (java.io.File stagingFile : stagingFiles) {
+                if (posix) {
+                    assertThat(Files.getPosixFilePermissions(stagingFile.toPath()))
+                            .isEqualTo(PosixFilePermissions.fromString("rw-------"));
+                }
+                assertThat(stagingFile.length()).isPositive();
+            }
+        }
+        assertThat(tmpDir.toFile().listFiles()).isNullOrEmpty();
+    }
+
+    @Test
+    void testNonPosixProviderCreatesTemporaryPartWithoutPosixAttributes() throws Exception {
+        Path archive = tmpDir.resolve("parts.zip");
+        try (FileSystem fileSystem =
+                FileSystems.newFileSystem(
+                        URI.create("jar:" + archive.toUri()),
+                        Collections.singletonMap("create", "true"))) {
+            Path directory = Files.createDirectory(fileSystem.getPath("/staging"));
+            assertThat(
+                            Files.getFileStore(directory)
+                                    .supportsFileAttributeView(PosixFileAttributeView.class))
+                    .isFalse();
+            // Exercise the provider branch with the JDK's real non-POSIX filesystem.
+            Method createPartStream =
+                    S3NativePositionOutputStream.class.getDeclaredMethod(
+                            "createPartStream", Path.class);
+            createPartStream.setAccessible(true);
+            Path part = directory.resolve("part.tmp");
+            byte[] content = new byte[] {1, 2, 3};
+            try (OutputStream output = (OutputStream) createPartStream.invoke(null, part)) {
+                output.write(content);
+            }
+            assertThat(Files.exists(part)).isTrue();
+            assertThat(Files.readAllBytes(part)).containsExactly(content);
+            Files.delete(part);
+        }
+    }
+
+    @Test
+    void testPartCreationRejectsExistingFileWithoutTruncatingIt() throws Exception {
+        Path part = tmpDir.resolve("existing-part.tmp");
+        byte[] content = new byte[] {4, 5, 6};
+        Files.write(part, content);
+        Method createPartStream =
+                S3NativePositionOutputStream.class.getDeclaredMethod(
+                        "createPartStream", Path.class);
+        createPartStream.setAccessible(true);
+
+        assertThatThrownBy(() -> createPartStream.invoke(null, part))
+                .isInstanceOf(java.lang.reflect.InvocationTargetException.class)
+                .hasCauseInstanceOf(FileAlreadyExistsException.class);
+
+        assertThat(Files.exists(part)).isTrue();
+        assertThat(Files.readAllBytes(part)).containsExactly(content);
     }
 }
