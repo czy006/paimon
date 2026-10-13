@@ -34,9 +34,10 @@ import java.util.Set;
  * fs.s3a.*} aliases) into the canonical {@code s3.*} option set consumed by {@link
  * S3NativeOptions}.
  *
- * <p>Priority: {@code s3.*} &gt; {@code s3a.*} &gt; {@code fs.s3a.*}. Unrecognized {@code fs.s3a.*}
- * keys are warned about and dropped: S3A semantics cannot be forwarded to AWS SDK v2, and failing
- * loudly beats silently mis-configuring.
+ * <p>Priority: canonical {@code s3.*}, dotted {@code s3.*}, canonical {@code s3a.*}, dotted {@code
+ * s3a.*}, then whitelisted {@code fs.s3a.*} aliases in their declared order. Unrecognized {@code
+ * fs.s3a.*} keys are warned about and dropped: S3A semantics cannot be forwarded to AWS SDK v2, and
+ * failing loudly beats silently mis-configuring.
  *
  * <p>[NEW] The prefix-mirroring idea is taken from {@code org.apache.paimon.s3.S3FileIO}
  * (paimon-s3-impl), the alias whitelist from the compatibility layer of the porting Spec (§6.3).
@@ -87,10 +88,6 @@ final class S3ConfigTranslator {
         FS_S3A_ALIASES.put("s3.retry.max-num-retries", new String[] {"fs.s3a.attempts.maximum"});
     }
 
-    private static String canonicalize(String s3Key) {
-        return CANONICAL_KEY_ALIASES.getOrDefault(s3Key, s3Key);
-    }
-
     /** Value translation for aliases whose semantics differ from the canonical key. */
     private static String translateValue(String alias, String value) {
         if ("fs.s3a.attempts.maximum".equals(alias)) {
@@ -110,30 +107,21 @@ final class S3ConfigTranslator {
     static Options translate(Options raw) {
         Options normalized = new Options();
 
-        // 1. Generic prefixes: s3.* wins over s3a.*; dotted aliases map to canonical keys.
-        for (String key : raw.keySet()) {
-            String value = raw.get(key);
-            if (key.startsWith(S3_PREFIX)) {
-                normalized.set(canonicalize(key), value);
-            } else if (key.startsWith(S3A_PREFIX)) {
-                String canonical = canonicalize(S3_PREFIX + key.substring(S3A_PREFIX.length()));
-                if (normalized.get(canonical) == null) {
-                    normalized.set(canonical, value);
-                }
-            }
-        }
+        // 1. Resolve each prefix's canonical keys before its dotted aliases. Native s3.*
+        // options always outrank s3a.* options, regardless of the raw HashMap iteration order.
+        copyPrefix(raw, normalized, S3_PREFIX);
+        copyPrefix(raw, normalized, S3A_PREFIX);
 
         // 2. fs.s3a.* whitelist, lowest priority; remember recognized aliases for step 3.
         Set<String> recognized = new HashSet<>();
         for (Map.Entry<String, String[]> entry : FS_S3A_ALIASES.entrySet()) {
             String canonical = entry.getKey();
+            recognized.addAll(Arrays.asList(entry.getValue()));
             if (normalized.get(canonical) != null) {
-                recognized.addAll(Arrays.asList(entry.getValue()));
                 continue;
             }
             for (String alias : entry.getValue()) {
                 String value = raw.get(alias);
-                recognized.add(alias);
                 if (value != null) {
                     normalized.set(canonical, translateValue(alias, value));
                     break;
@@ -153,5 +141,27 @@ final class S3ConfigTranslator {
         }
 
         return normalized;
+    }
+
+    /** Copies canonical keys before dotted aliases, without overriding a higher-priority value. */
+    private static void copyPrefix(Options raw, Options normalized, String prefix) {
+        for (String key : raw.keySet()) {
+            if (key.startsWith(prefix)) {
+                String canonical = S3_PREFIX + key.substring(prefix.length());
+                if (!CANONICAL_KEY_ALIASES.containsKey(canonical)
+                        && normalized.get(canonical) == null) {
+                    normalized.set(canonical, raw.get(key));
+                }
+            }
+        }
+        for (Map.Entry<String, String> entry : CANONICAL_KEY_ALIASES.entrySet()) {
+            if (normalized.get(entry.getValue()) == null) {
+                String alias = prefix + entry.getKey().substring(S3_PREFIX.length());
+                String value = raw.get(alias);
+                if (value != null) {
+                    normalized.set(entry.getValue(), value);
+                }
+            }
+        }
     }
 }
