@@ -30,10 +30,14 @@ import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadResponse;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.model.PutObjectResponse;
+import software.amazon.awssdk.services.s3.model.S3Exception;
 import software.amazon.awssdk.services.s3.model.UploadPartRequest;
 import software.amazon.awssdk.services.s3.model.UploadPartResponse;
 
 import java.io.IOException;
+import java.io.OutputStream;
+import java.lang.reflect.Field;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -735,6 +739,252 @@ class S3NativePositionOutputStreamTest {
         verify(sync).abortMultipartUpload(any(AbortMultipartUploadRequest.class));
         // Poisoned: subsequent write fails without touching the client again.
         assertThatThrownBy(() -> out.write(1)).isInstanceOf(IOException.class);
+        assertThat(tmpDir.toFile().listFiles()).isNullOrEmpty();
+    }
+
+    @Test
+    void testMultipartInitializationFailureDoesNotPublishPartialObject() throws Exception {
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        S3Exception failure =
+                (S3Exception)
+                        S3Exception.builder()
+                                .message("injected create failure")
+                                .statusCode(503)
+                                .build();
+        when(sync.createMultipartUpload(any(CreateMultipartUploadRequest.class)))
+                .thenThrow(failure);
+
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(sync, async, "bucket", "key", options());
+        assertThatThrownBy(() -> out.write(new byte[(int) PART_SIZE + 1024 * 1024]))
+                .isInstanceOf(IOException.class)
+                .hasCause(failure);
+        out.close();
+
+        assertNoObjectPublished(sync);
+        assertThatThrownBy(() -> out.write(1))
+                .isInstanceOf(IOException.class)
+                .hasRootCause(failure);
+        assertThat(tmpDir.toFile().listFiles()).isNullOrEmpty();
+    }
+
+    @Test
+    void testSingleByteMultipartInitializationFailureDoesNotPublishPartialObject()
+            throws Exception {
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        S3Exception failure =
+                (S3Exception)
+                        S3Exception.builder()
+                                .message("injected create failure")
+                                .statusCode(503)
+                                .build();
+        when(sync.createMultipartUpload(any(CreateMultipartUploadRequest.class)))
+                .thenThrow(failure);
+
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(sync, async, "bucket", "key", options());
+        out.write(new byte[(int) PART_SIZE - 1]);
+        assertThatThrownBy(() -> out.write(1)).isInstanceOf(IOException.class).hasCause(failure);
+        out.close();
+
+        assertNoObjectPublished(sync);
+        assertThat(tmpDir.toFile().listFiles()).isNullOrEmpty();
+    }
+
+    @Test
+    void testSingleByteLocalWriteFailureClosesBufferAndPreventsPublication() throws Exception {
+        assertLocalWriteFailurePreventsPublication(true);
+    }
+
+    @Test
+    void testBulkLocalWriteFailureClosesBufferAndPreventsPublication() throws Exception {
+        assertLocalWriteFailurePreventsPublication(false);
+    }
+
+    private void assertLocalWriteFailurePreventsPublication(boolean singleByte) throws Exception {
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(sync, async, "bucket", "key", options());
+        out.write(new byte[128]);
+        IOException failure = new IOException("injected local write failure");
+        FailingBuffer buffer = replaceBuffer(out, failure, null, null);
+
+        assertThatThrownBy(
+                        () -> {
+                            if (singleByte) {
+                                out.write(1);
+                            } else {
+                                out.write(new byte[256]);
+                            }
+                        })
+                .isSameAs(failure);
+        assertThat(buffer.closed).isTrue();
+        out.close();
+
+        assertNoObjectPublished(sync);
+        assertThat(tmpDir.toFile().listFiles()).isNullOrEmpty();
+    }
+
+    @Test
+    void testLocalFlushFailureCleansUpWithoutHidingOriginalFailure() throws Exception {
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(sync, async, "bucket", "key", options());
+        out.write(new byte[128]);
+        IOException failure = new IOException("injected local flush failure");
+        IOException closeFailure = new IOException("injected cleanup close failure");
+        FailingBuffer buffer = replaceBuffer(out, null, failure, closeFailure);
+
+        assertThatThrownBy(out::flush).isSameAs(failure);
+        assertThat(buffer.closed).isTrue();
+        assertThat(failure.getSuppressed()).containsExactly(closeFailure);
+        out.close();
+
+        assertNoObjectPublished(sync);
+        assertThatThrownBy(() -> out.write(1)).isInstanceOf(IOException.class).hasCause(failure);
+        assertThat(tmpDir.toFile().listFiles()).isNullOrEmpty();
+    }
+
+    @Test
+    void testLocalPartRolloverFailurePreventsPublication() throws Exception {
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(sync, async, "bucket", "key", options());
+        // An unrelated file prevents creating the next part after the current part is sealed.
+        Path obstruction = tmpDir.resolve("obstruction");
+        Files.write(obstruction, new byte[] {1});
+        Field directory = S3NativePositionOutputStream.class.getDeclaredField("tmpDir");
+        directory.setAccessible(true);
+        directory.set(out, obstruction.toFile());
+
+        assertThatThrownBy(() -> out.write(new byte[(int) PART_SIZE]))
+                .isInstanceOf(IOException.class);
+        out.close();
+
+        assertNoObjectPublished(sync);
+        assertThat(tmpDir.toFile().listFiles()).containsExactly(obstruction.toFile());
+    }
+
+    @Test
+    void testSynchronousUploadPartFailureClosesCurrentBuffer() throws Exception {
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        when(sync.createMultipartUpload(any(CreateMultipartUploadRequest.class)))
+                .thenReturn(CreateMultipartUploadResponse.builder().uploadId("u1").build());
+        when(async.uploadPart(any(UploadPartRequest.class), any(AsyncRequestBody.class)))
+                .thenThrow(new RuntimeException("injected submission failure"));
+
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(sync, async, "bucket", "key", options());
+        assertThatThrownBy(() -> out.write(new byte[(int) PART_SIZE]))
+                .isInstanceOf(IOException.class);
+        Field buffer = S3NativePositionOutputStream.class.getDeclaredField("currentBuffer");
+        buffer.setAccessible(true);
+        assertThat(buffer.get(out)).isNull();
+        out.close();
+
+        assertNoObjectPublished(sync);
+        verify(sync).abortMultipartUpload(any(AbortMultipartUploadRequest.class));
+        assertThat(tmpDir.toFile().listFiles()).isNullOrEmpty();
+    }
+
+    private static void assertNoObjectPublished(S3Client sync) {
+        verify(sync, never()).putObject(any(PutObjectRequest.class), any(RequestBody.class));
+        verify(sync, never()).completeMultipartUpload(any(CompleteMultipartUploadRequest.class));
+    }
+
+    private static FailingBuffer replaceBuffer(
+            S3NativePositionOutputStream out,
+            IOException writeFailure,
+            IOException flushFailure,
+            IOException closeFailure)
+            throws Exception {
+        Field field = S3NativePositionOutputStream.class.getDeclaredField("currentBuffer");
+        field.setAccessible(true);
+        FailingBuffer replacement =
+                new FailingBuffer(
+                        (OutputStream) field.get(out), writeFailure, flushFailure, closeFailure);
+        field.set(out, replacement);
+        return replacement;
+    }
+
+    private static final class FailingBuffer extends OutputStream {
+        private final OutputStream delegate;
+        private final IOException writeFailure;
+        private final IOException flushFailure;
+        private final IOException closeFailure;
+        private boolean closed;
+
+        private FailingBuffer(
+                OutputStream delegate,
+                IOException writeFailure,
+                IOException flushFailure,
+                IOException closeFailure) {
+            this.delegate = delegate;
+            this.writeFailure = writeFailure;
+            this.flushFailure = flushFailure;
+            this.closeFailure = closeFailure;
+        }
+
+        @Override
+        public void write(int b) throws IOException {
+            if (writeFailure != null) {
+                throw writeFailure;
+            }
+            delegate.write(b);
+        }
+
+        @Override
+        public void write(byte[] b, int off, int len) throws IOException {
+            if (writeFailure != null) {
+                throw writeFailure;
+            }
+            delegate.write(b, off, len);
+        }
+
+        @Override
+        public void flush() throws IOException {
+            if (flushFailure != null) {
+                throw flushFailure;
+            }
+            delegate.flush();
+        }
+
+        @Override
+        public void close() throws IOException {
+            closed = true;
+            delegate.close();
+            if (closeFailure != null) {
+                throw closeFailure;
+            }
+        }
+    }
+
+    @Test
+    void testInvalidWriteArgumentsDoNotPoisonStream() throws Exception {
+        S3Client sync = mock(S3Client.class);
+        S3AsyncClient async = mock(S3AsyncClient.class);
+        S3NativePositionOutputStream out =
+                new S3NativePositionOutputStream(sync, async, "bucket", "key", options());
+        assertThatThrownBy(() -> out.write(null, 0, 1)).isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> out.write(new byte[4], -1, 1))
+                .isInstanceOf(IndexOutOfBoundsException.class);
+        assertThatThrownBy(() -> out.write(new byte[4], 0, -1))
+                .isInstanceOf(IndexOutOfBoundsException.class);
+        assertThatThrownBy(() -> out.write(new byte[4], 1, 4))
+                .isInstanceOf(IndexOutOfBoundsException.class);
+        assertThatThrownBy(() -> out.write(new byte[4], Integer.MAX_VALUE, 1))
+                .isInstanceOf(IndexOutOfBoundsException.class);
+
+        out.write(new byte[128]);
+        out.close();
+
+        verify(sync).putObject(any(PutObjectRequest.class), any(RequestBody.class));
         assertThat(tmpDir.toFile().listFiles()).isNullOrEmpty();
     }
 }

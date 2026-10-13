@@ -143,6 +143,7 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
     private int nextPartNumber = 1;
     private long pos;
     private boolean closed;
+    @Nullable private IOException failure;
 
     /** Capture site for the unclosed-stream warning emitted by {@link #finalize()}. */
     private final StackTraceElement[] createStack;
@@ -173,7 +174,11 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
             this.wholeObjectDigest = newDigest();
         }
         Files.createDirectories(tmpDir.toPath());
-        rollPartFile();
+        try {
+            rollPartFile();
+        } catch (IOException | RuntimeException e) {
+            throw failStream(e);
+        }
     }
 
     private static Set<Tag> toTags(Map<String, String> tagMap) {
@@ -215,6 +220,11 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
             }
             onPartMaybeFull();
             maybeStartUploading();
+        } catch (IOException | RuntimeException e) {
+            if (!closed) {
+                throw failStream(e);
+            }
+            throw e;
         } finally {
             lock.unlock();
         }
@@ -227,6 +237,12 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
 
     @Override
     public void write(byte[] b, int off, int len) throws IOException {
+        if (b == null) {
+            throw new NullPointerException("buffer");
+        }
+        if (off < 0 || len < 0 || off > b.length - len) {
+            throw new IndexOutOfBoundsException();
+        }
         lock.lock();
         try {
             ensureOpen();
@@ -255,6 +271,11 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
             // this tail check a sub-part-increment stream just past the threshold would reach
             // close() and take the single-PutObject path instead of starting the MPU.
             maybeStartUploading();
+        } catch (IOException | RuntimeException e) {
+            if (!closed) {
+                throw failStream(e);
+            }
+            throw e;
         } finally {
             lock.unlock();
         }
@@ -268,6 +289,11 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
         try {
             ensureOpen();
             currentBuffer.flush();
+        } catch (IOException | RuntimeException e) {
+            if (!closed) {
+                throw failStream(e);
+            }
+            throw e;
         } finally {
             lock.unlock();
         }
@@ -311,20 +337,17 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
                 } else {
                     if (currentPartSize > 0) {
                         rollPendingPart();
-                    } else {
-                        currentBuffer.close();
-                        currentBuffer = null;
-                        discardCurrentEmptyPart();
                     }
+                    currentBuffer.close();
+                    currentBuffer = null;
+                    discardCurrentEmptyPart();
                     submitPendingParts();
                     completeUpload();
                 }
             } catch (IOException | RuntimeException e) {
-                abortUploadQuietly();
-                throw new IOException("Failed to upload s3://" + bucket + "/" + key, e);
-            } finally {
-                cleanupTempFiles();
+                throw failStream(new IOException("Failed to upload s3://" + bucket + "/" + key, e));
             }
+            cleanupTempFiles();
         } finally {
             lock.unlock();
         }
@@ -333,6 +356,9 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
     // ------------------------------------------------------------------------
 
     private void ensureOpen() throws IOException {
+        if (failure != null) {
+            throw new IOException("Stream has failed", failure);
+        }
         if (closed) {
             throw new IOException("Stream is closed");
         }
@@ -439,7 +465,6 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
                 uploadPermits.acquire();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                failStream();
                 throw new IOException("Interrupted while waiting for an upload permit", e);
             }
             try {
@@ -464,7 +489,6 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
                 partFutures.add(future);
             } catch (RuntimeException e) {
                 uploadPermits.release(); // whenComplete never registered on synchronous failure
-                failStream();
                 throw new IOException("Failed to submit part " + partNumber + " of " + key, e);
             }
         }
@@ -560,11 +584,35 @@ final class S3NativePositionOutputStream extends PositionOutputStream {
         }
     }
 
-    /** Aborts the multipart upload and permanently closes the stream on a submit failure. */
-    private void failStream() {
-        abortUploadQuietly();
-        cleanupTempFiles();
+    /** Discards a failed write without letting a later close publish its staged prefix. */
+    private IOException failStream(Exception cause) {
+        failure =
+                cause instanceof IOException
+                        ? (IOException) cause
+                        : new IOException("Failed to write s3://" + bucket + "/" + key, cause);
         closed = true;
+        OutputStream buffer = currentBuffer;
+        currentBuffer = null;
+        if (buffer != null) {
+            try {
+                buffer.close();
+            } catch (IOException | RuntimeException e) {
+                if (e != failure) {
+                    failure.addSuppressed(e);
+                }
+            }
+        }
+        try {
+            abortUploadQuietly();
+        } catch (RuntimeException e) {
+            failure.addSuppressed(e);
+        }
+        try {
+            cleanupTempFiles();
+        } catch (RuntimeException e) {
+            failure.addSuppressed(e);
+        }
+        return failure;
     }
 
     private void abortUploadQuietly() {
